@@ -1,0 +1,6 @@
+interface:
+  display_name: "Builder Pulse"
+  short_description: "Track product, feature, state, and capped active time"
+  default_prompt: "Use $builder-pulse to show the current builder state."
+policy:
+  allow_implicit_invocation: true

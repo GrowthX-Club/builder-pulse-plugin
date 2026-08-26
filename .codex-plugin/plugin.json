@@ -1,0 +1,22 @@
+{
+  "name": "builder-pulse",
+  "version": "0.3.0+codex.20260826093900",
+  "description": "Minimal lifecycle telemetry for product, feature, state, and approximate active time.",
+  "author": {
+    "name": "Udayan"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Builder Pulse",
+    "shortDescription": "See builder state without interrupting them.",
+    "longDescription": "Builder Pulse reports a claimed builder's product, explicitly labeled feature, coarse state, and capped active interval. Raw prompts, prompt lengths, commands, paths, source, and tool I/O are always off.",
+    "developerName": "Udayan",
+    "category": "Productivity",
+    "capabilities": [
+      "Lifecycle telemetry",
+      "One-time installation claim",
+      "Offline delivery queue"
+    ],
+    "defaultPrompt": "Use Builder Pulse to show the current builder state."
+  }
+}
