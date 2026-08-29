@@ -1676,6 +1676,11 @@ class HookManifestTests(unittest.TestCase):
         hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
         self.assertNotIn("async", hook)
 
+    def test_user_prompt_submit_is_synchronous_for_reliable_delivery(self) -> None:
+        manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        hook = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        self.assertNotIn("async", hook)
+
 
 if __name__ == "__main__":
     unittest.main()
