@@ -878,6 +878,30 @@ class BuilderPulseTests(unittest.TestCase):
             len(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")), 1
         )
 
+    def test_current_prompt_attempt_bypasses_busy_backlog_lease(self) -> None:
+        self.claim_locally()
+        current = self.record_prompt(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "concurrent-current",
+                "prompt": "deliver despite concurrent backlog flush",
+            },
+            1_787_721_055_010,
+        )
+        assert current is not None
+        with builder_pulse.delivery_lease(self.data_dir) as acquired:
+            self.assertTrue(acquired)
+            with mock.patch.object(
+                builder_pulse, "deliver_prompt", return_value=(True, "delivered")
+            ) as delivered:
+                result = builder_pulse.attempt_current_prompt(
+                    self.data_dir, self.config, current
+                )
+
+        self.assertEqual(result, {"delivered": 1, "discarded": 0, "remaining": 0})
+        delivered.assert_called_once()
+        self.assertFalse((self.data_dir / "prompt-outbox.jsonl").exists())
+
     def test_prompt_capture_failure_never_breaks_hook(self) -> None:
         output = io.StringIO()
         payload = {

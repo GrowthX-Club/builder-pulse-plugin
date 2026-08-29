@@ -1501,57 +1501,50 @@ def attempt_current_prompt(
     ):
         return {"delivered": 0, "discarded": 0, "remaining": len(read_jsonl(path))}
 
-    with delivery_lease(data_dir) as acquired:
-        if not acquired:
-            return {
-                "delivered": 0,
-                "discarded": 0,
-                "remaining": len(read_jsonl(path)),
-                "busy": 1,
-            }
-        prompt_config = dict(config)
-        prompt_config["delivery_timeout_seconds"] = min(
-            float(config.get("delivery_timeout_seconds", 1.0)),
-            CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS,
-        )
-        ok, result = deliver_prompt(event, prompt_config, token, endpoint)
+    # Do not use the shared backlog lease here. A concurrent async flush may
+    # have snapshotted its queue before this prompt was appended. Concurrent
+    # delivery is safe because the server deduplicates the unique promptId.
+    prompt_config = dict(config)
+    prompt_config["delivery_timeout_seconds"] = min(
+        float(config.get("delivery_timeout_seconds", 1.0)),
+        CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS,
+    )
+    ok, result = deliver_prompt(event, prompt_config, token, endpoint)
 
-        if result in {"http_401", "http_403"}:
-            with data_lock(data_dir):
-                current = read_jsonl(path)
-                current_identity = read_json(identity_path(data_dir), {})
-                if isinstance(current_identity, dict):
-                    current_identity["promptCapture"] = "off"
-                    atomic_write_json(identity_path(data_dir), current_identity)
+    if result in {"http_401", "http_403"}:
+        with data_lock(data_dir):
+            current = read_jsonl(path)
+            current_identity = read_json(identity_path(data_dir), {})
+            if isinstance(current_identity, dict):
+                current_identity["promptCapture"] = "off"
+                atomic_write_json(identity_path(data_dir), current_identity)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        return {"delivered": 0, "discarded": len(current), "remaining": 0}
+
+    discard = permanent_delivery_failure(result)
+    if ok or discard:
+        with data_lock(data_dir):
+            current = read_jsonl(path)
+            remaining = [
+                queued for queued in current if queued.get("promptId") != prompt_id
+            ]
+            if remaining:
+                atomic_write_jsonl(path, remaining)
+            else:
                 try:
                     path.unlink()
                 except FileNotFoundError:
                     pass
-            return {"delivered": 0, "discarded": len(current), "remaining": 0}
-
-        discard = permanent_delivery_failure(result)
-        if ok or discard:
-            with data_lock(data_dir):
-                current = read_jsonl(path)
-                remaining = [
-                    queued
-                    for queued in current
-                    if queued.get("promptId") != prompt_id
-                ]
-                if remaining:
-                    atomic_write_jsonl(path, remaining)
-                else:
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-        else:
-            remaining = read_jsonl(path)
-        return {
-            "delivered": 1 if ok else 0,
-            "discarded": 1 if discard else 0,
-            "remaining": len(remaining),
-        }
+    else:
+        remaining = read_jsonl(path)
+    return {
+        "delivered": 1 if ok else 0,
+        "discarded": 1 if discard else 0,
+        "remaining": len(remaining),
+    }
 
 
 def ingest_hook(data_dir: Path) -> int:
