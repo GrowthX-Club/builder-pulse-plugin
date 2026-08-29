@@ -14,7 +14,8 @@ prompt text to GrowthX for learning feedback.
 ## Locate the CLI
 
 Resolve `../../scripts/builder_pulse.py` relative to this `SKILL.md`, then use
-that resolved absolute path in commands below. Before claiming, verify Python
+that resolved absolute path in commands below. In the examples, `<python>` means
+`python3` on macOS/Linux and `py -3` on Windows. Before claiming, verify Python
 3.11 or newer with `python3 --version` on macOS/Linux or `py -3 --version` on
 Windows. Stop and explain the missing prerequisite if that check fails; hooks
 cannot report telemetry without this standard-library-only runtime.
@@ -45,7 +46,7 @@ possible so they do not remain in shell history.
 ## Claim once (no login)
 
 ```bash
-python3 <resolved-cli-path> claim --endpoint https://your-convex-site.example
+<python> <resolved-cli-path> claim --endpoint https://your-convex-site.example
 ```
 
 The CLI first persists a client-generated 64-hex token as pending, then sends it
@@ -61,11 +62,11 @@ Feature context must be concise and non-sensitive. Never copy a raw prompt into
 the feature label.
 
 ```bash
-python3 <resolved-cli-path> work set \
+<python> <resolved-cli-path> work set \
   --project growthx-community \
   --feature "Member search filters"
-python3 <resolved-cli-path> work show
-python3 <resolved-cli-path> work clear-feature
+<python> <resolved-cli-path> work show
+<python> <resolved-cli-path> work clear-feature
 ```
 
 Feature labels are limited to 120 characters. A stable feature ID is sanitized
@@ -76,7 +77,7 @@ fallbacks, not the place to label concurrent work.
 ## Read status
 
 ```bash
-python3 <resolved-cli-path> status --json
+<python> <resolved-cli-path> status --json
 ```
 
 Summarize claimed identity, prompt-capture policy, product, feature, state, last
@@ -89,8 +90,8 @@ is deduplicated server-side.
 Use an explicit mark only when the state is known:
 
 ```bash
-python3 <resolved-cli-path> mark blocked
-python3 <resolved-cli-path> mark ready
+<python> <resolved-cli-path> mark blocked
+<python> <resolved-cli-path> mark ready
 ```
 
 Allowed states are `building`, `testing`, `blocked`, and `ready`; `SessionEnd`
@@ -119,7 +120,7 @@ capture and purges its outbox without exposing text.
 Manual retry handles both queues:
 
 ```bash
-python3 <resolved-cli-path> flush
+<python> <resolved-cli-path> flush
 ```
 
 Delivery is best effort and must never interrupt Codex. Read the reference when

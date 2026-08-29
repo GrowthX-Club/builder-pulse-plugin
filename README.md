@@ -4,6 +4,9 @@ Builder Pulse connects a builder's claimed installation to GrowthX, reports
 coarse progress, and sends submitted Codex prompts so GrowthX can provide
 learning feedback.
 
+In commands below, `<python>` means `python3` on macOS/Linux and `py -3` on
+Windows.
+
 ## Consent and data boundary
 
 Installing and claiming Builder Pulse enables the data collection described
@@ -68,7 +71,7 @@ later claim or configuration override. Plain HTTP is accepted only on loopback
 for local development.
 
 ```bash
-python3 <plugin-root>/scripts/builder_pulse.py \
+<python> <plugin-root>/scripts/builder_pulse.py \
   claim --endpoint https://precious-ant-429.convex.site
 ```
 
@@ -102,12 +105,12 @@ characters and never inferred from prompt text. The configured project and
 feature context is attached to both lifecycle and prompt events.
 
 ```bash
-python3 <plugin-root>/scripts/builder_pulse.py work set \
+<python> <plugin-root>/scripts/builder_pulse.py work set \
   --project growthx-community \
   --feature "Member search filters"
 
-python3 <plugin-root>/scripts/builder_pulse.py work show
-python3 <plugin-root>/scripts/builder_pulse.py work clear-feature
+<python> <plugin-root>/scripts/builder_pulse.py work show
+<python> <plugin-root>/scripts/builder_pulse.py work clear-feature
 ```
 
 An optional `--feature-id member-search-filters` preserves a stable ID when the
@@ -200,11 +203,11 @@ existing schema v1 payload is preserved.
 ## Status and configuration
 
 ```bash
-python3 <plugin-root>/scripts/builder_pulse.py status
-python3 <plugin-root>/scripts/builder_pulse.py status --json
-python3 <plugin-root>/scripts/builder_pulse.py config show
-python3 <plugin-root>/scripts/builder_pulse.py mark blocked
-python3 <plugin-root>/scripts/builder_pulse.py flush
+<python> <plugin-root>/scripts/builder_pulse.py status
+<python> <plugin-root>/scripts/builder_pulse.py status --json
+<python> <plugin-root>/scripts/builder_pulse.py config show
+<python> <plugin-root>/scripts/builder_pulse.py mark blocked
+<python> <plugin-root>/scripts/builder_pulse.py flush
 ```
 
 Status reports lifecycle and prompt queue counts separately. `flush` retries
@@ -232,8 +235,9 @@ codex plugin add builder-pulse@growthx-builder-tools
 
 The admin-provided claim command must use the installed plugin root; this build
 defaults to `https://precious-ant-429.convex.site`. To upgrade after an announced
-release, run `codex plugin marketplace upgrade growthx-builder-tools`, then the
-same `codex plugin add` command and start a new Codex task. To pause
+release, remove the configured marketplace, re-add it with the announced
+immutable tag, then run the same `codex plugin add` command and start a new Codex
+task. To pause
 without removing local identity, run `config set enabled false`. To uninstall,
 run `codex plugin remove builder-pulse`; uninstalling is not token revocation.
 
@@ -246,8 +250,8 @@ compromised device requires server-side revocation before replacement.
 
 ```bash
 python3 -m unittest discover -s <plugin-root>/tests -v
-python3 <skill-creator-root>/scripts/quick_validate.py <plugin-root>/skills/builder-pulse
-python3 <plugin-creator-root>/scripts/validate_plugin.py <plugin-root>
+<python> <skill-creator-root>/scripts/quick_validate.py <plugin-root>/skills/builder-pulse
+<python> <plugin-creator-root>/scripts/validate_plugin.py <plugin-root>
 ```
 
 Operational settings live in the plugin data directory and survive upgrades.
