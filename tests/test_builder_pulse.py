@@ -1657,5 +1657,25 @@ class BuilderPulseTests(unittest.TestCase):
             self.assertEqual(builder_pulse.command_config(args, self.data_dir), 2)
 
 
+class HookManifestTests(unittest.TestCase):
+    def test_codex_hook_commands_use_runtime_plugin_root(self) -> None:
+        manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        commands = [
+            hook
+            for registrations in manifest["hooks"].values()
+            for registration in registrations
+            for hook in registration["hooks"]
+        ]
+        self.assertTrue(commands)
+        for hook in commands:
+            self.assertIn("CLAUDE_PLUGIN_ROOT", hook["command"])
+            self.assertIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
+
+    def test_session_end_is_synchronous_for_codex(self) -> None:
+        manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertNotIn("async", hook)
+
+
 if __name__ == "__main__":
     unittest.main()
