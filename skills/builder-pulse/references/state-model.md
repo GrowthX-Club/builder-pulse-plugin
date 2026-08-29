@@ -20,7 +20,7 @@ The plugin creates a stable UUID `installationId` and client-generated 64-hex
 so a response-loss retry reuses the same values. The request uses one
 `inviteCode` and `schemaVersion: 2` to bind that installation to a roster entry
 and enable prompt capture. The response returns
-`builderId`, `name`, `defaultProject`, `heartbeatMinutes: 15`, and
+`builderId`, stable GrowthX `memberId`, `name`, `defaultProject`, `heartbeatMinutes: 15`, and
 `promptCapture: "on"`, but never returns the token. Prompt capture remains off
 unless the claimed identity stores that exact server policy.
 

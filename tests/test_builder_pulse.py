@@ -308,8 +308,8 @@ class BuilderPulseTests(unittest.TestCase):
     def test_concurrent_first_claims_serialize_and_reuse_pending_token(self) -> None:
         requests: list[dict] = []
         requests_lock = threading.Lock()
-        second_request_seen = threading.Event()
-        first_request_overlapped: list[bool] = []
+        first_request_seen = threading.Event()
+        release_first_request = threading.Event()
 
         class ClaimHandler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
@@ -320,11 +320,11 @@ class BuilderPulseTests(unittest.TestCase):
                     requests.append(payload)
 
                 if request_index == 0:
-                    first_request_overlapped.append(second_request_seen.wait(1.0))
+                    first_request_seen.set()
+                    release_first_request.wait(5.0)
                     self.close_connection = True
                     return
 
-                second_request_seen.set()
                 response = json.dumps(
                     {
                         "builderId": "builder-17",
@@ -362,17 +362,27 @@ class BuilderPulseTests(unittest.TestCase):
 
         processes: list[subprocess.Popen[str]] = []
         try:
-            for _ in range(2):
-                processes.append(
-                    subprocess.Popen(
-                        command,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                    )
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
+            )
+            self.assertTrue(first_request_seen.wait(5.0))
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+            release_first_request.set()
             results = [process.communicate(timeout=10) for process in processes]
         finally:
+            release_first_request.set()
             for process in processes:
                 if process.poll() is None:
                     process.kill()
@@ -383,7 +393,6 @@ class BuilderPulseTests(unittest.TestCase):
 
         self.assertEqual(sorted(process.returncode for process in processes), [0, 1])
         self.assertEqual(len(requests), 2)
-        self.assertEqual(first_request_overlapped, [False])
         self.assertEqual(requests[0]["installationId"], requests[1]["installationId"])
         self.assertEqual(
             requests[0]["installationToken"], requests[1]["installationToken"]

@@ -14,7 +14,10 @@ prompt text to GrowthX for learning feedback.
 ## Locate the CLI
 
 Resolve `../../scripts/builder_pulse.py` relative to this `SKILL.md`, then use
-that resolved absolute path in commands below.
+that resolved absolute path in commands below. Before claiming, verify Python
+3.11 or newer with `python3 --version` on macOS/Linux or `py -3 --version` on
+Windows. Stop and explain the missing prerequisite if that check fails; hooks
+cannot report telemetry without this standard-library-only runtime.
 
 ## Consent boundary
 
@@ -47,8 +50,9 @@ python3 <resolved-cli-path> claim --endpoint https://your-convex-site.example
 
 The CLI first persists a client-generated 64-hex token as pending, then sends it
 with the schema v2 claim. A response-loss retry reuses that exact token. The
-server's returned name and builder ID are recorded locally; the installation
-token is mode `0600`, never printed, and bound to the claimed HTTPS endpoint.
+server's returned name, builder ID, and stable GrowthX member ID are recorded
+locally; the installation token is mode `0600`, never printed, and bound to the
+claimed HTTPS endpoint.
 The claim must return `promptCapture: "on"` before prompt capture starts.
 
 ## Set product and feature

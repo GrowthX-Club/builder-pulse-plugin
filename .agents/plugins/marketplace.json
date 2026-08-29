@@ -8,7 +8,7 @@
       "name": "builder-pulse",
       "source": {
         "source": "local",
-        "path": "."
+        "path": "./"
       },
       "policy": {
         "installation": "AVAILABLE",

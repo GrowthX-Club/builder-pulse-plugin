@@ -220,16 +220,20 @@ environment context overrides are `BUILDER_PULSE_ENDPOINT`,
 ## Prepared installation and lifecycle contract
 
 Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
-repository. Install or upgrade it with:
+repository. Python 3.11 or newer is the only host prerequisite; verify it with
+`python3 --version` on macOS/Linux or `py -3 --version` on Windows before
+installation. The runtime uses only Python's standard library. Install the
+immutable v0.4.0 release with:
 
 ```bash
-codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref main
+codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.0
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 The admin-provided claim command must use the installed plugin root; this build
-defaults to `https://precious-ant-429.convex.site`. To upgrade, run the same `codex plugin add` command
-after an announced version is available, then start a new Codex task. To pause
+defaults to `https://precious-ant-429.convex.site`. To upgrade after an announced
+release, run `codex plugin marketplace upgrade growthx-builder-tools`, then the
+same `codex plugin add` command and start a new Codex task. To pause
 without removing local identity, run `config set enabled false`. To uninstall,
 run `codex plugin remove builder-pulse`; uninstalling is not token revocation.
 
