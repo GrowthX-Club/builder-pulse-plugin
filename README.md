@@ -119,8 +119,9 @@ with `work set`, `work show`, or `work clear-feature` to target another checkout
 
 ## Delivery behavior
 
-Hooks run asynchronously. Only essential lifecycle hooks and matched post-tool
-events launch the runtime. A lifecycle telemetry event is created only when
+Hooks run asynchronously except `SessionEnd`, which Codex runs synchronously.
+Only essential lifecycle hooks and matched post-tool events launch the runtime.
+A lifecycle telemetry event is created only when
 state changes or a 15-minute heartbeat is due. Observed hook continuity can
 create an active interval; a gap over 15 minutes never receives active credit.
 `SessionEnd` changes the state to `idle`. Reading token totals does not create
