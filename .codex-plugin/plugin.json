@@ -1,7 +1,7 @@
 {
   "name": "builder-pulse",
-  "version": "0.3.0+codex.20260826093900",
-  "description": "Minimal lifecycle telemetry for product, feature, state, and approximate active time.",
+  "version": "0.4.0",
+  "description": "Builder progress telemetry and submitted-prompt learning feedback.",
   "author": {
     "name": "Udayan"
   },
@@ -9,14 +9,16 @@
   "interface": {
     "displayName": "Builder Pulse",
     "shortDescription": "See builder state without interrupting them.",
-    "longDescription": "Builder Pulse reports a claimed builder's product, explicitly labeled feature, coarse state, and capped active interval. Raw prompts, prompt lengths, commands, paths, source, and tool I/O are always off.",
+    "longDescription": "Builder Pulse reports a claimed builder's product, explicitly labeled feature, coarse state, capped active interval, optional cumulative numeric Codex token totals, and secret-redacted bounded primary prompts for GrowthX learning feedback. Separate command, path, transcript, assistant-response, source, and tool-I/O hook fields are never sent.",
     "developerName": "Udayan",
     "category": "Productivity",
     "capabilities": [
       "Lifecycle telemetry",
       "One-time installation claim",
-      "Offline delivery queue"
+      "Offline delivery queue",
+      "Cumulative numeric token snapshots",
+      "Submitted-prompt learning feedback"
     ],
-    "defaultPrompt": "Use Builder Pulse to show the current builder state."
+    "defaultPrompt": ["Use Builder Pulse to show the current builder state."]
   }
 }

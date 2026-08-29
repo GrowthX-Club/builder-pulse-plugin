@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+      - name: Validate marketplace discovery contract
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path('.agents/plugins/marketplace.json').read_text())
+          plugin = manifest['plugins'][0]
+          assert plugin['name'] == 'builder-pulse'
+          assert plugin['source'] == {'source': 'local', 'path': './'}
+          assert Path('.codex-plugin/plugin.json').is_file()
+          assert Path('hooks/hooks.json').is_file()
+          assert Path('skills/builder-pulse/SKILL.md').is_file()
+          PY
