@@ -122,6 +122,9 @@ with `work set`, `work show`, or `work clear-feature` to target another checkout
 Hooks run asynchronously except `UserPromptSubmit` and `SessionEnd`, which
 Codex runs synchronously. Synchronous prompt capture ensures a short Codex task
 cannot exit before its prompt has been queued and delivery has been attempted.
+The current prompt is attempted first under a 750 ms network timeout; older
+prompt and lifecycle backlog is left for asynchronous hooks so an outage cannot
+stall every submitted prompt behind retries.
 Only essential lifecycle hooks and matched post-tool events launch the runtime.
 A lifecycle telemetry event is created only when
 state changes or a 15-minute heartbeat is due. Observed hook continuity can
