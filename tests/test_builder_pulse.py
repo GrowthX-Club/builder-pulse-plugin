@@ -786,7 +786,9 @@ class BuilderPulseTests(unittest.TestCase):
         with mock.patch.object(
             builder_pulse, "utc_now_ms", side_effect=[1_787_721_050_000, 1_787_721_050_000,
                                                        1_787_721_050_001, 1_787_721_050_001]
-        ), mock.patch.object(builder_pulse, "flush_outbox"), mock.patch.object(
+        ), mock.patch.object(builder_pulse, "attempt_current_prompt"), mock.patch.object(
+            builder_pulse, "flush_outbox"
+        ), mock.patch.object(
             builder_pulse, "flush_prompt_outbox"
         ):
             for payload in payloads:
@@ -817,6 +819,88 @@ class BuilderPulseTests(unittest.TestCase):
         ):
             self.assertNotIn(sensitive, lifecycle_storage)
             self.assertNotIn(sensitive, state_storage)
+
+    def test_synchronous_hook_attempts_current_prompt_before_backlog(self) -> None:
+        self.claim_locally()
+        older = self.record_prompt(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "older-session",
+                "prompt": "older queued prompt",
+            },
+            1_787_721_055_000,
+        )
+        lifecycle = self.record(
+            {"hook_event_name": "SessionStart", "session_id": "older-lifecycle"},
+            1_787_721_055_001,
+        )
+        assert older is not None and lifecycle is not None
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "current-session",
+            "prompt": "current prompt must go first",
+            "transcript_path": str(self.primary_transcript),
+        }
+        self.config["delivery_timeout_seconds"] = 3.0
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse, "load_config", return_value=self.config
+        ), mock.patch.object(
+            builder_pulse, "utc_now_ms", return_value=1_787_721_055_002
+        ), mock.patch.object(
+            builder_pulse, "deliver_prompt", return_value=(True, "delivered")
+        ) as delivered, mock.patch.object(
+            builder_pulse, "deliver_event"
+        ) as lifecycle_delivery, mock.patch.object(
+            builder_pulse, "flush_outbox"
+        ) as lifecycle_flush, mock.patch.object(
+            builder_pulse, "flush_prompt_outbox"
+        ) as prompt_flush, mock.patch.object(
+            sys, "stdin", io.StringIO(json.dumps(payload))
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(builder_pulse.ingest_hook(self.data_dir), 0)
+
+        self.assertEqual(output.getvalue(), "{}\n")
+        delivered_event, delivered_config, _, _ = delivered.call_args.args
+        self.assertEqual(delivered_event["promptText"], "current prompt must go first")
+        self.assertEqual(
+            delivered_config["delivery_timeout_seconds"],
+            builder_pulse.CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS,
+        )
+        lifecycle_delivery.assert_not_called()
+        lifecycle_flush.assert_not_called()
+        prompt_flush.assert_not_called()
+        queued_prompts = builder_pulse.read_jsonl(
+            self.data_dir / "prompt-outbox.jsonl"
+        )
+        self.assertEqual([event["promptId"] for event in queued_prompts], [older["promptId"]])
+        self.assertGreaterEqual(
+            len(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")), 1
+        )
+
+    def test_current_prompt_attempt_bypasses_busy_backlog_lease(self) -> None:
+        self.claim_locally()
+        current = self.record_prompt(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "concurrent-current",
+                "prompt": "deliver despite concurrent backlog flush",
+            },
+            1_787_721_055_010,
+        )
+        assert current is not None
+        with builder_pulse.delivery_lease(self.data_dir) as acquired:
+            self.assertTrue(acquired)
+            with mock.patch.object(
+                builder_pulse, "deliver_prompt", return_value=(True, "delivered")
+            ) as delivered:
+                result = builder_pulse.attempt_current_prompt(
+                    self.data_dir, self.config, current
+                )
+
+        self.assertEqual(result, {"delivered": 1, "discarded": 0, "remaining": 0})
+        delivered.assert_called_once()
+        self.assertFalse((self.data_dir / "prompt-outbox.jsonl").exists())
 
     def test_prompt_capture_failure_never_breaks_hook(self) -> None:
         output = io.StringIO()
@@ -1674,6 +1758,11 @@ class HookManifestTests(unittest.TestCase):
     def test_session_end_is_synchronous_for_codex(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
         hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
+        self.assertNotIn("async", hook)
+
+    def test_user_prompt_submit_is_synchronous_for_reliable_delivery(self) -> None:
+        manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        hook = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]
         self.assertNotIn("async", hook)
 
 

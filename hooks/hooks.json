@@ -21,7 +21,6 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
             "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
-            "async": true,
             "timeout": 5
           }
         ]
