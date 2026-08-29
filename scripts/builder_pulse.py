@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Builder Pulse: minimal, privacy-bounded Codex lifecycle telemetry.
+"""Builder Pulse: privacy-bounded Codex lifecycle and prompt telemetry.
 
 Hook payloads can contain prompts, commands, paths, source, and tool I/O. This
 module may inspect a command in memory to classify a state, but it never writes
-or forwards those sensitive values. Only state transitions and a 15-minute
-heartbeat can create a telemetry event.
+or forwards commands, paths, source, tool I/O, transcripts, or assistant
+responses. Primary UserPromptSubmit text is separately redacted, bounded, and
+queued for learning feedback. Only state transitions and a 15-minute heartbeat
+can create a lifecycle event. An already-due primary-session event may include
+exactly five allowlisted cumulative numeric token counters from a local Codex
+token_count record. Subagent and fork snapshots are suppressed; transcript
+paths and all other content are discarded.
 """
 
 from __future__ import annotations
@@ -29,8 +34,20 @@ import uuid
 
 
 SCHEMA_VERSION = 1
+TOKEN_USAGE_SCHEMA_VERSION = 2
+CLAIM_SCHEMA_VERSION = 2
 HEARTBEAT_MINUTES = 15
 MAX_ACTIVE_MINUTES = 15
+MAX_SAFE_INTEGER = (1 << 53) - 1
+TOKEN_USAGE_TAIL_BYTES = 512 * 1024
+TOKEN_USAGE_MAX_RECORD_BYTES = 64 * 1024
+PROMPT_MAX_BYTES = 64 * 1024
+PROMPT_RETENTION_MS = 60 * 24 * 60 * 60 * 1000
+PROMPT_CAPTURE_POLICY = "on"
+SETUP_DISCLOSURE = (
+    "Builder Pulse connects you with GrowthX so that we can track your progress "
+    "and provide you learning feedback."
+)
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS_PATH = PLUGIN_ROOT / "config" / "defaults.json"
 MANIFEST_PATH = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
@@ -65,6 +82,58 @@ REVIEW_PATTERNS = (
     r"(?:^|\s)gh\s+pr\s+(?:create|ready)(?:\s|$)",
     r"(?:^|\s)glab\s+mr\s+create(?:\s|$)",
 )
+
+PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9 -]*PRIVATE KEY(?: BLOCK)?)-----"
+    r".*?(?:-----END (?P=label)-----|$)",
+    re.DOTALL,
+)
+AUTHORIZATION_PATTERN = re.compile(
+    r"(?im)(\bauthorization\s*[:=]\s*)[^\r\n]+"
+)
+BEARER_PATTERN = re.compile(
+    r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{12,}"
+)
+API_TOKEN_PATTERNS = (
+    re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
+        r"[A-Za-z0-9_-]{10,}\b"
+    ),
+)
+
+TOKEN_USAGE_FIELDS = (
+    ("input_tokens", "inputTokens"),
+    ("cached_input_tokens", "cachedInputTokens"),
+    ("output_tokens", "outputTokens"),
+    ("reasoning_output_tokens", "reasoningOutputTokens"),
+    ("total_tokens", "totalTokens"),
+)
+TOKEN_USAGE_KEYS = tuple(destination for _, destination in TOKEN_USAGE_FIELDS)
+TOKEN_USAGE_SOURCE_KEYS = frozenset(source for source, _ in TOKEN_USAGE_FIELDS) | {
+    "cache_write_input_tokens"
+}
+SUBAGENT_SOURCE_KEYS = frozenset({"subagent", "fork"})
+SUBAGENT_PARENT_KEYS = frozenset(
+    {
+        "parent_agent_id",
+        "parent_session_id",
+        "parent_thread_id",
+        "parentAgentId",
+        "parentSessionId",
+        "parentThreadId",
+    }
+)
+SUBAGENT_FLAG_KEYS = frozenset(
+    {"is_fork", "is_forked", "is_subagent", "isFork", "isForked", "isSubagent"}
+)
+SUBAGENT_PATH_PARTS = frozenset({"fork", "forks", "subagent", "subagents"})
 
 
 def read_json(path: Path, fallback: Any) -> Any:
@@ -229,13 +298,20 @@ def claim_lease(data_dir: Path) -> Iterable[None]:
 
 def append_jsonl(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, separators=(",", ":"), sort_keys=True))
-        handle.write("\n")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o600)
     try:
         os.chmod(path, 0o600)
-    except OSError:
-        pass
+        handle = os.fdopen(descriptor, "a", encoding="utf-8")
+        descriptor = -1
+    except Exception:
+        os.close(descriptor)
+        raise
+    with handle:
+        handle.write(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        handle.write("\n")
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -265,6 +341,17 @@ def resolve_data_dir(explicit: str | None = None) -> Path:
     )
     if plugin_data:
         return Path(plugin_data).expanduser()
+    # An interactive command launched from an installed marketplace cache does
+    # not receive PLUGIN_DATA. Derive the exact directory Codex gives the hooks
+    # so claim/status/work/flush and hooks always share one identity.
+    try:
+        cache_dir = PLUGIN_ROOT.parent.parent.parent
+        if cache_dir.name == "cache":
+            marketplace = PLUGIN_ROOT.parent.parent.name
+            plugin_name = PLUGIN_ROOT.parent.name
+            return cache_dir.parent / "data" / f"{plugin_name}-{marketplace}"
+    except (IndexError, OSError):
+        pass
     return FALLBACK_ROOT
 
 
@@ -609,6 +696,254 @@ def capped_active_from(previous: dict[str, Any], now_ms: int) -> int | None:
     return start
 
 
+def allowed_transcript_roots() -> tuple[Path, ...]:
+    configured_home = os.environ.get("CODEX_HOME")
+    if configured_home:
+        candidate = Path(configured_home).expanduser()
+        homes = [candidate] if candidate.is_absolute() else []
+    else:
+        homes = [Path.home() / ".codex"]
+
+    roots: list[Path] = []
+    for home in homes:
+        for directory in ("sessions", "archived_sessions"):
+            try:
+                root = (home / directory).resolve(strict=False)
+            except OSError:
+                continue
+            if root not in roots:
+                roots.append(root)
+    return tuple(roots)
+
+
+def validated_transcript_path(payload: dict[str, Any]) -> Path | None:
+    value = payload.get("transcript_path")
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or "\x00" in value
+    ):
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() or candidate.suffix.lower() != ".jsonl":
+        return None
+    try:
+        if candidate.is_symlink():
+            return None
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            return None
+    except OSError:
+        return None
+    if not any(
+        resolved == root or root in resolved.parents
+        for root in allowed_transcript_roots()
+    ):
+        return None
+    return resolved
+
+
+def source_marks_subagent_or_fork(source: Any) -> bool:
+    """Recognize only explicit Codex child-session metadata, never free text."""
+    if isinstance(source, str):
+        return source.strip().lower() in SUBAGENT_SOURCE_KEYS
+    return isinstance(source, dict) and bool(SUBAGENT_SOURCE_KEYS & set(source))
+
+
+def payload_marks_subagent_or_fork(payload: dict[str, Any]) -> bool:
+    event_name = payload.get("hook_event_name")
+    if event_name in {"SubagentStart", "SubagentStop"}:
+        return True
+    if any(
+        key in payload and payload.get(key) not in (None, False, "")
+        for key in SUBAGENT_FLAG_KEYS
+    ):
+        return True
+    if any(
+        key in payload and payload.get(key) not in (None, False, "")
+        for key in SUBAGENT_PARENT_KEYS
+    ):
+        return True
+    return source_marks_subagent_or_fork(payload.get("source"))
+
+
+def transcript_marks_subagent_or_fork(path: Path) -> bool:
+    """Inspect only bounded structural session metadata and retain nothing."""
+    if any(part.lower() in SUBAGENT_PATH_PARTS for part in path.parts):
+        return True
+    try:
+        with path.open("rb") as handle:
+            raw_line = handle.readline(TOKEN_USAGE_MAX_RECORD_BYTES + 1)
+        if not raw_line or len(raw_line) > TOKEN_USAGE_MAX_RECORD_BYTES:
+            return False
+        record = json.loads(raw_line.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return False
+    metadata = record.get("payload")
+    return isinstance(metadata, dict) and source_marks_subagent_or_fork(
+        metadata.get("source")
+    )
+
+
+def transcript_structurally_marks_primary(path: Path) -> bool:
+    """Require trusted, bounded session metadata with no child-run markers."""
+    if any(part.lower() in SUBAGENT_PATH_PARTS for part in path.parts):
+        return False
+    try:
+        with path.open("rb") as handle:
+            raw_line = handle.readline(TOKEN_USAGE_MAX_RECORD_BYTES + 1)
+        if not raw_line or len(raw_line) > TOKEN_USAGE_MAX_RECORD_BYTES:
+            return False
+        record = json.loads(raw_line.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return False
+    metadata = record.get("payload")
+    return isinstance(metadata, dict) and not payload_marks_subagent_or_fork(metadata)
+
+
+def is_primary_user_prompt(payload: dict[str, Any]) -> bool:
+    if payload.get("hook_event_name") != "UserPromptSubmit":
+        return False
+    if payload_marks_subagent_or_fork(payload):
+        return False
+    path = validated_transcript_path(payload)
+    return path is not None and transcript_structurally_marks_primary(path)
+
+
+def truncate_utf8(text: str, max_bytes: int = PROMPT_MAX_BYTES) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def redact_prompt_text(text: str) -> tuple[str, bool]:
+    redacted = False
+
+    def replace_private_key(match: re.Match[str]) -> str:
+        nonlocal redacted
+        redacted = True
+        return "[REDACTED PRIVATE KEY]"
+
+    def replace_authorization(match: re.Match[str]) -> str:
+        nonlocal redacted
+        redacted = True
+        return f"{match.group(1)}[REDACTED]"
+
+    text = PRIVATE_KEY_PATTERN.sub(replace_private_key, text)
+    text = AUTHORIZATION_PATTERN.sub(replace_authorization, text)
+    text, bearer_count = BEARER_PATTERN.subn("Bearer [REDACTED]", text)
+    redacted = redacted or bearer_count > 0
+    for pattern in API_TOKEN_PATTERNS:
+        text, count = pattern.subn("[REDACTED API TOKEN]", text)
+        redacted = redacted or count > 0
+    return text, redacted
+
+
+def bounded_redacted_prompt(value: Any) -> tuple[str, bool, bool] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        original_exceeds_limit = len(value.encode("utf-8")) > PROMPT_MAX_BYTES
+    except UnicodeEncodeError:
+        return None
+    redacted_text, redacted = redact_prompt_text(value)
+    bounded, wire_truncated = truncate_utf8(redacted_text)
+    return bounded, redacted, original_exceeds_limit or wire_truncated
+
+
+def token_usage_from_record(record: Any) -> dict[str, int] | None:
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    totals = info.get("total_token_usage")
+    if (
+        not isinstance(totals, dict)
+        or not set(totals).issubset(TOKEN_USAGE_SOURCE_KEYS)
+        or not all(source in totals for source, _ in TOKEN_USAGE_FIELDS)
+    ):
+        return None
+
+    snapshot: dict[str, int] = {}
+    for source, destination in TOKEN_USAGE_FIELDS:
+        value = totals[source]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > MAX_SAFE_INTEGER
+        ):
+            return None
+        snapshot[destination] = value
+    return snapshot
+
+
+def validated_token_usage(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict) or set(value) != set(TOKEN_USAGE_KEYS):
+        return None
+    snapshot: dict[str, int] = {}
+    for key in TOKEN_USAGE_KEYS:
+        counter = value[key]
+        if (
+            isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or counter < 0
+            or counter > MAX_SAFE_INTEGER
+        ):
+            return None
+        snapshot[key] = counter
+    return snapshot
+
+
+def token_usage_snapshot(payload: dict[str, Any]) -> dict[str, int] | None:
+    """Read one cumulative numeric snapshot without retaining path or transcript data."""
+    try:
+        if payload_marks_subagent_or_fork(payload):
+            return None
+        path = validated_transcript_path(payload)
+        if path is None or transcript_marks_subagent_or_fork(path):
+            return None
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - TOKEN_USAGE_TAIL_BYTES)
+            handle.seek(start)
+            raw_tail = handle.read(TOKEN_USAGE_TAIL_BYTES)
+        lines = raw_tail.splitlines()
+        if start and lines:
+            lines = lines[1:]
+        for raw_line in reversed(lines):
+            if (
+                b'"token_count"' not in raw_line
+                or len(raw_line) > TOKEN_USAGE_MAX_RECORD_BYTES
+            ):
+                continue
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            record_payload = record.get("payload") if isinstance(record, dict) else None
+            if (
+                isinstance(record_payload, dict)
+                and record.get("type") == "event_msg"
+                and record_payload.get("type") == "token_count"
+            ):
+                return token_usage_from_record(record)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return None
+
+
 def telemetry_payload(
     *,
     installation_id: str,
@@ -619,9 +954,15 @@ def telemetry_payload(
     state: str,
     occurred_at: int,
     active_from: int | None,
+    token_usage: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    safe_token_usage = validated_token_usage(token_usage)
     event: dict[str, Any] = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": (
+            TOKEN_USAGE_SCHEMA_VERSION
+            if safe_token_usage is not None
+            else SCHEMA_VERSION
+        ),
         "eventId": str(uuid.uuid4()),
         "installationId": installation_id,
         "sessionKey": key,
@@ -635,6 +976,38 @@ def telemetry_payload(
         event["featureLabel"] = feature_label
     if active_from:
         event["activeFrom"] = active_from
+    if safe_token_usage is not None:
+        event["tokenUsage"] = safe_token_usage
+    return event
+
+
+def prompt_payload(
+    *,
+    installation_id: str,
+    key: str,
+    project_id: str,
+    feature_id: str | None,
+    feature_label: str | None,
+    prompt_text: str,
+    occurred_at: int,
+    redacted: bool,
+    truncated: bool,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "promptId": str(uuid.uuid4()),
+        "installationId": installation_id,
+        "sessionKey": key,
+        "projectId": project_id,
+        "promptText": prompt_text,
+        "occurredAt": occurred_at,
+        "pluginVersion": PLUGIN_VERSION,
+        "redacted": redacted,
+        "truncated": truncated,
+    }
+    if feature_id and feature_label:
+        event["featureId"] = feature_id
+        event["featureLabel"] = feature_label
     return event
 
 
@@ -650,6 +1023,121 @@ def enqueue_event_unlocked(
     records.append(event)
     if len(records) > max_events:
         atomic_write_jsonl(path, records[-max_events:])
+
+
+def enqueue_prompt_unlocked(
+    data_dir: Path,
+    event: dict[str, Any],
+    max_events: int,
+    now_ms: int | None = None,
+) -> None:
+    path = data_dir / "prompt-outbox.jsonl"
+    records, _ = prune_prompt_outbox_unlocked(
+        path,
+        utc_now_ms() if now_ms is None else now_ms,
+    )
+    prompt_id = event.get("promptId")
+    if any(record.get("promptId") == prompt_id for record in records):
+        return
+    append_jsonl(path, event)
+    records.append(event)
+    if len(records) > max_events:
+        atomic_write_jsonl(path, records[-max_events:])
+
+
+def retained_prompt_records(
+    records: list[dict[str, Any]], now_ms: int
+) -> tuple[list[dict[str, Any]], int]:
+    cutoff = now_ms - PROMPT_RETENTION_MS
+    retained: list[dict[str, Any]] = []
+    expired = 0
+    for record in records:
+        occurred_at = record.get("occurredAt")
+        if (
+            not isinstance(occurred_at, int)
+            or isinstance(occurred_at, bool)
+            or occurred_at < cutoff
+        ):
+            expired += 1
+        else:
+            retained.append(record)
+    return retained, expired
+
+
+def prune_prompt_outbox_unlocked(
+    path: Path, now_ms: int
+) -> tuple[list[dict[str, Any]], int]:
+    records = read_jsonl(path)
+    retained, expired = retained_prompt_records(records, now_ms)
+    if expired:
+        if retained:
+            atomic_write_jsonl(path, retained)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    return retained, expired
+
+
+def record_prompt_event(
+    data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any] | None:
+    if not is_primary_user_prompt(payload):
+        return None
+    prepared = bounded_redacted_prompt(payload.get("prompt"))
+    if prepared is None:
+        return None
+
+    identity = claimed_identity(data_dir)
+    if (
+        identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
+        or not isinstance(identity.get("installationToken"), str)
+        or not isinstance(identity.get("claimedEndpoint"), str)
+    ):
+        return None
+
+    raw_session_id = str(
+        payload.get("session_id")
+        or os.environ.get("CODEX_SESSION_ID")
+        or "unknown-session"
+    )
+    key = session_key(raw_session_id)
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    _, scoped, _ = scoped_work_context(data_dir, cwd)
+    project_id = safe_project_id(payload, config, scoped)
+    feature_id, feature_label = feature_context(config, scoped)
+    prompt_text, redacted, truncated = prepared
+    occurred_at = utc_now_ms()
+    event = prompt_payload(
+        installation_id=str(identity["installationId"]),
+        key=key,
+        project_id=project_id,
+        feature_id=feature_id,
+        feature_label=feature_label,
+        prompt_text=prompt_text,
+        occurred_at=occurred_at,
+        redacted=redacted,
+        truncated=truncated,
+    )
+    with data_lock(data_dir):
+        current_identity = read_json(identity_path(data_dir), {})
+        if (
+            not isinstance(current_identity, dict)
+            or current_identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
+            or current_identity.get("installationToken")
+            != identity.get("installationToken")
+            or current_identity.get("claimedEndpoint")
+            != identity.get("claimedEndpoint")
+        ):
+            return None
+        enqueue_prompt_unlocked(
+            data_dir,
+            event,
+            int(config.get("max_outbox_events", 500)),
+            occurred_at,
+        )
+    return event
 
 
 def record_hook_event(
@@ -684,6 +1172,7 @@ def record_hook_event(
         should_emit = changed or heartbeat_due(previous, now_ms)
 
         active_from = capped_active_from(previous, now_ms) if should_emit else None
+        token_usage = token_usage_snapshot(payload) if should_emit else None
         event = (
             telemetry_payload(
                 installation_id=installation_id,
@@ -694,6 +1183,7 @@ def record_hook_event(
                 state=next_state,
                 occurred_at=now_ms,
                 active_from=active_from,
+                token_usage=token_usage,
             )
             if should_emit
             else None
@@ -814,6 +1304,22 @@ def deliver_event(
     return ok, result
 
 
+def deliver_prompt(
+    event: dict[str, Any], config: dict[str, Any], token: str, endpoint: str | None = None
+) -> tuple[bool, str]:
+    bound_endpoint = endpoint or str(config.get("endpoint") or "")
+    if not bound_endpoint or not token:
+        return False, "not_claimed"
+    ok, result, _ = http_post_json(
+        endpoint_url(bound_endpoint, "/v1/prompts"),
+        event,
+        token=token,
+        timeout=float(config.get("delivery_timeout_seconds", 1.0)),
+        expect_json=False,
+    )
+    return ok, result
+
+
 def permanent_delivery_failure(result: str) -> bool:
     match = re.fullmatch(r"http_(\d{3})", result)
     if not match:
@@ -883,6 +1389,98 @@ def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
         }
 
 
+def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
+    now_ms = utc_now_ms()
+    path = data_dir / "prompt-outbox.jsonl"
+    with data_lock(data_dir):
+        records, expired_count = prune_prompt_outbox_unlocked(path, now_ms)
+
+    identity = claimed_identity(data_dir)
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    if (
+        identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
+        or not isinstance(token, str)
+        or not token
+        or not endpoint
+    ):
+        return {
+            "delivered": 0,
+            "discarded": expired_count,
+            "remaining": len(records),
+        }
+
+    with delivery_lease(data_dir) as acquired:
+        if not acquired:
+            return {
+                "delivered": 0,
+                "discarded": expired_count,
+                "remaining": len(read_jsonl(path)),
+                "busy": 1,
+            }
+        with data_lock(data_dir):
+            records, newly_expired = prune_prompt_outbox_unlocked(path, utc_now_ms())
+            expired_count += newly_expired
+            limit = int(config.get("max_flush_events", 3))
+            attempted = records[:limit]
+
+        delivered_ids: set[str] = set()
+        discarded_ids: set[str] = set()
+        capture_rejected = False
+        for event in attempted:
+            ok, result = deliver_prompt(event, config, token, str(endpoint))
+            prompt_id = event.get("promptId")
+            if ok and isinstance(prompt_id, str):
+                delivered_ids.add(prompt_id)
+            elif result in {"http_401", "http_403"}:
+                capture_rejected = True
+                break
+            elif permanent_delivery_failure(result) and isinstance(prompt_id, str):
+                discarded_ids.add(prompt_id)
+
+        if capture_rejected:
+            with data_lock(data_dir):
+                current = read_jsonl(path)
+                current_identity = read_json(identity_path(data_dir), {})
+                if isinstance(current_identity, dict):
+                    current_identity["promptCapture"] = "off"
+                    atomic_write_json(identity_path(data_dir), current_identity)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            return {
+                "delivered": len(delivered_ids),
+                "discarded": expired_count
+                + max(0, len(current) - len(delivered_ids)),
+                "remaining": 0,
+            }
+
+        removed_ids = delivered_ids | discarded_ids
+        if removed_ids:
+            with data_lock(data_dir):
+                current = read_jsonl(path)
+                remaining = [
+                    event
+                    for event in current
+                    if event.get("promptId") not in removed_ids
+                ]
+                if remaining:
+                    atomic_write_jsonl(path, remaining)
+                else:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+        else:
+            remaining = read_jsonl(path)
+        return {
+            "delivered": len(delivered_ids),
+            "discarded": expired_count + len(discarded_ids),
+            "remaining": len(remaining),
+        }
+
+
 def ingest_hook(data_dir: Path) -> int:
     # Never echo raw input or error details: hook failures must be invisible to Codex.
     try:
@@ -897,11 +1495,18 @@ def ingest_hook(data_dir: Path) -> int:
     try:
         config = load_config(data_dir)
         if config.get("enabled", True):
+            prompt_event = record_prompt_event(data_dir, payload, config)
             event = record_hook_event(data_dir, payload, config)
-            if event is not None:
+            # SessionEnd is synchronous in Codex even for async hooks. Persist
+            # idle locally and let the next hook/manual flush deliver it.
+            if (
+                payload.get("hook_event_name") != "SessionEnd"
+                and (event is not None or prompt_event is not None)
+            ):
                 flush_outbox(data_dir, config)
+                flush_prompt_outbox(data_dir, config)
     except Exception:
-        # Telemetry is strictly best effort and may never break a builder session.
+        # Delivery is strictly best effort and may never break a builder session.
         pass
     print("{}")
     return 0
@@ -936,9 +1541,15 @@ def safe_identity_summary(data_dir: Path) -> dict[str, Any]:
             identity.get("builderId") and identity.get("installationToken")
         ),
         "builderId": identity.get("builderId"),
+        "memberId": identity.get("memberId"),
         "builderName": identity.get("builderName"),
         "tokenConfigured": bool(identity.get("installationToken")),
         "claimedEndpoint": sanitized_endpoint(str(identity.get("claimedEndpoint") or "")),
+        "promptCapture": (
+            PROMPT_CAPTURE_POLICY
+            if identity.get("promptCapture") == PROMPT_CAPTURE_POLICY
+            else "off"
+        ),
     }
 
 
@@ -951,15 +1562,20 @@ def command_status(args: argparse.Namespace, data_dir: Path) -> int:
         "schemaVersion": SCHEMA_VERSION,
         "identity": identity,
         "heartbeatMinutes": HEARTBEAT_MINUTES,
-        "promptCapture": "off",
+        "promptCapture": identity["promptCapture"],
         "outboxEvents": len(read_jsonl(data_dir / "outbox.jsonl")),
+        "promptOutboxEvents": len(read_jsonl(data_dir / "prompt-outbox.jsonl")),
         "sessions": records,
     }
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     builder = identity.get("builderName") or identity.get("builderId") or "unclaimed"
-    print(f"Builder: {builder} | prompt capture: off | queued: {result['outboxEvents']}")
+    print(
+        f"Builder: {builder} | prompt capture: {result['promptCapture']} | "
+        f"state queued: {result['outboxEvents']} | "
+        f"prompts queued: {result['promptOutboxEvents']}"
+    )
     if not records:
         print("No Builder Pulse state yet. Start a Codex turn after claiming.")
         return 0
@@ -997,6 +1613,7 @@ def command_mark(args: argparse.Namespace, data_dir: Path) -> int:
     event = record_hook_event(data_dir, payload, config)
     if event is not None:
         flush_outbox(data_dir, config)
+        flush_prompt_outbox(data_dir, config)
     print(json.dumps({"state": args.state, "sessionKey": key}, indent=2))
     return 0
 
@@ -1006,8 +1623,9 @@ def display_config(config: dict[str, Any], data_dir: Path) -> dict[str, Any]:
     result["endpoint"] = sanitized_endpoint(str(result.get("endpoint") or ""))
     result["dataDir"] = str(data_dir)
     result["heartbeatMinutes"] = HEARTBEAT_MINUTES
-    result["promptCapture"] = "off"
-    result["identity"] = safe_identity_summary(data_dir)
+    identity = safe_identity_summary(data_dir)
+    result["promptCapture"] = identity["promptCapture"]
+    result["identity"] = identity
     return result
 
 
@@ -1125,6 +1743,20 @@ def validate_builder_name(value: Any) -> str:
     return text
 
 
+def validate_member_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid memberId")
+    text = value.strip()
+    if (
+        not text
+        or len(text) > 128
+        or text != value
+        or re.fullmatch(r"[A-Za-z0-9._:-]+", text) is None
+    ):
+        raise ValueError("invalid memberId")
+    return text
+
+
 def command_claim(args: argparse.Namespace, data_dir: Path) -> int:
     with claim_lease(data_dir):
         return _command_claim_locked(args, data_dir)
@@ -1158,8 +1790,14 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                     "alreadyClaimed": True,
                     "installationId": identity["installationId"],
                     "builderId": identity.get("builderId"),
+                    "memberId": identity.get("memberId"),
                     "builderName": identity.get("builderName"),
                     "tokenConfigured": True,
+                    "promptCapture": (
+                        PROMPT_CAPTURE_POLICY
+                        if identity.get("promptCapture") == PROMPT_CAPTURE_POLICY
+                        else "off"
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
@@ -1173,6 +1811,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
     if not invite_code:
         print("Claim error: provide --code or BUILDER_PULSE_INVITE_CODE.", file=sys.stderr)
         return 2
+
+    print(SETUP_DISCLOSURE, file=sys.stderr)
 
     pending_token = identity.get("pendingInstallationToken")
     pending_endpoint = identity.get("pendingEndpoint")
@@ -1195,7 +1835,7 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
         atomic_write_json(identity_path(data_dir), identity)
 
     request_payload = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": CLAIM_SCHEMA_VERSION,
         "inviteCode": invite_code,
         "installationId": identity["installationId"],
         "installationToken": pending_token,
@@ -1213,12 +1853,13 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
         return 1
     try:
         builder_id = validate_identifier(response.get("builderId"), "builderId")
+        member_id = validate_member_id(response.get("memberId"))
         builder_name = validate_builder_name(response.get("name"))
-        if not builder_id:
+        if not builder_id or not member_id:
             raise ValueError("invalid claim identity")
         if response.get("heartbeatMinutes") != HEARTBEAT_MINUTES:
             raise ValueError("unsupported heartbeat policy")
-        if response.get("promptCapture") != "off":
+        if response.get("promptCapture") != PROMPT_CAPTURE_POLICY:
             raise ValueError("unsupported prompt capture policy")
     except (TypeError, ValueError):
         print("Claim failed: invalid_response.", file=sys.stderr)
@@ -1228,8 +1869,10 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
         "installationId": identity["installationId"],
         "installationToken": pending_token,
         "builderId": builder_id,
+        "memberId": member_id,
         "builderName": builder_name,
         "claimedEndpoint": endpoint,
+        "promptCapture": PROMPT_CAPTURE_POLICY,
     }
     atomic_write_json(identity_path(data_dir), claimed)
 
@@ -1249,10 +1892,11 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                 "claimed": True,
                 "installationId": claimed["installationId"],
                 "builderId": builder_id,
+                "memberId": member_id,
                 "builderName": builder_name,
                 "tokenConfigured": True,
                 "heartbeatMinutes": HEARTBEAT_MINUTES,
-                "promptCapture": "off",
+                "promptCapture": PROMPT_CAPTURE_POLICY,
             },
             indent=2,
             sort_keys=True,
@@ -1262,14 +1906,18 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
 
 
 def command_flush(data_dir: Path) -> int:
-    result = flush_outbox(data_dir, load_config(data_dir))
+    config = load_config(data_dir)
+    result = {
+        "telemetry": flush_outbox(data_dir, config),
+        "prompts": flush_prompt_outbox(data_dir, config),
+    }
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Minimal Builder Pulse lifecycle telemetry (raw prompts off)"
+        description="Builder Pulse lifecycle, token, and submitted-prompt telemetry"
     )
     parser.add_argument(
         "--data-dir",

@@ -1,5 +1,5 @@
 {
-  "description": "Minimal builder state telemetry. Raw prompts, prompt lengths, commands, paths, source code, and tool I/O are never persisted or sent; only state changes and 15-minute heartbeats are queued.",
+  "description": "Builder progress and learning-feedback telemetry. Primary UserPromptSubmit text is secret-redacted, UTF-8 bounded, and sent through a separate retry queue; separate command, path, source, transcript, assistant-response, and tool-I/O hook fields are never sent. Due lifecycle events may include five cumulative numeric Codex token counters; subagent and fork capture stays off.",
   "hooks": {
     "SessionStart": [
       {

@@ -1,13 +1,16 @@
 # Builder Pulse
 
-Builder Pulse answers four small questions: **who is building, which product,
-which feature, and what coarse state are they in?** It is intentionally not a
-prompt recorder or employee-monitoring agent.
+Builder Pulse connects a builder's claimed installation to GrowthX, reports
+coarse progress, and sends submitted Codex prompts so GrowthX can provide
+learning feedback.
 
 ## Consent and data boundary
 
-Installing and claiming Builder Pulse enables the minimal telemetry described
-below. A builder should see this disclosure before using their invite code.
+Installing and claiming Builder Pulse enables the data collection described
+below. The claim command displays this exact disclosure before making the
+request:
+
+> Builder Pulse connects you with GrowthX so that we can track your progress and provide you learning feedback.
 
 Builder Pulse sends only:
 
@@ -16,12 +19,39 @@ Builder Pulse sends only:
 - an optional feature ID and feature label explicitly set by the builder;
 - `building`, `testing`, `blocked`, `ready`, or `idle`;
 - event time, an optional active interval capped at 15 minutes, and plugin version.
+- when Codex exposes it, an optional cumulative per-session numeric token snapshot:
+  input, cached input, output, reasoning output, and total tokens.
+- on each primary `UserPromptSubmit`, the submitted prompt text (after
+  high-confidence secret redaction and a 64 KiB UTF-8 bound), a stable prompt
+  ID, and `redacted` / `truncated` flags.
 
-Raw prompts are **off**. Prompt text, prompt length, commands, full paths,
-source code, patches, tool input/output, transcript data, environment variables,
-and endpoint response bodies are never persisted, queued, or forwarded. A shell
-command may be inspected in process just long enough to recognize testing or a
-review artifact, then discarded.
+Prompt capture is **on** for claim schema v2. The redactor targets private-key
+blocks, Authorization/Bearer values, and common API-token formats. It is a
+high-confidence safety layer, not a guarantee that every possible secret will
+be recognized. The bounded redacted prompt is temporarily persisted in a
+separate local prompt outbox and forwarded to GrowthX.
+
+Separate command, path, source, patch, tool input/output, transcript, assistant
+response, environment, invite-code, and endpoint-response fields from hooks are
+never added to prompt or lifecycle events. A submitted prompt may itself mention
+such content; that user-authored message remains part of `promptText`. A shell
+command hook may be inspected in process just long enough to recognize testing
+or a review artifact, then discarded. Subagent and fork prompts are not captured.
+Prompt capture fails closed unless the hook supplies a trusted Codex transcript
+path whose first bounded record is valid `session_meta` with no subagent/fork
+source or parent markers.
+
+For an event that is already due, the plugin may best-effort inspect a bounded
+tail of the local Codex session file for the latest numeric `token_count`
+record. Only five validated nonnegative safe integers can leave that process.
+The transcript path and all other session content are discarded, never added to
+plugin state, the outbox, quarantine, or the wire payload. Missing, inaccessible,
+or malformed counters are ignored with no effect on Codex.
+
+Subagent and fork snapshots are always omitted to prevent replayed parent
+usage from being counted twice. The plugin recognizes only explicit child-run
+hook fields, exact child transcript path segments, and the structural
+`session_meta.payload.source` marker; none of that metadata is retained.
 
 Builder Pulse reports approximate **Codex-active time**, not working hours.
 Overlapping sessions and devices are deduplicated by the server.
@@ -51,23 +81,25 @@ Claim request:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.3.0"
+  "pluginVersion": "0.4.0"
 }
 ```
 
-The response supplies `builderId`, `name`, `defaultProject`,
-`heartbeatMinutes: 15`, and `promptCapture: "off"`; it does not return the
+The response supplies the internal `builderId`, the stable GrowthX `memberId`,
+`name`, `defaultProject`,
+`heartbeatMinutes: 15`, and `promptCapture: "on"`; it does not return the
 installation token. A
 non-null default project is used only when the builder has not configured one.
 
 ## Product and feature context
 
 Use a concise, non-sensitive label. Feature labels are limited to 120
-characters and never inferred from prompt text.
+characters and never inferred from prompt text. The configured project and
+feature context is attached to both lifecycle and prompt events.
 
 ```bash
 python3 <plugin-root>/scripts/builder_pulse.py work set \
@@ -87,12 +119,12 @@ with `work set`, `work show`, or `work clear-feature` to target another checkout
 
 ## Delivery behavior
 
-Hooks run asynchronously and reduce rich hook input to the coarse state in
-memory. Only essential lifecycle hooks and matched post-tool events launch the
-runtime. A telemetry event is created only when state changes or a 15-minute
-heartbeat is due. Observed hook continuity can create an active interval; a gap
-over 15 minutes never receives active credit. `SessionEnd` changes the state to
-`idle`.
+Hooks run asynchronously. Only essential lifecycle hooks and matched post-tool
+events launch the runtime. A lifecycle telemetry event is created only when
+state changes or a 15-minute heartbeat is due. Observed hook continuity can
+create an active interval; a gap over 15 minutes never receives active credit.
+`SessionEnd` changes the state to `idle`. Reading token totals does not create
+another lifecycle event or network request.
 
 Claimed installations append the exact minimal event to a bounded local
 `outbox.jsonl`, then make a best-effort `POST /v1/telemetry` with the
@@ -101,11 +133,42 @@ for server-side deduplication and retry on a later state change/heartbeat. Queue
 updates are file-locked and atomic; normal enqueue is append-only, with bounded
 compaction at 500 events. Delivery failure never interrupts Codex.
 
-The wire payload contains only:
+Separately, every eligible primary `UserPromptSubmit` creates the exact bounded
+prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
+`POST /v1/prompts` with the same bearer token:
 
 ```json
 {
   "schemaVersion": 1,
+  "promptId": "uuid",
+  "installationId": "uuid",
+  "sessionKey": "short-hash",
+  "projectId": "growthx-community",
+  "featureId": "member-search-filters",
+  "featureLabel": "Member search filters",
+  "promptText": "Help me improve the member search experience.",
+  "occurredAt": 1787721000000,
+  "pluginVersion": "0.4.0",
+  "redacted": false,
+  "truncated": false
+}
+```
+
+`featureId` and `featureLabel` are omitted when unavailable. The prompt outbox
+uses the same file lock, maximum queue length, and flush batch size as the
+lifecycle outbox. Its first creation is `0600` before any prompt bytes are
+written. Network failures keep the same `promptId` for an idempotent later retry,
+with a local 60-day maximum retention period. Older captures are deleted.
+Permanently rejected prompt events are discarded rather than copied to lifecycle
+quarantine. A prompt endpoint `401` or `403` disables local prompt capture and
+purges the prompt outbox without logging its contents. No prompt request is
+created by tool, assistant-response, transcript, subagent, or fork hooks.
+
+When a cumulative token snapshot is available, the wire payload is schema v2:
+
+```json
+{
+  "schemaVersion": 2,
   "eventId": "uuid",
   "installationId": "uuid",
   "sessionKey": "short-hash",
@@ -115,11 +178,24 @@ The wire payload contains only:
   "state": "building",
   "occurredAt": 1787721000000,
   "activeFrom": 1787720100000,
-  "pluginVersion": "0.3.0"
+  "tokenUsage": {
+    "inputTokens": 1200,
+    "cachedInputTokens": 300,
+    "outputTokens": 240,
+    "reasoningOutputTokens": 80,
+    "totalTokens": 1440
+  },
+  "pluginVersion": "0.4.0"
 }
 ```
 
-`featureId`, `featureLabel`, and `activeFrom` are omitted when unavailable.
+`tokenUsage` is cumulative for the hashed Codex session, not a per-prompt
+measurement. Each of its five fields is a required nonnegative JSON-safe integer.
+The legacy local `cache_write_input_tokens` counter, when present, is ignored
+and never transported.
+`featureId`, `featureLabel`, and `activeFrom` are omitted when unavailable. If
+no valid token snapshot is available, `tokenUsage` is omitted and the exact
+existing schema v1 payload is preserved.
 
 ## Status and configuration
 
@@ -131,19 +207,24 @@ python3 <plugin-root>/scripts/builder_pulse.py mark blocked
 python3 <plugin-root>/scripts/builder_pulse.py flush
 ```
 
-The hook runtime normally writes to Codex's `PLUGIN_DATA`. Set
-`BUILDER_PULSE_DATA_DIR` or pass `--data-dir` for explicit CLI access. Supported
+Status reports lifecycle and prompt queue counts separately. `flush` retries
+both queues.
+
+The hook runtime writes to Codex's `PLUGIN_DATA`. Interactive commands launched
+from an installed marketplace cache derive that same directory automatically.
+Set `BUILDER_PULSE_DATA_DIR` or pass `--data-dir` only for explicit local/testing access. Supported
 environment context overrides are `BUILDER_PULSE_ENDPOINT`,
 `BUILDER_PULSE_PROJECT_ID`, `BUILDER_PULSE_FEATURE_ID`, and
 `BUILDER_PULSE_FEATURE_LABEL`.
 
 ## Prepared installation and lifecycle contract
 
-Builder Pulse has not been published yet. The rollout distribution source is a
-placeholder until an approved marketplace is configured:
+Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
+repository. Install or upgrade it with:
 
 ```bash
-codex plugin add builder-pulse@<approved-marketplace>
+codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref main
+codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 The admin-provided claim command must use the installed plugin root; this build
@@ -153,9 +234,9 @@ without removing local identity, run `config set enabled false`. To uninstall,
 run `codex plugin remove builder-pulse`; uninstalling is not token revocation.
 
 For a replacement or second device, issue a new one-time invite for the same
-roster email, claim on the new installation, and revoke the old installation
-server-side. Never copy `identity.json` between devices. A lost or compromised
-device requires server-side revocation before replacement.
+GrowthX member ID, claim on the new installation, and revoke the old installation
+in the admin dashboard. Never copy `identity.json` between devices. A lost or
+compromised device requires server-side revocation before replacement.
 
 ## Verification
 

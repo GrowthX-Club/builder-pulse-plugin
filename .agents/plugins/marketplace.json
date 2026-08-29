@@ -1,0 +1,20 @@
+{
+  "name": "growthx-builder-tools",
+  "interface": {
+    "displayName": "GrowthX Builder Tools"
+  },
+  "plugins": [
+    {
+      "name": "builder-pulse",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Education & Research"
+    }
+  ]
+}
