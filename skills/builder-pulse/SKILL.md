@@ -62,9 +62,7 @@ Feature context must be concise and non-sensitive. Never copy a raw prompt into
 the feature label.
 
 ```bash
-<python> <resolved-cli-path> work set \
-  --project growthx-community \
-  --feature "Member search filters"
+<python> <resolved-cli-path> work set --project growthx-community --feature "Member search filters"
 <python> <resolved-cli-path> work show
 <python> <resolved-cli-path> work clear-feature
 ```

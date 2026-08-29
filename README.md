@@ -71,8 +71,7 @@ later claim or configuration override. Plain HTTP is accepted only on loopback
 for local development.
 
 ```bash
-<python> <plugin-root>/scripts/builder_pulse.py \
-  claim --endpoint https://precious-ant-429.convex.site
+<python> <plugin-root>/scripts/builder_pulse.py claim --endpoint https://precious-ant-429.convex.site
 ```
 
 The CLI asks for the invite code without echoing it. For managed setup, use
@@ -105,9 +104,7 @@ characters and never inferred from prompt text. The configured project and
 feature context is attached to both lifecycle and prompt events.
 
 ```bash
-<python> <plugin-root>/scripts/builder_pulse.py work set \
-  --project growthx-community \
-  --feature "Member search filters"
+<python> <plugin-root>/scripts/builder_pulse.py work set --project growthx-community --feature "Member search filters"
 
 <python> <plugin-root>/scripts/builder_pulse.py work show
 <python> <plugin-root>/scripts/builder_pulse.py work clear-feature
@@ -249,7 +246,7 @@ compromised device requires server-side revocation before replacement.
 ## Verification
 
 ```bash
-python3 -m unittest discover -s <plugin-root>/tests -v
+<python> -m unittest discover -s <plugin-root>/tests -v
 <python> <skill-creator-root>/scripts/quick_validate.py <plugin-root>/skills/builder-pulse
 <python> <plugin-creator-root>/scripts/validate_plugin.py <plugin-root>
 ```
