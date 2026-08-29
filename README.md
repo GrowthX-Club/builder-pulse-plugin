@@ -87,7 +87,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.4.0"
+  "pluginVersion": "0.4.1"
 }
 ```
 
@@ -119,8 +119,9 @@ with `work set`, `work show`, or `work clear-feature` to target another checkout
 
 ## Delivery behavior
 
-Hooks run asynchronously. Only essential lifecycle hooks and matched post-tool
-events launch the runtime. A lifecycle telemetry event is created only when
+Hooks run asynchronously except `SessionEnd`, which Codex runs synchronously.
+Only essential lifecycle hooks and matched post-tool events launch the runtime.
+A lifecycle telemetry event is created only when
 state changes or a 15-minute heartbeat is due. Observed hook continuity can
 create an active interval; a gap over 15 minutes never receives active credit.
 `SessionEnd` changes the state to `idle`. Reading token totals does not create
@@ -148,7 +149,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.4.0",
+  "pluginVersion": "0.4.1",
   "redacted": false,
   "truncated": false
 }
@@ -185,7 +186,7 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.4.0"
+  "pluginVersion": "0.4.1"
 }
 ```
 
@@ -223,10 +224,10 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. Install the
-immutable v0.4.0 release with:
+immutable v0.4.1 release with:
 
 ```bash
-codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.0
+codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.1
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
