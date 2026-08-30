@@ -83,6 +83,28 @@ class SetupBuilderPulseTests(unittest.TestCase):
             result = setup_builder_pulse.activate(ROOT / "scripts" / "builder_pulse.py")
         self.assertEqual(result["reviewRequired"], True)
 
+    def test_nonzero_activation_cannot_report_connected(self) -> None:
+        completed = mock.Mock(
+            returncode=3,
+            stdout=(
+                '{"connected":true,"hooksTrusted":true,'
+                '"serverVerified":true}'
+            ),
+            stderr="",
+        )
+        with mock.patch.object(
+            setup_builder_pulse.subprocess,
+            "run",
+            return_value=completed,
+        ):
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "activation failed",
+            ):
+                setup_builder_pulse.activate(
+                    ROOT / "scripts" / "builder_pulse.py"
+                )
+
     def test_failed_update_restores_previous_immutable_release(self) -> None:
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
@@ -123,6 +145,73 @@ class SetupBuilderPulseTests(unittest.TestCase):
             [call.args[0] for call in install.call_args_list],
             [setup_builder_pulse.TARGET_RELEASE, "v0.4.4"],
         )
+
+    def test_partial_removal_failure_restores_previous_release(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_builder",
+                return_value={"version": "0.4.4"},
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "marketplace_state",
+                return_value={
+                    "marketplaceSource": {
+                        "source": setup_builder_pulse.REPOSITORY,
+                    }
+                },
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "remove_current",
+                side_effect=setup_builder_pulse.SetupError("marketplace removal failed"),
+            ),
+            mock.patch.object(setup_builder_pulse, "cleanup_partial") as cleanup,
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_release",
+                return_value=ROOT / "scripts" / "builder_pulse.py",
+            ) as install,
+        ):
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "marketplace removal failed",
+            ):
+                setup_builder_pulse.setup(
+                    "InviteCode_1234567890",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                )
+
+        cleanup.assert_called_once_with()
+        install.assert_called_once_with("v0.4.4")
+
+    def test_install_rejects_stale_package_version(self) -> None:
+        add_response = {"installedPath": str(ROOT)}
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env
+            if arguments[:3] == ["codex", "plugin", "add"]:
+                self.assertTrue(expect_json)
+                return add_response
+            return ""
+
+        with (
+            mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(
+                Path,
+                "read_text",
+                return_value='{"version":"0.4.4"}',
+            ),
+        ):
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "expected 0.4.5",
+            ):
+                setup_builder_pulse.install_release("v0.4.5")
 
     def test_rejects_marketplace_name_pointing_to_another_repository(self) -> None:
         with (

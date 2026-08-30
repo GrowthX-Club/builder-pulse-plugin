@@ -849,8 +849,8 @@ def redact_prompt_text(text: str) -> tuple[str, bool]:
         text, count = pattern.subn("[REDACTED API TOKEN]", text)
         redacted = redacted or count > 0
     text, invite_argument_count = re.subn(
-        r"(?i)(--code\s+)[A-Za-z0-9_-]{16,256}",
-        r"\1[REDACTED INVITE CODE]",
+        r"(?i)(--code\s+)(['\"]?)[A-Za-z0-9_-]{16,256}\2",
+        r"\1\2[REDACTED INVITE CODE]\2",
         text,
     )
     text, invite_label_count = re.subn(
@@ -858,7 +858,17 @@ def redact_prompt_text(text: str) -> tuple[str, bool]:
         r"\1[REDACTED INVITE CODE]",
         text,
     )
-    redacted = redacted or invite_argument_count > 0 or invite_label_count > 0
+    text, invite_environment_count = re.subn(
+        r"(?i)(BUILDER_PULSE_INVITE_CODE\s*=\s*)(['\"]?)[A-Za-z0-9_-]{16,256}\2",
+        r"\1\2[REDACTED INVITE CODE]\2",
+        text,
+    )
+    redacted = (
+        redacted
+        or invite_argument_count > 0
+        or invite_label_count > 0
+        or invite_environment_count > 0
+    )
     return text, redacted
 
 

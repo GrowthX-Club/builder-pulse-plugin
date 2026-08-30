@@ -113,6 +113,19 @@ def install_release(release: str) -> Path:
     cli = Path(installed_path).resolve(strict=False) / "scripts" / "builder_pulse.py"
     if not cli.is_file():
         raise SetupError("The installed Builder Pulse package is incomplete")
+    manifest = cli.parent.parent / ".codex-plugin" / "plugin.json"
+    try:
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SetupError("The installed Builder Pulse manifest is invalid") from exc
+    expected_version = release.removeprefix("v")
+    if (
+        not isinstance(manifest_data, dict)
+        or manifest_data.get("version") != expected_version
+    ):
+        raise SetupError(
+            f"Codex installed an unexpected Builder Pulse version; expected {expected_version}"
+        )
     return cli
 
 
@@ -162,7 +175,9 @@ def activate(cli: Path) -> dict[str, Any]:
             result = parse_activation(output)
         except SetupError:
             result = None
-        if isinstance(result, dict):
+        if completed.returncode == 0 and isinstance(result, dict):
+            return result
+        if isinstance(result, dict) and result.get("reviewRequired") is True:
             return result
     detail = completed.stderr.strip()
     raise SetupError(detail or "Builder Pulse activation failed")
@@ -188,11 +203,11 @@ def setup(invite_code: str, endpoint: str) -> None:
         if repository not in {REPOSITORY, REPOSITORY.removesuffix(".git")}:
             raise SetupError("The GrowthX marketplace name points to a different source")
 
-    remove_current(
-        plugin_installed=previous is not None,
-        marketplace_configured=previous_marketplace is not None,
-    )
     try:
+        remove_current(
+            plugin_installed=previous is not None,
+            marketplace_configured=previous_marketplace is not None,
+        )
         cli = install_release(TARGET_RELEASE)
     except SetupError:
         cleanup_partial()
