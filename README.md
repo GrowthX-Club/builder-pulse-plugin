@@ -87,7 +87,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.4.2"
+  "pluginVersion": "0.4.3"
 }
 ```
 
@@ -154,7 +154,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.4.2",
+  "pluginVersion": "0.4.3",
   "redacted": false,
   "truncated": false
 }
@@ -211,10 +211,16 @@ existing schema v1 payload is preserved.
 <python> <plugin-root>/scripts/builder_pulse.py config show
 <python> <plugin-root>/scripts/builder_pulse.py mark blocked
 <python> <plugin-root>/scripts/builder_pulse.py flush
+<python> <plugin-root>/scripts/builder_pulse.py activate
 ```
 
 Status reports lifecycle and prompt queue counts separately. `flush` retries
-both queues.
+both queues. `activate` reads the local Codex app-server's official
+`hooks/list` result and exits successfully only when every Builder Pulse hook
+is current, enabled, and trusted or managed and the Builder Pulse service
+accepts the claimed installation. It does not create a lifecycle event or
+change the builder's work state. A claim by itself is not a verified
+connection.
 
 The hook runtime writes to Codex's `PLUGIN_DATA`. Interactive commands launched
 from an installed marketplace cache derive that same directory automatically.

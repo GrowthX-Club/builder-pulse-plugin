@@ -15,6 +15,7 @@ paths and all other content are discarded.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import contextlib
 import datetime as dt
 import getpass
@@ -24,8 +25,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
+import queue
 from typing import Any, Iterable
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -1985,6 +1990,270 @@ def command_flush(data_dir: Path) -> int:
     return 0
 
 
+EXPECTED_PLUGIN_HOOK_EVENTS = {
+    "permissionRequest",
+    "postToolUse",
+    "sessionEnd",
+    "sessionStart",
+    "userPromptSubmit",
+}
+
+
+def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
+    """Reduce Codex's official hooks/list response to a safe readiness result."""
+    if not isinstance(response, dict):
+        return {"ready": False, "hookStatus": "invalid_response"}
+    result = response.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        return {"ready": False, "hookStatus": "invalid_response"}
+
+    entry = data[0]
+    if entry.get("errors"):
+        return {"ready": False, "hookStatus": "discovery_error"}
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return {"ready": False, "hookStatus": "invalid_response"}
+    plugin_hooks = [
+        hook
+        for hook in hooks
+        if isinstance(hook, dict)
+        and hook.get("pluginId") == "builder-pulse@growthx-builder-tools"
+    ]
+    if not plugin_hooks:
+        return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
+
+    source_path = (PLUGIN_ROOT / "hooks" / "hooks.json").resolve(strict=False)
+    discovered_event_counts = Counter(
+        hook.get("eventName")
+        for hook in plugin_hooks
+        if isinstance(hook.get("eventName"), str)
+    )
+    expected_event_counts = Counter(
+        {event_name: 1 for event_name in EXPECTED_PLUGIN_HOOK_EVENTS}
+    )
+    if (
+        len(plugin_hooks) != len(EXPECTED_PLUGIN_HOOK_EVENTS)
+        or discovered_event_counts != expected_event_counts
+    ):
+        return {
+            "ready": False,
+            "hookStatus": "incomplete",
+            "hookCount": len(plugin_hooks),
+        }
+    try:
+        current_plugin = all(
+            Path(str(hook.get("sourcePath"))).resolve(strict=False) == source_path
+            for hook in plugin_hooks
+        )
+    except (OSError, ValueError):
+        current_plugin = False
+    if not current_plugin:
+        return {
+            "ready": False,
+            "hookStatus": "stale_plugin",
+            "hookCount": len(plugin_hooks),
+        }
+    if not all(hook.get("enabled") is True for hook in plugin_hooks):
+        return {
+            "ready": False,
+            "hookStatus": "disabled",
+            "hookCount": len(plugin_hooks),
+        }
+    trust_statuses = {hook.get("trustStatus") for hook in plugin_hooks}
+    if not trust_statuses.issubset({"trusted", "managed"}):
+        status = "modified" if "modified" in trust_statuses else "review_required"
+        return {
+            "ready": False,
+            "hookStatus": status,
+            "hookCount": len(plugin_hooks),
+        }
+    return {
+        "ready": True,
+        "hookStatus": "managed" if trust_statuses == {"managed"} else "trusted",
+        "hookCount": len(plugin_hooks),
+    }
+
+
+def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, Any]:
+    """Call the local Codex app-server hooks/list API without changing config."""
+    codex = shutil.which("codex")
+    if not codex:
+        return {"ready": False, "hookStatus": "codex_not_found"}
+
+    try:
+        process = subprocess.Popen(
+            [codex, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
+        return {"ready": False, "hookStatus": "app_server_unavailable"}
+
+    responses: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            responses.put(line)
+        responses.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    def send(message: dict[str, Any]) -> bool:
+        if process.stdin is None:
+            return False
+        try:
+            process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def receive(response_id: int) -> dict[str, Any] | None:
+        deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
+        while True:
+            remaining = deadline - dt.datetime.now(dt.timezone.utc).timestamp()
+            if remaining <= 0:
+                return None
+            try:
+                line = responses.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(response, dict) and response.get("id") == response_id:
+                return response
+
+    try:
+        initialized = send(
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "builder_pulse_verifier",
+                        "title": "Builder Pulse Verifier",
+                        "version": PLUGIN_VERSION,
+                    },
+                    "capabilities": {},
+                },
+            }
+        ) and receive(1)
+        if not initialized or "error" in initialized:
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        if not send({"method": "initialized", "params": {}}) or not send(
+            {
+                "method": "hooks/list",
+                "id": 2,
+                "params": {"cwds": [str(cwd.resolve(strict=False))]},
+            }
+        ):
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        response = receive(2)
+        if response is None:
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        return evaluate_builder_pulse_hooks(response)
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
+    """Verify Codex hook readiness and the claimed server connection."""
+    identity = claimed_identity(data_dir)
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(endpoint, str)
+        or not endpoint
+    ):
+        print("Activation failed: this installation has not been claimed.", file=sys.stderr)
+        return 2
+
+    config = load_config(data_dir)
+    if config.get("enabled") is not True:
+        print(
+            json.dumps(
+                {
+                    "connected": False,
+                    "ready": False,
+                    "reviewRequired": False,
+                    "hookStatus": "disabled",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 3
+
+    hook_result = inspect_codex_hooks(cwd or Path.cwd())
+    if not hook_result.get("ready"):
+        print(
+            json.dumps(
+                {
+                    "connected": False,
+                    "reviewRequired": hook_result.get("hookStatus")
+                    in {"modified", "review_required"},
+                    **hook_result,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 3
+
+    ok, result, response = http_post_json(
+        endpoint_url(endpoint, "/v1/activation"),
+        {
+            "schemaVersion": 1,
+            "installationId": identity.get("installationId"),
+            "pluginVersion": PLUGIN_VERSION,
+        },
+        token=token,
+        timeout=float(config.get("claim_timeout_seconds", 10.0)),
+        expect_json=True,
+    )
+    if not ok or not isinstance(response, dict) or response.get("accepted") is not True:
+        print(f"Activation failed: {result}.", file=sys.stderr)
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "connected": True,
+                "hooksTrusted": True,
+                "serverVerified": True,
+                "hookStatus": hook_result["hookStatus"],
+                "hookCount": hook_result["hookCount"],
+                "installationId": identity.get("installationId"),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Builder Pulse lifecycle, token, and submitted-prompt telemetry"
@@ -2032,6 +2301,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_unset.add_argument("key", choices=sorted(CONFIG_KEYS))
 
     subparsers.add_parser("flush", help="Retry queued minimal events")
+    subparsers.add_parser(
+        "activate",
+        help="Verify official Codex hook trust and the claimed server connection",
+    )
     return parser
 
 
@@ -2053,6 +2326,8 @@ def main() -> int:
         return command_config(args, data_dir)
     if args.command == "flush":
         return command_flush(data_dir)
+    if args.command == "activate":
+        return command_activate(data_dir)
     return 2
 
 
