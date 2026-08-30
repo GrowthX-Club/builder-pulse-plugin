@@ -209,46 +209,83 @@ class BuilderPulseTests(unittest.TestCase):
         config = builder_pulse.load_config(self.data_dir)
         self.assertEqual(config["project_id"], "community-app")
 
-    def test_activate_succeeds_only_after_server_accepts_telemetry(self) -> None:
+    def test_activate_succeeds_only_after_codex_and_server_verify_connection(self) -> None:
         identity = self.claim_locally()
         output = io.StringIO()
         with mock.patch.object(
             builder_pulse,
-            "deliver_event",
-            return_value=(True, "delivered"),
-        ) as delivered, contextlib.redirect_stdout(output):
+            "inspect_codex_hooks",
+            return_value={
+                "ready": True,
+                "hookStatus": "trusted",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(True, "delivered", {"accepted": True}),
+        ) as posted, contextlib.redirect_stdout(output):
             result = builder_pulse.command_activate(self.data_dir)
 
         self.assertEqual(result, 0)
-        activation = delivered.call_args.args[0]
-        self.assertEqual(activation["state"], "building")
+        self.assertEqual(posted.call_args.args[0], "https://pulse.example/v1/activation")
+        activation = posted.call_args.args[1]
+        self.assertEqual(activation["schemaVersion"], 1)
         self.assertEqual(activation["installationId"], identity["installationId"])
-        self.assertEqual(delivered.call_args.args[3], "https://pulse.example")
+        self.assertEqual(activation["pluginVersion"], builder_pulse.PLUGIN_VERSION)
         response = json.loads(output.getvalue())
         self.assertEqual(response["connected"], True)
-        self.assertEqual(response["telemetryVerified"], True)
+        self.assertEqual(response["hooksTrusted"], True)
+        self.assertEqual(response["serverVerified"], True)
+        self.assertEqual(response["hookCount"], 5)
         self.assertNotIn(identity["installationToken"], output.getvalue())
         self.assertEqual(
             builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
             [],
         )
 
-    def test_activate_keeps_event_queued_when_delivery_fails(self) -> None:
+    def test_activate_requires_official_codex_hook_review(self) -> None:
+        self.claim_locally()
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "inspect_codex_hooks",
+            return_value={
+                "ready": False,
+                "hookStatus": "review_required",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(builder_pulse, "http_post_json") as posted, contextlib.redirect_stdout(output):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 3)
+        posted.assert_not_called()
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["connected"], False)
+        self.assertEqual(response["reviewRequired"], True)
+        self.assertEqual(response["hookStatus"], "review_required")
+
+    def test_activate_does_not_queue_fake_state_when_server_is_unavailable(self) -> None:
         self.claim_locally()
         error = io.StringIO()
         with mock.patch.object(
             builder_pulse,
-            "deliver_event",
-            return_value=(False, "network_error"),
+            "inspect_codex_hooks",
+            return_value={
+                "ready": True,
+                "hookStatus": "trusted",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(False, "network_error", None),
         ), contextlib.redirect_stderr(error):
             result = builder_pulse.command_activate(self.data_dir)
 
         self.assertEqual(result, 1)
-        self.assertIn("queued for retry", error.getvalue())
-        self.assertEqual(
-            len(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")),
-            1,
-        )
+        self.assertIn("network_error", error.getvalue())
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
 
     def test_activate_rejects_an_unclaimed_installation(self) -> None:
         error = io.StringIO()
@@ -256,6 +293,37 @@ class BuilderPulseTests(unittest.TestCase):
             result = builder_pulse.command_activate(self.data_dir)
         self.assertEqual(result, 2)
         self.assertIn("has not been claimed", error.getvalue())
+
+    def test_hook_readiness_requires_current_enabled_trusted_plugin_hooks(self) -> None:
+        source_path = str(builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json")
+        hooks = [
+            {
+                "pluginId": "builder-pulse@growthx-builder-tools",
+                "eventName": event_name,
+                "sourcePath": source_path,
+                "enabled": True,
+                "trustStatus": "trusted",
+            }
+            for event_name in builder_pulse.EXPECTED_PLUGIN_HOOK_EVENTS
+        ]
+        response = {"result": {"data": [{"hooks": hooks, "errors": []}]}}
+        self.assertEqual(
+            builder_pulse.evaluate_builder_pulse_hooks(response),
+            {"ready": True, "hookStatus": "trusted", "hookCount": 5},
+        )
+
+        hooks[0]["trustStatus"] = "untrusted"
+        self.assertEqual(
+            builder_pulse.evaluate_builder_pulse_hooks(response),
+            {"ready": False, "hookStatus": "review_required", "hookCount": 5},
+        )
+
+        hooks[0]["trustStatus"] = "trusted"
+        hooks[0]["sourcePath"] = "/tmp/stale/hooks/hooks.json"
+        self.assertEqual(
+            builder_pulse.evaluate_builder_pulse_hooks(response),
+            {"ready": False, "hookStatus": "stale_plugin", "hookCount": 5},
+        )
 
     def test_member_id_validation_is_strict(self) -> None:
         self.assertEqual(

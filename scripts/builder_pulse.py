@@ -24,8 +24,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
+import queue
 from typing import Any, Iterable
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -1985,8 +1989,188 @@ def command_flush(data_dir: Path) -> int:
     return 0
 
 
-def command_activate(data_dir: Path) -> int:
-    """Send one lifecycle event and succeed only after the server accepts it."""
+EXPECTED_PLUGIN_HOOK_EVENTS = {
+    "permissionRequest",
+    "postToolUse",
+    "sessionEnd",
+    "sessionStart",
+    "userPromptSubmit",
+}
+
+
+def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
+    """Reduce Codex's official hooks/list response to a safe readiness result."""
+    if not isinstance(response, dict):
+        return {"ready": False, "hookStatus": "invalid_response"}
+    result = response.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        return {"ready": False, "hookStatus": "invalid_response"}
+
+    entry = data[0]
+    if entry.get("errors"):
+        return {"ready": False, "hookStatus": "discovery_error"}
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return {"ready": False, "hookStatus": "invalid_response"}
+    plugin_hooks = [
+        hook
+        for hook in hooks
+        if isinstance(hook, dict)
+        and hook.get("pluginId") == "builder-pulse@growthx-builder-tools"
+    ]
+    if not plugin_hooks:
+        return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
+
+    source_path = (PLUGIN_ROOT / "hooks" / "hooks.json").resolve(strict=False)
+    discovered_events = {
+        hook.get("eventName")
+        for hook in plugin_hooks
+        if isinstance(hook.get("eventName"), str)
+    }
+    if discovered_events != EXPECTED_PLUGIN_HOOK_EVENTS:
+        return {
+            "ready": False,
+            "hookStatus": "incomplete",
+            "hookCount": len(plugin_hooks),
+        }
+    try:
+        current_plugin = all(
+            Path(str(hook.get("sourcePath"))).resolve(strict=False) == source_path
+            for hook in plugin_hooks
+        )
+    except (OSError, ValueError):
+        current_plugin = False
+    if not current_plugin:
+        return {
+            "ready": False,
+            "hookStatus": "stale_plugin",
+            "hookCount": len(plugin_hooks),
+        }
+    if not all(hook.get("enabled") is True for hook in plugin_hooks):
+        return {
+            "ready": False,
+            "hookStatus": "disabled",
+            "hookCount": len(plugin_hooks),
+        }
+    trust_statuses = {hook.get("trustStatus") for hook in plugin_hooks}
+    if not trust_statuses.issubset({"trusted", "managed"}):
+        status = "modified" if "modified" in trust_statuses else "review_required"
+        return {
+            "ready": False,
+            "hookStatus": status,
+            "hookCount": len(plugin_hooks),
+        }
+    return {
+        "ready": True,
+        "hookStatus": "managed" if trust_statuses == {"managed"} else "trusted",
+        "hookCount": len(plugin_hooks),
+    }
+
+
+def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, Any]:
+    """Call the local Codex app-server hooks/list API without changing config."""
+    codex = shutil.which("codex")
+    if not codex:
+        return {"ready": False, "hookStatus": "codex_not_found"}
+
+    try:
+        process = subprocess.Popen(
+            [codex, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
+        return {"ready": False, "hookStatus": "app_server_unavailable"}
+
+    responses: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            responses.put(line)
+        responses.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+
+    def send(message: dict[str, Any]) -> bool:
+        if process.stdin is None:
+            return False
+        try:
+            process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def receive(response_id: int) -> dict[str, Any] | None:
+        deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
+        while True:
+            remaining = deadline - dt.datetime.now(dt.timezone.utc).timestamp()
+            if remaining <= 0:
+                return None
+            try:
+                line = responses.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(response, dict) and response.get("id") == response_id:
+                return response
+
+    try:
+        initialized = send(
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "builder_pulse_verifier",
+                        "title": "Builder Pulse Verifier",
+                        "version": PLUGIN_VERSION,
+                    },
+                    "capabilities": {},
+                },
+            }
+        ) and receive(1)
+        if not initialized or "error" in initialized:
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        if not send({"method": "initialized", "params": {}}) or not send(
+            {
+                "method": "hooks/list",
+                "id": 2,
+                "params": {"cwds": [str(cwd.resolve(strict=False))]},
+            }
+        ):
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        response = receive(2)
+        if response is None:
+            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        return evaluate_builder_pulse_hooks(response)
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
+def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
+    """Verify Codex hook readiness and the claimed server connection."""
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
@@ -1999,51 +2183,46 @@ def command_activate(data_dir: Path) -> int:
         print("Activation failed: this installation has not been claimed.", file=sys.stderr)
         return 2
 
-    config = load_config(data_dir)
-    activation_key = session_key(f"activation-{uuid.uuid4()}")
-    event = record_hook_event(
-        data_dir,
-        {
-            "hook_event_name": "ExplicitStateMark",
-            "_session_key": activation_key,
-            "explicit_state": "building",
-        },
-        config,
-    )
-    if event is None:
-        print("Activation failed: no telemetry event was created.", file=sys.stderr)
-        return 1
-
-    ok, result = deliver_event(event, config, token, endpoint)
-    if not ok:
+    hook_result = inspect_codex_hooks(cwd or Path.cwd())
+    if not hook_result.get("ready"):
         print(
-            f"Activation failed: {result}. The event is queued for retry.",
-            file=sys.stderr,
+            json.dumps(
+                {
+                    "connected": False,
+                    "reviewRequired": hook_result.get("hookStatus")
+                    in {"modified", "review_required"},
+                    **hook_result,
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
-        return 1
+        return 3
 
-    event_id = event.get("eventId")
-    if isinstance(event_id, str):
-        with data_lock(data_dir):
-            path = data_dir / "outbox.jsonl"
-            remaining = [
-                queued
-                for queued in read_jsonl(path)
-                if queued.get("eventId") != event_id
-            ]
-            if remaining:
-                atomic_write_jsonl(path, remaining)
-            else:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+    config = load_config(data_dir)
+    ok, result, response = http_post_json(
+        endpoint_url(endpoint, "/v1/activation"),
+        {
+            "schemaVersion": 1,
+            "installationId": identity.get("installationId"),
+            "pluginVersion": PLUGIN_VERSION,
+        },
+        token=token,
+        timeout=float(config.get("claim_timeout_seconds", 10.0)),
+        expect_json=True,
+    )
+    if not ok or not isinstance(response, dict) or response.get("accepted") is not True:
+        print(f"Activation failed: {result}.", file=sys.stderr)
+        return 1
 
     print(
         json.dumps(
             {
                 "connected": True,
-                "telemetryVerified": True,
+                "hooksTrusted": True,
+                "serverVerified": True,
+                "hookStatus": hook_result["hookStatus"],
+                "hookCount": hook_result["hookCount"],
                 "installationId": identity.get("installationId"),
             },
             indent=2,
@@ -2102,7 +2281,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("flush", help="Retry queued minimal events")
     subparsers.add_parser(
         "activate",
-        help="Verify the claimed installation by delivering one telemetry event",
+        help="Verify official Codex hook trust and the claimed server connection",
     )
     return parser
 

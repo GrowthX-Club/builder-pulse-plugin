@@ -215,9 +215,12 @@ existing schema v1 payload is preserved.
 ```
 
 Status reports lifecycle and prompt queue counts separately. `flush` retries
-both queues. `activate` sends a fresh lifecycle event and exits successfully
-only after the Builder Pulse service accepts it; a claim by itself is not a
-verified connection.
+both queues. `activate` reads the local Codex app-server's official
+`hooks/list` result and exits successfully only when every Builder Pulse hook
+is current, enabled, and trusted or managed and the Builder Pulse service
+accepts the claimed installation. It does not create a lifecycle event or
+change the builder's work state. A claim by itself is not a verified
+connection.
 
 The hook runtime writes to Codex's `PLUGIN_DATA`. Interactive commands launched
 from an installed marketplace cache derive that same directory automatically.
