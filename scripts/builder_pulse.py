@@ -15,6 +15,7 @@ paths and all other content are discarded.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import contextlib
 import datetime as dt
 import getpass
@@ -2023,12 +2024,18 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
         return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
 
     source_path = (PLUGIN_ROOT / "hooks" / "hooks.json").resolve(strict=False)
-    discovered_events = {
+    discovered_event_counts = Counter(
         hook.get("eventName")
         for hook in plugin_hooks
         if isinstance(hook.get("eventName"), str)
-    }
-    if discovered_events != EXPECTED_PLUGIN_HOOK_EVENTS:
+    )
+    expected_event_counts = Counter(
+        {event_name: 1 for event_name in EXPECTED_PLUGIN_HOOK_EVENTS}
+    )
+    if (
+        len(plugin_hooks) != len(EXPECTED_PLUGIN_HOOK_EVENTS)
+        or discovered_event_counts != expected_event_counts
+    ):
         return {
             "ready": False,
             "hookStatus": "incomplete",
@@ -2183,6 +2190,22 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         print("Activation failed: this installation has not been claimed.", file=sys.stderr)
         return 2
 
+    config = load_config(data_dir)
+    if config.get("enabled") is not True:
+        print(
+            json.dumps(
+                {
+                    "connected": False,
+                    "ready": False,
+                    "reviewRequired": False,
+                    "hookStatus": "disabled",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 3
+
     hook_result = inspect_codex_hooks(cwd or Path.cwd())
     if not hook_result.get("ready"):
         print(
@@ -2199,7 +2222,6 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         )
         return 3
 
-    config = load_config(data_dir)
     ok, result, response = http_post_json(
         endpoint_url(endpoint, "/v1/activation"),
         {

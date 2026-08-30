@@ -265,6 +265,26 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(response["reviewRequired"], True)
         self.assertEqual(response["hookStatus"], "review_required")
 
+    def test_activate_rejects_a_locally_disabled_plugin_without_server_call(self) -> None:
+        self.claim_locally()
+        builder_pulse.save_config_overrides(self.data_dir, {"enabled": False})
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse, "inspect_codex_hooks"
+        ) as inspected, mock.patch.object(
+            builder_pulse, "http_post_json"
+        ) as posted, contextlib.redirect_stdout(output):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 3)
+        inspected.assert_not_called()
+        posted.assert_not_called()
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["connected"], False)
+        self.assertEqual(response["ready"], False)
+        self.assertEqual(response["reviewRequired"], False)
+        self.assertEqual(response["hookStatus"], "disabled")
+
     def test_activate_does_not_queue_fake_state_when_server_is_unavailable(self) -> None:
         self.claim_locally()
         error = io.StringIO()
@@ -324,6 +344,32 @@ class BuilderPulseTests(unittest.TestCase):
             builder_pulse.evaluate_builder_pulse_hooks(response),
             {"ready": False, "hookStatus": "stale_plugin", "hookCount": 5},
         )
+
+    def test_hook_readiness_rejects_duplicate_missing_or_extra_hooks(self) -> None:
+        source_path = str(builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json")
+
+        def hook(event_name: str) -> dict[str, object]:
+            return {
+                "pluginId": "builder-pulse@growthx-builder-tools",
+                "eventName": event_name,
+                "sourcePath": source_path,
+                "enabled": True,
+                "trustStatus": "trusted",
+            }
+
+        events = sorted(builder_pulse.EXPECTED_PLUGIN_HOOK_EVENTS)
+        cases = {
+            "duplicate": [hook(event) for event in events] + [hook(events[0])],
+            "missing": [hook(event) for event in events[:-1]],
+            "extra": [hook(event) for event in events] + [hook("preToolUse")],
+        }
+        for name, hooks in cases.items():
+            with self.subTest(name=name):
+                response = {"result": {"data": [{"hooks": hooks, "errors": []}]}}
+                result = builder_pulse.evaluate_builder_pulse_hooks(response)
+                self.assertEqual(result["ready"], False)
+                self.assertEqual(result["hookStatus"], "incomplete")
+                self.assertEqual(result["hookCount"], len(hooks))
 
     def test_member_id_validation_is_strict(self) -> None:
         self.assertEqual(
