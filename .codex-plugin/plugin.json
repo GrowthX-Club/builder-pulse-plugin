@@ -1,6 +1,6 @@
 {
   "name": "builder-pulse",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Builder progress telemetry and submitted-prompt learning feedback.",
   "author": {
     "name": "Udayan"
