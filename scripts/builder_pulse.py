@@ -1985,6 +1985,74 @@ def command_flush(data_dir: Path) -> int:
     return 0
 
 
+def command_activate(data_dir: Path) -> int:
+    """Send one lifecycle event and succeed only after the server accepts it."""
+    identity = claimed_identity(data_dir)
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(endpoint, str)
+        or not endpoint
+    ):
+        print("Activation failed: this installation has not been claimed.", file=sys.stderr)
+        return 2
+
+    config = load_config(data_dir)
+    activation_key = session_key(f"activation-{uuid.uuid4()}")
+    event = record_hook_event(
+        data_dir,
+        {
+            "hook_event_name": "ExplicitStateMark",
+            "_session_key": activation_key,
+            "explicit_state": "building",
+        },
+        config,
+    )
+    if event is None:
+        print("Activation failed: no telemetry event was created.", file=sys.stderr)
+        return 1
+
+    ok, result = deliver_event(event, config, token, endpoint)
+    if not ok:
+        print(
+            f"Activation failed: {result}. The event is queued for retry.",
+            file=sys.stderr,
+        )
+        return 1
+
+    event_id = event.get("eventId")
+    if isinstance(event_id, str):
+        with data_lock(data_dir):
+            path = data_dir / "outbox.jsonl"
+            remaining = [
+                queued
+                for queued in read_jsonl(path)
+                if queued.get("eventId") != event_id
+            ]
+            if remaining:
+                atomic_write_jsonl(path, remaining)
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    print(
+        json.dumps(
+            {
+                "connected": True,
+                "telemetryVerified": True,
+                "installationId": identity.get("installationId"),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Builder Pulse lifecycle, token, and submitted-prompt telemetry"
@@ -2032,6 +2100,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_unset.add_argument("key", choices=sorted(CONFIG_KEYS))
 
     subparsers.add_parser("flush", help="Retry queued minimal events")
+    subparsers.add_parser(
+        "activate",
+        help="Verify the claimed installation by delivering one telemetry event",
+    )
     return parser
 
 
@@ -2053,6 +2125,8 @@ def main() -> int:
         return command_config(args, data_dir)
     if args.command == "flush":
         return command_flush(data_dir)
+    if args.command == "activate":
+        return command_activate(data_dir)
     return 2
 
 

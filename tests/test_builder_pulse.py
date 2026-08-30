@@ -209,6 +209,54 @@ class BuilderPulseTests(unittest.TestCase):
         config = builder_pulse.load_config(self.data_dir)
         self.assertEqual(config["project_id"], "community-app")
 
+    def test_activate_succeeds_only_after_server_accepts_telemetry(self) -> None:
+        identity = self.claim_locally()
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "deliver_event",
+            return_value=(True, "delivered"),
+        ) as delivered, contextlib.redirect_stdout(output):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 0)
+        activation = delivered.call_args.args[0]
+        self.assertEqual(activation["state"], "building")
+        self.assertEqual(activation["installationId"], identity["installationId"])
+        self.assertEqual(delivered.call_args.args[3], "https://pulse.example")
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["connected"], True)
+        self.assertEqual(response["telemetryVerified"], True)
+        self.assertNotIn(identity["installationToken"], output.getvalue())
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
+            [],
+        )
+
+    def test_activate_keeps_event_queued_when_delivery_fails(self) -> None:
+        self.claim_locally()
+        error = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "deliver_event",
+            return_value=(False, "network_error"),
+        ), contextlib.redirect_stderr(error):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 1)
+        self.assertIn("queued for retry", error.getvalue())
+        self.assertEqual(
+            len(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")),
+            1,
+        )
+
+    def test_activate_rejects_an_unclaimed_installation(self) -> None:
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            result = builder_pulse.command_activate(self.data_dir)
+        self.assertEqual(result, 2)
+        self.assertIn("has not been claimed", error.getvalue())
+
     def test_member_id_validation_is_strict(self) -> None:
         self.assertEqual(
             builder_pulse.validate_member_id("member_17:cohort-a"),
