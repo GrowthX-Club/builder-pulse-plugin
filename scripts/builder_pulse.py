@@ -848,6 +848,17 @@ def redact_prompt_text(text: str) -> tuple[str, bool]:
     for pattern in API_TOKEN_PATTERNS:
         text, count = pattern.subn("[REDACTED API TOKEN]", text)
         redacted = redacted or count > 0
+    text, invite_argument_count = re.subn(
+        r"(?i)(--code\s+)[A-Za-z0-9_-]{16,256}",
+        r"\1[REDACTED INVITE CODE]",
+        text,
+    )
+    text, invite_label_count = re.subn(
+        r"(?i)((?:builder\s+pulse\s+)?invite\s+code\s*[:=]\s*)[A-Za-z0-9_-]{16,256}",
+        r"\1[REDACTED INVITE CODE]",
+        text,
+    )
+    redacted = redacted or invite_argument_count > 0 or invite_label_count > 0
     return text, redacted
 
 

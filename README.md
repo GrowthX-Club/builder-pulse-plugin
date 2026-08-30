@@ -7,6 +7,13 @@ learning feedback.
 In commands below, `<python>` means `python3` on macOS/Linux and `py -3` on
 Windows.
 
+## Stable setup and update
+
+The permanent setup entrypoint is [SETUP.md](SETUP.md). Builder-facing handbook
+prompts link to that file instead of embedding a release number or duplicating
+installation steps. The repository-owned installer selects the current stable
+release, so future releases require no handbook-prompt change.
+
 ## Consent and data boundary
 
 Installing and claiming Builder Pulse enables the data collection described
@@ -234,11 +241,11 @@ environment context overrides are `BUILDER_PULSE_ENDPOINT`,
 Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
-installation. The runtime uses only Python's standard library. Install the
-immutable v0.4.2 release with:
+installation. The runtime uses only Python's standard library. For manual
+recovery, install the current immutable v0.4.5 release with:
 
 ```bash
-codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.2
+codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.5
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
