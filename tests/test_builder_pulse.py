@@ -106,6 +106,7 @@ class BuilderPulseTests(unittest.TestCase):
         identity.update(
             {
                 "builderId": "builder-1",
+                "memberId": "growthx-member-1",
                 "builderName": "Builder One",
                 "installationToken": "a" * 64,
                 "claimedEndpoint": endpoint,
@@ -578,6 +579,157 @@ class BuilderPulseTests(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 2)
         opened.assert_not_called()
+
+    def test_claim_without_fresh_code_keeps_existing_identity_without_server_call(self) -> None:
+        self.claim_locally()
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        args = argparse.Namespace(endpoint="https://pulse.example", code=None)
+        output = io.StringIO()
+        with mock.patch.object(builder_pulse, "http_post_json") as posted, \
+            contextlib.redirect_stdout(output):
+            self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 0)
+
+        posted.assert_not_called()
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
+        self.assertTrue(json.loads(output.getvalue())["alreadyClaimed"])
+
+    def test_fresh_claim_code_reverifies_existing_identity_without_replacing_it(self) -> None:
+        identity = self.claim_locally()
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        response = {
+            "builderId": identity["builderId"],
+            "memberId": identity["memberId"],
+            "name": identity["builderName"],
+            "defaultProject": None,
+            "heartbeatMinutes": 15,
+            "promptCapture": "on",
+        }
+        args = argparse.Namespace(
+            endpoint="https://pulse.example", code="fresh-personalized-invite"
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(True, "delivered", response),
+        ) as posted, contextlib.redirect_stdout(output), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 0)
+
+        payload = posted.call_args.args[1]
+        self.assertEqual(payload["inviteCode"], "fresh-personalized-invite")
+        self.assertEqual(payload["installationId"], identity["installationId"])
+        self.assertEqual(payload["installationToken"], identity["installationToken"])
+        self.assertEqual(payload["pluginVersion"], builder_pulse.PLUGIN_VERSION)
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["alreadyClaimed"])
+        self.assertTrue(result["reverified"])
+
+    def test_fresh_claim_code_refuses_different_authoritative_identity(self) -> None:
+        identity = self.claim_locally()
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        response = {
+            "builderId": "builder-2",
+            "memberId": "growthx-member-2",
+            "name": "Builder Two",
+            "defaultProject": None,
+            "heartbeatMinutes": 15,
+            "promptCapture": "on",
+        }
+        args = argparse.Namespace(
+            endpoint="https://pulse.example", code="wrong-member-invite"
+        )
+        error = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(True, "delivered", response),
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(error):
+            self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 1)
+
+        self.assertIn("invite_identity_mismatch", error.getvalue())
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
+        self.assertEqual(
+            builder_pulse.read_json(builder_pulse.identity_path(self.data_dir), {}),
+            identity,
+        )
+
+    def test_fresh_claim_code_server_refusal_preserves_existing_identity(self) -> None:
+        self.claim_locally()
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        args = argparse.Namespace(
+            endpoint="https://pulse.example", code="wrong-member-invite"
+        )
+        error = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(False, "installation_exists", None),
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(error):
+            self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 1)
+
+        self.assertIn("installation_exists", error.getvalue())
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
+
+    def test_existing_identity_recovery_is_safe_end_to_end(self) -> None:
+        identity = self.claim_locally()
+        requests: list[dict] = []
+
+        class RecoveryHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                requests.append(payload)
+                same_member = payload["inviteCode"] == "same-member"
+                response = json.dumps(
+                    {
+                        "builderId": identity["builderId"] if same_member else "builder-2",
+                        "memberId": identity["memberId"] if same_member else "growthx-member-2",
+                        "name": identity["builderName"] if same_member else "Builder Two",
+                        "defaultProject": None,
+                        "heartbeatMinutes": 15,
+                        "promptCapture": "on",
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RecoveryHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        local_identity = dict(identity)
+        local_identity["claimedEndpoint"] = endpoint
+        builder_pulse.atomic_write_json(
+            builder_pulse.identity_path(self.data_dir), local_identity
+        )
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        try:
+            same_args = argparse.Namespace(endpoint=endpoint, code="same-member")
+            wrong_args = argparse.Namespace(endpoint=endpoint, code="wrong-member")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                self.assertEqual(builder_pulse.command_claim(same_args, self.data_dir), 0)
+                self.assertEqual(builder_pulse.command_claim(wrong_args, self.data_dir), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+        self.assertEqual(len(requests), 2)
+        for payload in requests:
+            self.assertEqual(payload["installationId"], identity["installationId"])
+            self.assertEqual(payload["installationToken"], identity["installationToken"])
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
 
     def test_telemetry_payload_is_exact_and_authorized(self) -> None:
         identity = self.claim_locally()

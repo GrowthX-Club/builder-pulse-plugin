@@ -1832,6 +1832,19 @@ def validate_member_id(value: Any) -> str:
     return text
 
 
+def validate_claim_response(response: dict[str, Any]) -> tuple[str, str, str]:
+    builder_id = validate_identifier(response.get("builderId"), "builderId")
+    member_id = validate_member_id(response.get("memberId"))
+    builder_name = validate_builder_name(response.get("name"))
+    if not builder_id or not member_id:
+        raise ValueError("invalid claim identity")
+    if response.get("heartbeatMinutes") != HEARTBEAT_MINUTES:
+        raise ValueError("unsupported heartbeat policy")
+    if response.get("promptCapture") != PROMPT_CAPTURE_POLICY:
+        raise ValueError("unsupported prompt capture policy")
+    return builder_id, member_id, builder_name
+
+
 def command_claim(args: argparse.Namespace, data_dir: Path) -> int:
     with claim_lease(data_dir):
         return _command_claim_locked(args, data_dir)
@@ -1850,6 +1863,7 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
     identity = ensure_identity(data_dir)
     claimed_token = identity.get("installationToken")
     claimed_endpoint = identity.get("claimedEndpoint")
+    invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE")
     if isinstance(claimed_token, str) and claimed_token:
         if not isinstance(claimed_endpoint, str) or claimed_endpoint != endpoint:
             print(
@@ -1858,6 +1872,75 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                 file=sys.stderr,
             )
             return 2
+        if invite_code:
+            try:
+                existing_builder_id = validate_identifier(
+                    identity.get("builderId"), "builderId"
+                )
+                existing_member_id = validate_member_id(identity.get("memberId"))
+                if not existing_builder_id:
+                    raise ValueError("invalid builderId")
+            except (TypeError, ValueError):
+                print(
+                    "Claim error: the existing identity cannot be safely reverified; "
+                    "use the documented replacement-device/reset flow.",
+                    file=sys.stderr,
+                )
+                return 2
+
+            print(SETUP_DISCLOSURE, file=sys.stderr)
+            request_payload = {
+                "schemaVersion": CLAIM_SCHEMA_VERSION,
+                "inviteCode": invite_code,
+                "installationId": identity["installationId"],
+                "installationToken": claimed_token,
+                "pluginVersion": PLUGIN_VERSION,
+            }
+            ok, result, response = http_post_json(
+                endpoint_url(endpoint, "/v1/claim"),
+                request_payload,
+                token=None,
+                timeout=float(config.get("claim_timeout_seconds", 10.0)),
+                expect_json=True,
+            )
+            if not ok or response is None:
+                print(f"Claim failed: {result}.", file=sys.stderr)
+                return 1
+            try:
+                builder_id, member_id, builder_name = validate_claim_response(response)
+            except (TypeError, ValueError):
+                print("Claim failed: invalid_response.", file=sys.stderr)
+                return 1
+            if (
+                builder_id != existing_builder_id
+                or member_id != existing_member_id
+            ):
+                print(
+                    "Claim failed: invite_identity_mismatch.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            print(
+                json.dumps(
+                    {
+                        "claimed": True,
+                        "alreadyClaimed": True,
+                        "reverified": True,
+                        "installationId": identity["installationId"],
+                        "builderId": builder_id,
+                        "memberId": member_id,
+                        "builderName": builder_name,
+                        "tokenConfigured": True,
+                        "heartbeatMinutes": HEARTBEAT_MINUTES,
+                        "promptCapture": PROMPT_CAPTURE_POLICY,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+
         print(
             json.dumps(
                 {
@@ -1880,7 +1963,6 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
         )
         return 0
 
-    invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE")
     if not invite_code and sys.stdin.isatty():
         invite_code = getpass.getpass("One-time invite code: ")
     if not invite_code:
@@ -1927,15 +2009,7 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
         print(f"Claim failed: {result}.", file=sys.stderr)
         return 1
     try:
-        builder_id = validate_identifier(response.get("builderId"), "builderId")
-        member_id = validate_member_id(response.get("memberId"))
-        builder_name = validate_builder_name(response.get("name"))
-        if not builder_id or not member_id:
-            raise ValueError("invalid claim identity")
-        if response.get("heartbeatMinutes") != HEARTBEAT_MINUTES:
-            raise ValueError("unsupported heartbeat policy")
-        if response.get("promptCapture") != PROMPT_CAPTURE_POLICY:
-            raise ValueError("unsupported prompt capture policy")
+        builder_id, member_id, builder_name = validate_claim_response(response)
     except (TypeError, ValueError):
         print("Claim failed: invalid_response.", file=sys.stderr)
         return 1
