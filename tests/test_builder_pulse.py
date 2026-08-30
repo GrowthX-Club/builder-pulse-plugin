@@ -656,9 +656,25 @@ class BuilderPulseTests(unittest.TestCase):
             identity,
         )
 
+    def test_fresh_claim_code_server_refusal_preserves_existing_identity(self) -> None:
+        self.claim_locally()
+        before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        args = argparse.Namespace(
+            endpoint="https://pulse.example", code="wrong-member-invite"
+        )
+        error = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(False, "installation_exists", None),
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(error):
+            self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 1)
+
+        self.assertIn("installation_exists", error.getvalue())
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), before)
+
     def test_existing_identity_recovery_is_safe_end_to_end(self) -> None:
         identity = self.claim_locally()
-        before = builder_pulse.identity_path(self.data_dir).read_bytes()
         requests: list[dict] = []
 
         class RecoveryHandler(BaseHTTPRequestHandler):
