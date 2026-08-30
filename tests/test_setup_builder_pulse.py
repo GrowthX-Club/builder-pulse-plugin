@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -62,7 +63,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(invite_code, setup_builder_pulse.DEFAULT_ENDPOINT)
 
         verify.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
-        remove.assert_called_once_with(plugin_installed=True, marketplace_configured=True)
+        remove.assert_called_once_with(
+            plugin_installed=True,
+            marketplace_configured=True,
+            rollback_version="0.4.4",
+        )
         install.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
         activate.assert_called_once_with(cli)
         calls = [call.args[0] for call in run.call_args_list]
@@ -146,47 +151,50 @@ class SetupBuilderPulseTests(unittest.TestCase):
             [setup_builder_pulse.TARGET_RELEASE, "v0.4.4"],
         )
 
-    def test_partial_removal_failure_restores_previous_release(self) -> None:
-        with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
-            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
-            mock.patch.object(
-                setup_builder_pulse,
-                "installed_builder",
-                return_value={"version": "0.4.4"},
-            ),
-            mock.patch.object(
-                setup_builder_pulse,
-                "marketplace_state",
-                return_value={
-                    "marketplaceSource": {
-                        "source": setup_builder_pulse.REPOSITORY,
-                    }
-                },
-            ),
-            mock.patch.object(
-                setup_builder_pulse,
-                "remove_current",
-                side_effect=setup_builder_pulse.SetupError("marketplace removal failed"),
-            ),
-            mock.patch.object(setup_builder_pulse, "cleanup_partial") as cleanup,
-            mock.patch.object(
-                setup_builder_pulse,
-                "install_release",
-                return_value=ROOT / "scripts" / "builder_pulse.py",
-            ) as install,
-        ):
-            with self.assertRaisesRegex(
-                setup_builder_pulse.SetupError,
-                "marketplace removal failed",
-            ):
-                setup_builder_pulse.setup(
-                    "InviteCode_1234567890",
-                    setup_builder_pulse.DEFAULT_ENDPOINT,
-                )
+    def test_partial_removal_failure_restores_plugin_from_existing_marketplace(self) -> None:
+        state = {"plugin": True, "marketplace": True}
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory)
+            (plugin_root / "scripts").mkdir()
+            (plugin_root / "scripts" / "builder_pulse.py").touch()
+            (plugin_root / ".codex-plugin").mkdir()
+            (plugin_root / ".codex-plugin" / "plugin.json").write_text(
+                '{"version":"0.4.4"}',
+                encoding="utf-8",
+            )
 
-        cleanup.assert_called_once_with()
-        install.assert_called_once_with("v0.4.4")
+            def run_command(arguments, *, env=None, expect_json=False):
+                del env
+                if arguments[:3] == ["codex", "plugin", "remove"]:
+                    state["plugin"] = False
+                    return ""
+                if arguments[:4] == ["codex", "plugin", "marketplace", "remove"]:
+                    self.assertTrue(state["marketplace"])
+                    raise setup_builder_pulse.SetupError("marketplace removal failed")
+                if arguments[:3] == ["codex", "plugin", "add"]:
+                    self.assertTrue(expect_json)
+                    self.assertTrue(state["marketplace"])
+                    state["plugin"] = True
+                    return {"installedPath": str(plugin_root)}
+                self.fail(f"Unexpected command: {arguments}")
+
+            with mock.patch.object(
+                setup_builder_pulse,
+                "run_command",
+                side_effect=run_command,
+            ):
+                with self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "marketplace removal failed",
+                ):
+                    setup_builder_pulse.remove_current(
+                        plugin_installed=True,
+                        marketplace_configured=True,
+                        rollback_version="0.4.4",
+                    )
+
+        self.assertTrue(state["plugin"])
+        self.assertTrue(state["marketplace"])
 
     def test_install_rejects_stale_package_version(self) -> None:
         add_response = {"installedPath": str(ROOT)}

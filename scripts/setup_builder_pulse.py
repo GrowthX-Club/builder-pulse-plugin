@@ -82,13 +82,60 @@ def marketplace_state() -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
-def remove_current(*, plugin_installed: bool, marketplace_configured: bool) -> None:
+def remove_current(
+    *,
+    plugin_installed: bool,
+    marketplace_configured: bool,
+    rollback_version: str | None = None,
+) -> None:
+    plugin_removed = False
     if plugin_installed:
         run_command(["codex", "plugin", "remove", PLUGIN, "--json"])
+        plugin_removed = True
     if marketplace_configured:
-        run_command(
-            ["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"]
+        try:
+            run_command(
+                ["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"]
+            )
+        except SetupError as removal_error:
+            if plugin_removed and rollback_version:
+                try:
+                    add_plugin_from_configured_marketplace(rollback_version)
+                except SetupError:
+                    try:
+                        install_release(f"v{rollback_version.removeprefix('v')}")
+                    except SetupError as rollback_error:
+                        raise SetupError(
+                            "Builder Pulse removal failed and the previous version "
+                            f"could not be restored: {rollback_error}"
+                        ) from rollback_error
+            raise removal_error
+
+
+def add_plugin_from_configured_marketplace(expected_version: str) -> Path:
+    response = run_command(
+        ["codex", "plugin", "add", PLUGIN, "--json"], expect_json=True
+    )
+    installed_path = response.get("installedPath") if isinstance(response, dict) else None
+    if not isinstance(installed_path, str) or not installed_path:
+        raise SetupError("Codex did not return the installed Builder Pulse path")
+    cli = Path(installed_path).resolve(strict=False) / "scripts" / "builder_pulse.py"
+    if not cli.is_file():
+        raise SetupError("The installed Builder Pulse package is incomplete")
+    manifest = cli.parent.parent / ".codex-plugin" / "plugin.json"
+    try:
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SetupError("The installed Builder Pulse manifest is invalid") from exc
+    if (
+        not isinstance(manifest_data, dict)
+        or manifest_data.get("version") != expected_version
+    ):
+        raise SetupError(
+            "Codex installed an unexpected Builder Pulse version; "
+            f"expected {expected_version}"
         )
+    return cli
 
 
 def install_release(release: str) -> Path:
@@ -104,29 +151,8 @@ def install_release(release: str) -> Path:
             "--json",
         ]
     )
-    response = run_command(
-        ["codex", "plugin", "add", PLUGIN, "--json"], expect_json=True
-    )
-    installed_path = response.get("installedPath") if isinstance(response, dict) else None
-    if not isinstance(installed_path, str) or not installed_path:
-        raise SetupError("Codex did not return the installed Builder Pulse path")
-    cli = Path(installed_path).resolve(strict=False) / "scripts" / "builder_pulse.py"
-    if not cli.is_file():
-        raise SetupError("The installed Builder Pulse package is incomplete")
-    manifest = cli.parent.parent / ".codex-plugin" / "plugin.json"
-    try:
-        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SetupError("The installed Builder Pulse manifest is invalid") from exc
     expected_version = release.removeprefix("v")
-    if (
-        not isinstance(manifest_data, dict)
-        or manifest_data.get("version") != expected_version
-    ):
-        raise SetupError(
-            f"Codex installed an unexpected Builder Pulse version; expected {expected_version}"
-        )
-    return cli
+    return add_plugin_from_configured_marketplace(expected_version)
 
 
 def cleanup_partial() -> None:
@@ -203,11 +229,12 @@ def setup(invite_code: str, endpoint: str) -> None:
         if repository not in {REPOSITORY, REPOSITORY.removesuffix(".git")}:
             raise SetupError("The GrowthX marketplace name points to a different source")
 
+    remove_current(
+        plugin_installed=previous is not None,
+        marketplace_configured=previous_marketplace is not None,
+        rollback_version=previous_version if isinstance(previous_version, str) else None,
+    )
     try:
-        remove_current(
-            plugin_installed=previous is not None,
-            marketplace_configured=previous_marketplace is not None,
-        )
         cli = install_release(TARGET_RELEASE)
     except SetupError:
         cleanup_partial()
