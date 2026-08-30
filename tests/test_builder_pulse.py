@@ -854,6 +854,10 @@ class BuilderPulseTests(unittest.TestCase):
             "AKIA1234567890ABCDEF",
             "AIza1234567890abcdefghijklmnopqrstuvwxy",
             "xoxb-1234567890-abcdefghijklmnop",
+            "InviteCodeViaArgument_1234567890",
+            "InviteCodeViaLabel_1234567890",
+            "InviteCodeViaQuotedArgument_1234567890",
+            "InviteCodeViaEnvironment_1234567890",
         )
         prompt_text = "\n".join(
             (
@@ -863,7 +867,11 @@ class BuilderPulseTests(unittest.TestCase):
                 "-----END PRIVATE KEY-----",
                 f"Authorization: {secrets_to_remove[1]}",
                 f"Use Bearer {secrets_to_remove[2]}",
-                *secrets_to_remove[3:],
+                *secrets_to_remove[3:8],
+                f"claim --code {secrets_to_remove[8]}",
+                f"Builder Pulse invite code: {secrets_to_remove[9]}",
+                f"claim --code '{secrets_to_remove[10]}'",
+                f'BUILDER_PULSE_INVITE_CODE="{secrets_to_remove[11]}"',
             )
         )
         event = self.record_prompt(
