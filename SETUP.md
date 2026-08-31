@@ -63,8 +63,10 @@ the `BUILDER_PULSE_INVITE_CODE` environment of that one process; it must not
 echo the value. Delete only the temporary clone after setup finishes. Never
 delete Builder Pulse's Codex plugin data directory.
 When upgrading an existing installation, the installer pauses its old capture
-before replacing the package and enables capture again only after the confirmed
-project is enrolled.
+on the GrowthX service before replacing the package. It resumes server acceptance
+only after the confirmed project is enrolled, requires the service to acknowledge
+that exact installation, and re-pauses the service if resume acknowledgement,
+activation, or flush fails.
 The confirmed folder path is used locally to enforce scope and is represented
 only by an HMAC keyed with a random secret private to that installation; the path
 is never sent to GrowthX. The confirmed display name and a stable sanitized

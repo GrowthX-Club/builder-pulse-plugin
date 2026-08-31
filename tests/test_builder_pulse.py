@@ -1020,6 +1020,10 @@ class BuilderPulseTests(unittest.TestCase):
             request.get_header("Authorization"),
             f"Bearer {'a' * 64}",
         )
+        self.assertEqual(
+            request.get_header("X-builder-pulse-project-scope"),
+            "explicit-v1",
+        )
         self.assertEqual(json.loads(request.data.decode("utf-8")), wire_event)
 
     def test_primary_user_prompt_payload_is_exact_separate_and_authorized(self) -> None:
@@ -1086,6 +1090,10 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://pulse.example/v1/prompts")
         self.assertEqual(
             request.get_header("Authorization"), f"Bearer {'a' * 64}"
+        )
+        self.assertEqual(
+            request.get_header("X-builder-pulse-project-scope"),
+            "explicit-v1",
         )
         self.assertEqual(
             json.loads(request.data.decode("utf-8")),

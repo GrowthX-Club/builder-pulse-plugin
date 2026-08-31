@@ -51,6 +51,7 @@ PROMPT_MAX_BYTES = 64 * 1024
 PROMPT_RETENTION_MS = 60 * 24 * 60 * 60 * 1000
 PROMPT_CAPTURE_POLICY = "on"
 PROJECT_SCOPE_POLICY = "explicit"
+PROJECT_SCOPE_TRANSPORT = "explicit-v1"
 PROJECT_SCOPE_MIGRATION_VERSION = 2
 CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS = 0.75
 SETUP_DISCLOSURE = (
@@ -1714,6 +1715,7 @@ def http_post_json(
     token: str | None,
     timeout: float,
     expect_json: bool,
+    explicit_project_scope_transport: bool = False,
 ) -> tuple[bool, str, dict[str, Any] | None]:
     headers = {
         "Content-Type": "application/json",
@@ -1721,6 +1723,8 @@ def http_post_json(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if explicit_project_scope_transport:
+        headers["X-Builder-Pulse-Project-Scope"] = PROJECT_SCOPE_TRANSPORT
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
@@ -1761,6 +1765,7 @@ def deliver_event(
         token=token,
         timeout=float(config.get("delivery_timeout_seconds", 1.0)),
         expect_json=False,
+        explicit_project_scope_transport=True,
     )
     return ok, result
 
@@ -1777,6 +1782,7 @@ def deliver_prompt(
         token=token,
         timeout=float(config.get("delivery_timeout_seconds", 1.0)),
         expect_json=False,
+        explicit_project_scope_transport=True,
     )
     return ok, result
 

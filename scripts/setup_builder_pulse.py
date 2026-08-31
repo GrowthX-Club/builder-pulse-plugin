@@ -345,6 +345,60 @@ def pause_server_capture(identity: dict[str, Any], plugin_version: str) -> bool:
     return True
 
 
+def resume_server_capture(identity: dict[str, Any], plugin_version: str) -> None:
+    """Resume only after the replacement is installed and locally enrolled."""
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    installation_id = identity.get("installationId")
+    if not (
+        isinstance(token, str)
+        and token
+        and isinstance(endpoint, str)
+        and endpoint
+        and isinstance(installation_id, str)
+        and installation_id
+    ):
+        raise SetupError("The Builder Pulse delivery identity is incomplete")
+    payload = json.dumps(
+        {
+            "installationId": installation_id,
+            "pluginVersion": plugin_version,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urlrequest.Request(
+        f"{str(endpoint).rstrip('/')}/v1/privacy-resume",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"builder-pulse-installer/{TARGET_RELEASE.removeprefix('v')}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError(
+            "GrowthX could not resume the enrolled Builder Pulse installation safely"
+        ) from exc
+    if len(raw) > 65_536:
+        raise SetupError("GrowthX returned an invalid Builder Pulse privacy-resume response")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(
+            "GrowthX returned an invalid Builder Pulse privacy-resume response"
+        ) from exc
+    if not (
+        isinstance(result, dict)
+        and result.get("resumed") is True
+        and result.get("installationId") == installation_id
+    ):
+        raise SetupError("GrowthX did not confirm the Builder Pulse privacy resume")
+
+
 def pause_existing_capture(
     installation: dict[str, Any] | None,
 ) -> PausedCapture:
@@ -922,8 +976,17 @@ def setup(
             "--replace-existing",
         )
     )
-    run_command(cli_command(cli, "config", "set", "enabled", "true"))
+    target_plugin_version = TARGET_RELEASE.removeprefix("v")
+    resume_attempted = False
+    delivery_identity = authoritative_identity(plugin_data_dir(cli))
     try:
+        # A network failure can happen after the service commits the resume but
+        # before this process receives the acknowledgement. Treat every attempt
+        # as potentially successful and restore the server barrier on any later
+        # error, including an ambiguous resume response.
+        resume_attempted = True
+        resume_server_capture(delivery_identity, target_plugin_version)
+        run_command(cli_command(cli, "config", "set", "enabled", "true"))
         activation = activate(cli)
         if not (
             activation.get("activationReady") is True
@@ -937,13 +1000,29 @@ def setup(
             raise SetupError("Builder Pulse activation was not server-verified")
         run_command(cli_command(cli, "flush"))
     except SetupError as setup_error:
+        pause_error: SetupError | None = None
+        if resume_attempted:
+            try:
+                pause_server_capture(delivery_identity, target_plugin_version)
+            except SetupError as exc:
+                pause_error = exc
         try:
             run_command(cli_command(cli, "config", "set", "enabled", "false"))
         except SetupError as disable_error:
+            pause_detail = (
+                f"; server capture could not be paused after failure: {pause_error}"
+                if pause_error is not None
+                else ""
+            )
             raise SetupError(
-                f"{setup_error}; capture could not be disabled after failure: "
+                f"{setup_error}{pause_detail}; capture could not be disabled after failure: "
                 f"{disable_error}"
             ) from disable_error
+        if pause_error is not None:
+            raise SetupError(
+                f"{setup_error}; server capture could not be paused after failure: "
+                f"{pause_error}"
+            ) from pause_error
         raise
 
 
