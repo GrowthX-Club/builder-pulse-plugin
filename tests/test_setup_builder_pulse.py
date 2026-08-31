@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
+import json
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -194,6 +195,137 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 Path.home().parent,
                 "Home parent",
             )
+
+    def test_filesystem_root_detection_covers_windows_drives_and_unc_shares(self) -> None:
+        for root in (
+            PureWindowsPath("C:\\"),
+            PureWindowsPath("D:\\"),
+            PureWindowsPath("\\\\server\\share\\"),
+        ):
+            with self.subTest(root=str(root)):
+                self.assertTrue(setup_builder_pulse.is_filesystem_root(root))
+
+        self.assertFalse(
+            setup_builder_pulse.is_filesystem_root(PureWindowsPath("C:\\project"))
+        )
+
+    def test_release_verification_requires_a_published_immutable_release(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {
+                "tag_name": "v0.4.6",
+                "draft": False,
+                "immutable": True,
+            }
+        ).encode("utf-8")
+
+        with mock.patch.object(setup_builder_pulse, "run_command") as run, \
+            mock.patch.object(
+                setup_builder_pulse.urlrequest,
+                "urlopen",
+                return_value=response,
+            ) as opened:
+            setup_builder_pulse.verify_release_exists("v0.4.6")
+
+        self.assertEqual(run.call_args.args[0][-1], "refs/tags/v0.4.6")
+        request = opened.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            f"{setup_builder_pulse.RELEASE_API}v0.4.6",
+        )
+
+    def test_release_verification_rejects_a_movable_tag(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {
+                "tag_name": "v0.4.6",
+                "draft": False,
+                "immutable": False,
+            }
+        ).encode("utf-8")
+
+        with mock.patch.object(setup_builder_pulse, "run_command"), \
+            mock.patch.object(
+                setup_builder_pulse.urlrequest,
+                "urlopen",
+                return_value=response,
+            ), self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "published immutable GitHub release",
+            ):
+            setup_builder_pulse.verify_release_exists("v0.4.6")
+
+    def test_activation_or_flush_failure_disables_capture(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+
+        for failure in ("activation", "flush"):
+            with self.subTest(failure=failure):
+                calls: list[list[str]] = []
+
+                def run_command(arguments, *, env=None, expect_json=False):
+                    del env, expect_json
+                    calls.append(arguments)
+                    if failure == "flush" and arguments[-1] == "flush":
+                        raise setup_builder_pulse.SetupError("flush failed")
+                    return ""
+
+                def activate(_cli: Path):
+                    if failure == "activation":
+                        raise setup_builder_pulse.SetupError("activation failed")
+                    return {
+                        "activationReady": True,
+                        "hooksTrusted": True,
+                        "serverVerified": True,
+                    }
+
+                with (
+                    mock.patch.object(
+                        setup_builder_pulse.shutil, "which", return_value="ok"
+                    ),
+                    mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+                    mock.patch.object(
+                        setup_builder_pulse, "installed_builder", return_value=None
+                    ),
+                    mock.patch.object(
+                        setup_builder_pulse, "marketplace_state", return_value=None
+                    ),
+                    mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+                    mock.patch.object(setup_builder_pulse, "remove_current"),
+                    mock.patch.object(
+                        setup_builder_pulse, "install_release", return_value=cli
+                    ),
+                    mock.patch.object(
+                        setup_builder_pulse, "activate", side_effect=activate
+                    ),
+                    mock.patch.object(
+                        setup_builder_pulse,
+                        "run_command",
+                        side_effect=run_command,
+                    ),
+                    self.assertRaisesRegex(
+                        setup_builder_pulse.SetupError, f"{failure} failed"
+                    ),
+                ):
+                    setup_builder_pulse.setup(
+                        "InviteCode_1234567890",
+                        setup_builder_pulse.DEFAULT_ENDPOINT,
+                        ROOT,
+                        "Builder Pulse",
+                    )
+
+                self.assertIn(
+                    [
+                        sys.executable,
+                        str(cli),
+                        "config",
+                        "set",
+                        "enabled",
+                        "false",
+                    ],
+                    calls,
+                )
 
     def test_activation_review_result_is_preserved_even_with_nonzero_exit(self) -> None:
         completed = mock.Mock(

@@ -8,20 +8,12 @@ data directory, safely reverifies an existing GrowthX member identity, rolls
 back a failed package update, activates the official Codex hooks, and flushes
 queued telemetry.
 
-Builder Pulse is installed machine-wide, but it sends data only from project
-folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX
-member record. For each enrolled project, it receives a stable installation ID,
-a one-way hashed session ID, the display name you confirm and a sanitized project
-ID, any feature name and ID you explicitly set, coarse work state and event/activity
-timestamps, plugin version, optional cumulative token counts, and each primary
-prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated
-Builder Pulse admins can view this data for learning feedback. Raw lifecycle events
-and activity buckets are retained for 30 days; submitted prompts and their feedback
-are retained for 60 days; the installation/member link, latest status, and compacted
-session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths,
-files, patches, commands, tool input or output, assistant replies, transcripts, or
-environment variables. Secret redaction is a safety layer, not a guarantee;
-secrets do not belong in prompts.
+Before it changes the installed package, the installer verifies both the exact
+Git tag and its published GitHub Release. The release API must report the exact
+target tag, `draft: false`, and `immutable: true`; a tag existing by itself is
+not proof of immutability. Setup fails closed if either check cannot be proved.
+
+Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
 
 ## Run the installer
 
@@ -59,9 +51,10 @@ finishes. It must never delete Builder Pulse's Codex plugin data directory.
 When upgrading an existing installation, the installer pauses its old capture
 before replacing the package and enables capture again only after the confirmed
 project is enrolled.
-The confirmed folder path is used locally to enforce scope and is never sent to
-GrowthX. The confirmed display name and a stable sanitized project ID are sent
-with events.
+The confirmed folder path is used locally to enforce scope and is represented
+only by an HMAC keyed with a random secret private to that installation; the path
+is never sent to GrowthX. The confirmed display name and a stable sanitized
+project ID are sent with events.
 
 The local setup is complete only when the installer prints:
 

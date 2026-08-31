@@ -20,7 +20,7 @@ project folders a member explicitly enrolls. Installing and claiming Builder
 Pulse enables the data collection described below only for those folders. The
 claim command displays this exact disclosure before making the request:
 
-> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX member record. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view this data for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables.
+> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
 
 Builder Pulse sends only:
 
@@ -42,7 +42,8 @@ be recognized. The bounded redacted prompt is temporarily persisted in a
 separate local prompt outbox and forwarded to GrowthX.
 
 Folder paths are used locally only to match a hook's working directory to
-the one-way keyed enrollment record; folder paths are never persisted in
+an HMAC enrollment key derived with a random secret private to that installation;
+folder paths are never persisted in
 that record or transmitted. An enrollment covers the confirmed folder and its
 descendants, including one package inside a monorepo and projects without Git.
 The home directory, its parent directories, and filesystem root cannot be
@@ -130,9 +131,9 @@ and optional feature context is attached to both lifecycle and prompt events.
 <python> <plugin-root>/scripts/builder_pulse.py work enroll --root /confirmed/project-folder --project "GrowthX Community"
 <python> <plugin-root>/scripts/builder_pulse.py work set --root /confirmed/project-folder --feature "Member search filters"
 
-<python> <plugin-root>/scripts/builder_pulse.py work show
+<python> <plugin-root>/scripts/builder_pulse.py work show --root /confirmed/project-folder
 <python> <plugin-root>/scripts/builder_pulse.py work list
-<python> <plugin-root>/scripts/builder_pulse.py work clear-feature
+<python> <plugin-root>/scripts/builder_pulse.py work clear-feature --root /confirmed/project-folder
 <python> <plugin-root>/scripts/builder_pulse.py work unenroll --root /confirmed/project-folder
 ```
 
@@ -285,6 +286,12 @@ recovery, install the current immutable v0.4.6 release with:
 codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.4.6
 codex plugin add builder-pulse@growthx-builder-tools
 ```
+
+Before installing, verify both the exact Git tag and the corresponding
+published GitHub Release. The release API response must report
+`tag_name: "v0.4.6"`, `draft: false`, and `immutable: true`; a tag existing by
+itself is not proof of immutability. The prepared installer performs both
+checks and fails closed if either one cannot be verified.
 
 The admin-provided claim command must use the installed plugin root; this build
 defaults to `https://precious-ant-429.convex.site`. To upgrade after an announced

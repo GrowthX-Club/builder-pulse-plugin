@@ -26,7 +26,7 @@ cannot report telemetry without this standard-library-only runtime.
 
 Before claiming or enrolling an installation, show this exact disclosure:
 
-> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX member record. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view this data for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables.
+> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
 
 Explain the exact fields in
 [references/state-model.md](references/state-model.md). Primary submitted prompt
@@ -74,6 +74,12 @@ Stop and wait. Do not scan the home directory, infer names from folder basenames
 or prompts, or reuse a server `defaultProject`; that field is cohort/roster
 metadata. Enroll only paths and labels the user explicitly confirms:
 
+For an update or recovery install, verify both the exact Git tag and its
+published GitHub Release before replacing anything. Continue only when the
+release API reports the exact target `tag_name`, `draft: false`, and
+`immutable: true`; tag existence alone is not proof of immutability. The
+prepared installer performs both checks and fails closed.
+
 ```bash
 <python> <resolved-cli-path> work enroll --root <confirmed-folder> --project "<confirmed-name>"
 <python> <resolved-cli-path> work show --root <confirmed-folder>
@@ -81,7 +87,8 @@ metadata. Enroll only paths and labels the user explicitly confirms:
 ```
 
 The confirmed folder path is used locally only and is represented in `contexts.json`
-by a one-way key; it is never sent to GrowthX. Hooks with no working directory
+by an HMAC keyed with a random secret private to that installation; it is never
+sent to GrowthX. Hooks with no working directory
 or outside enrolled folders fail closed and queue nothing. Enrollment covers
 that exact folder and its descendants; it does not widen a monorepo package to
 the repository root. The home directory, its parents, and filesystem root are
@@ -97,8 +104,8 @@ the feature label.
 
 ```bash
 <python> <resolved-cli-path> work set --root <enrolled-folder> --feature "Member search filters"
-<python> <resolved-cli-path> work show
-<python> <resolved-cli-path> work clear-feature
+<python> <resolved-cli-path> work show --root <enrolled-folder>
+<python> <resolved-cli-path> work clear-feature --root <enrolled-folder>
 ```
 
 Feature labels are limited to 120 characters. A stable feature ID is sanitized

@@ -7,11 +7,13 @@ import argparse
 import getpass
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import shutil
 import subprocess
 import sys
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 
 REPOSITORY = "https://github.com/GrowthX-Club/builder-pulse-plugin.git"
@@ -25,26 +27,38 @@ MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
 TARGET_RELEASE = "v0.4.6"
 DEFAULT_ENDPOINT = "https://precious-ant-429.convex.site"
+RELEASE_API = (
+    "https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/"
+)
 SETUP_DISCLOSURE = (
     "Builder Pulse is installed machine-wide, but it sends data only from project "
-    "folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX "
-    "member record. For each enrolled project, it receives a stable installation ID, "
+    "folders you explicitly enroll. GrowthX stores the claimed member ID, name, email "
+    "address, and any optional default project or program copied from the member record "
+    "so telemetry can be linked to the right person. For each enrolled project, it "
+    "receives a stable installation ID, "
     "a one-way hashed session ID, the display name you confirm and a sanitized project "
     "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
     "timestamps, plugin version, optional cumulative token counts, and each primary "
     "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
-    "Builder Pulse admins can view this data for learning feedback. Raw lifecycle events "
+    "Builder Pulse admins can view these identity and telemetry fields for learning "
+    "feedback. Raw lifecycle events "
     "and activity buckets are retained for 30 days; submitted prompts and their feedback "
-    "are retained for 60 days; the installation/member link, latest status, and compacted "
+    "are retained for 60 days; the member identity fields, installation/member link, "
+    "latest status, and compacted "
     "session, daily, and all-time "
     "token aggregates remain until GrowthX removes them. It does not send "
     "folder paths, files, patches, commands, tool input or output, assistant replies, "
-    "transcripts, or environment variables."
+    "transcripts, or environment variables. Secret redaction is a safety layer, not a "
+    "guarantee, so do not put secrets in prompts."
 )
 
 
 class SetupError(RuntimeError):
     pass
+
+
+def is_filesystem_root(path: PurePath) -> bool:
+    return bool(path.anchor) and path == type(path)(path.anchor)
 
 
 def run_command(
@@ -259,6 +273,34 @@ def verify_release_exists(release: str) -> None:
             f"refs/tags/{release}",
         ]
     )
+    request = urlrequest.Request(
+        f"{RELEASE_API}{release}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "builder-pulse-installer",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError("The immutable Builder Pulse release could not be verified") from exc
+    if len(raw) > 65_536:
+        raise SetupError("GitHub returned an invalid Builder Pulse release response")
+    try:
+        release_data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("GitHub returned an invalid Builder Pulse release response") from exc
+    if not (
+        isinstance(release_data, dict)
+        and release_data.get("tag_name") == release
+        and release_data.get("draft") is False
+        and release_data.get("immutable") is True
+    ):
+        raise SetupError(
+            "Builder Pulse setup requires a published immutable GitHub release"
+        )
 
 
 def parse_activation(output: str) -> dict[str, Any]:
@@ -317,7 +359,11 @@ def setup(
     if any(ord(character) < 32 for character in confirmed_label):
         raise SetupError("The confirmed Builder Pulse project name is invalid")
     home = Path.home().resolve(strict=False)
-    if enrolled_root == home or enrolled_root in home.parents:
+    if (
+        enrolled_root == home
+        or enrolled_root in home.parents
+        or is_filesystem_root(enrolled_root)
+    ):
         raise SetupError(
             "The confirmed folder must be a project folder, not the home, one of "
             "its parents, or the filesystem root"
@@ -376,18 +422,30 @@ def setup(
     run_command(
         [sys.executable, str(cli), "config", "set", "enabled", "true"]
     )
-    activation = activate(cli)
-    if not (
-        activation.get("activationReady") is True
-        and activation.get("hooksTrusted") is True
-        and activation.get("serverVerified") is True
-    ):
-        if activation.get("reviewRequired") is True:
-            raise SetupError(
-                "Codex requires its official one-time Builder Pulse hook review"
+    try:
+        activation = activate(cli)
+        if not (
+            activation.get("activationReady") is True
+            and activation.get("hooksTrusted") is True
+            and activation.get("serverVerified") is True
+        ):
+            if activation.get("reviewRequired") is True:
+                raise SetupError(
+                    "Codex requires its official one-time Builder Pulse hook review"
+                )
+            raise SetupError("Builder Pulse activation was not server-verified")
+        run_command([sys.executable, str(cli), "flush"])
+    except SetupError as setup_error:
+        try:
+            run_command(
+                [sys.executable, str(cli), "config", "set", "enabled", "false"]
             )
-        raise SetupError("Builder Pulse activation was not server-verified")
-    run_command([sys.executable, str(cli), "flush"])
+        except SetupError as disable_error:
+            raise SetupError(
+                f"{setup_error}; capture could not be disabled after failure: "
+                f"{disable_error}"
+            ) from disable_error
+        raise
 
 
 def main() -> int:

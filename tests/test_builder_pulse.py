@@ -7,7 +7,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -132,13 +132,14 @@ class BuilderPulseTests(unittest.TestCase):
         project_label: str = "Product Alpha",
     ) -> None:
         contexts = builder_pulse.load_work_contexts(self.data_dir)
-        key = builder_pulse.repository_key(root)
+        key = builder_pulse.repository_key(self.data_dir, root)
         if key not in contexts:
             contexts[key] = {
                 "project_id": project_id,
                 "project_label": project_label,
                 "feature_id": "member-search",
                 "feature_label": "Member search",
+                "scope_key": str(uuid.uuid4()),
             }
             builder_pulse.atomic_write_json(
                 self.data_dir / "contexts.json", contexts
@@ -580,7 +581,7 @@ class BuilderPulseTests(unittest.TestCase):
             self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 0)
         self.assertNotIn("project_id", builder_pulse.load_config(self.data_dir))
         context = builder_pulse.load_work_contexts(self.data_dir)[
-            builder_pulse.repository_key(self.workspace)
+            builder_pulse.repository_key(self.data_dir, self.workspace)
         ]
         self.assertEqual(context["project_id"], "confirmed-product")
         self.assertEqual(context["project_label"], "Confirmed Product")
@@ -775,6 +776,56 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertTrue(result["alreadyClaimed"])
         self.assertTrue(result["reverified"])
 
+    def test_reverification_repairs_stale_capture_policy_and_builder_name(self) -> None:
+        identity = self.claim_locally()
+        stale_identity = dict(identity)
+        stale_identity["builderName"] = "Old roster name"
+        stale_identity["promptCapture"] = "off"
+        builder_pulse.atomic_write_json(
+            builder_pulse.identity_path(self.data_dir), stale_identity
+        )
+        preserved = {
+            key: stale_identity[key]
+            for key in (
+                "installationId",
+                "installationToken",
+                "claimedEndpoint",
+                "scopeSecret",
+            )
+        }
+        response = {
+            "builderId": identity["builderId"],
+            "memberId": identity["memberId"],
+            "name": "Current roster name",
+            "defaultProject": None,
+            "heartbeatMinutes": 15,
+            "promptCapture": "on",
+        }
+
+        with mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(True, "delivered", response),
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            result = builder_pulse.command_claim(
+                argparse.Namespace(
+                    endpoint="https://pulse.example",
+                    code="fresh-personalized-invite",
+                ),
+                self.data_dir,
+            )
+
+        self.assertEqual(result, 0)
+        refreshed = builder_pulse.read_json(
+            builder_pulse.identity_path(self.data_dir), {}
+        )
+        self.assertEqual(refreshed["builderName"], "Current roster name")
+        self.assertEqual(refreshed["promptCapture"], "on")
+        for key, value in preserved.items():
+            self.assertEqual(refreshed[key], value)
+
     def test_fresh_claim_code_refuses_different_authoritative_identity(self) -> None:
         identity = self.claim_locally()
         before = builder_pulse.identity_path(self.data_dir).read_bytes()
@@ -891,8 +942,9 @@ class BuilderPulseTests(unittest.TestCase):
             1_787_721_000_000,
         )
         assert event is not None
+        wire_event = builder_pulse.wire_payload(event)
         self.assertEqual(
-            set(event),
+            set(wire_event),
             {
                 "schemaVersion",
                 "eventId",
@@ -929,7 +981,7 @@ class BuilderPulseTests(unittest.TestCase):
             request.get_header("Authorization"),
             f"Bearer {'a' * 64}",
         )
-        self.assertEqual(json.loads(request.data.decode("utf-8")), event)
+        self.assertEqual(json.loads(request.data.decode("utf-8")), wire_event)
 
     def test_primary_user_prompt_payload_is_exact_separate_and_authorized(self) -> None:
         identity = self.claim_locally()
@@ -946,8 +998,9 @@ class BuilderPulseTests(unittest.TestCase):
             1_787_721_000_000,
         )
         assert event is not None
+        wire_event = builder_pulse.wire_payload(event)
         self.assertEqual(
-            set(event),
+            set(wire_event),
             {
                 "schemaVersion",
                 "promptId",
@@ -995,7 +1048,10 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(
             request.get_header("Authorization"), f"Bearer {'a' * 64}"
         )
-        self.assertEqual(json.loads(request.data.decode("utf-8")), event)
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            builder_pulse.wire_payload(event),
+        )
 
     def test_unenrolled_or_missing_cwd_fails_closed_without_local_capture(self) -> None:
         self.claim_locally()
@@ -1097,7 +1153,7 @@ class BuilderPulseTests(unittest.TestCase):
         self.claim_locally()
         contexts = builder_pulse.load_work_contexts(self.data_dir)
         changed_contexts = json.loads(json.dumps(contexts))
-        context_key = builder_pulse.repository_key(self.workspace)
+        context_key = builder_pulse.repository_key(self.data_dir, self.workspace)
         changed_contexts[context_key]["feature_id"] = "new-feature"
         changed_contexts[context_key]["feature_label"] = "New feature"
 
@@ -1605,6 +1661,8 @@ class BuilderPulseTests(unittest.TestCase):
 
     def test_prompt_outbox_expires_records_older_than_sixty_days(self) -> None:
         self.claim_locally()
+        context_key = builder_pulse.repository_key(self.data_dir, self.workspace)
+        context = builder_pulse.load_work_contexts(self.data_dir)[context_key]
         now_ms = 1_787_721_080_000
         events = []
         for name, occurred_at in (
@@ -1616,16 +1674,18 @@ class BuilderPulseTests(unittest.TestCase):
                 builder_pulse.prompt_payload(
                     installation_id="installation",
                     key="session",
-                    project_id="project",
-                    project_label="Project",
-                    feature_id=None,
-                    feature_label=None,
+                    project_id=context["project_id"],
+                    project_label=context["project_label"],
+                    feature_id=context["feature_id"],
+                    feature_label=context["feature_label"],
                     prompt_text=name,
                     occurred_at=occurred_at,
                     redacted=False,
                     truncated=False,
                 )
             )
+            events[-1]["_contextKey"] = context_key
+            events[-1]["_scopeKey"] = context["scope_key"]
         path = self.data_dir / "prompt-outbox.jsonl"
         for event in events:
             builder_pulse.append_jsonl(path, event)
@@ -1713,7 +1773,7 @@ class BuilderPulseTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            set(event),
+            set(builder_pulse.wire_payload(event)),
             {
                 "schemaVersion",
                 "eventId",
@@ -1741,7 +1801,10 @@ class BuilderPulseTests(unittest.TestCase):
             )
         self.assertTrue(ok)
         self.assertEqual(result, "delivered")
-        self.assertEqual(json.loads(opened.call_args.args[0].data), event)
+        self.assertEqual(
+            json.loads(opened.call_args.args[0].data),
+            builder_pulse.wire_payload(event),
+        )
         zero_snapshot = builder_pulse.token_usage_from_record(
             self.token_count_record(
                 totals={key: 0 for key in self.token_totals()}
@@ -2268,7 +2331,7 @@ class BuilderPulseTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
         context = builder_pulse.load_work_contexts(self.data_dir)[
-            builder_pulse.repository_key(self.data_dir)
+            builder_pulse.repository_key(self.data_dir, self.data_dir)
         ]
         self.assertEqual(context["feature_label"], "Member Search Filters")
         self.assertEqual(context["feature_id"], "member-search-filters")
@@ -2309,8 +2372,8 @@ class BuilderPulseTests(unittest.TestCase):
             self.assertEqual(builder_pulse.command_work(second_args, self.data_dir), 0)
         contexts = builder_pulse.load_work_contexts(self.data_dir)
         self.assertEqual(len(contexts), 2)
-        first_key = builder_pulse.repository_key(first_root)
-        second_key = builder_pulse.repository_key(second_root)
+        first_key = builder_pulse.repository_key(self.data_dir, first_root)
+        second_key = builder_pulse.repository_key(self.data_dir, second_root)
         self.assertEqual(contexts[first_key]["feature_label"], "Feature one")
         self.assertEqual(contexts[second_key]["feature_label"], "Feature two")
         persisted = (self.data_dir / "contexts.json").read_text(encoding="utf-8")
@@ -2396,7 +2459,7 @@ class BuilderPulseTests(unittest.TestCase):
         builder_pulse.atomic_write_json(
             self.data_dir / "contexts.json",
             {
-                builder_pulse.repository_key(project_root): {
+                builder_pulse.repository_key(self.data_dir, project_root): {
                     "project_id": "invalid id with spaces",
                     "project_label": "Looks enrolled",
                 }
@@ -2443,7 +2506,7 @@ class BuilderPulseTests(unittest.TestCase):
             self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
 
         context = builder_pulse.load_work_contexts(self.data_dir)[
-            builder_pulse.repository_key(project_root)
+            builder_pulse.repository_key(self.data_dir, project_root)
         ]
         self.assertEqual(context["project_id"], "stable-product-id")
         self.assertEqual(context["project_label"], "New Product Name")
@@ -2465,13 +2528,35 @@ class BuilderPulseTests(unittest.TestCase):
                 self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
 
         contexts = builder_pulse.load_work_contexts(self.data_dir)
-        first = contexts[builder_pulse.repository_key(first_root)]
-        second = contexts[builder_pulse.repository_key(second_root)]
+        first = contexts[builder_pulse.repository_key(self.data_dir, first_root)]
+        second = contexts[builder_pulse.repository_key(self.data_dir, second_root)]
         self.assertEqual(first["project_label"], "नमस्ते")
         self.assertEqual(second["project_label"], "こんにちは")
         self.assertRegex(first["project_id"], r"^project-[a-f0-9]{12}$")
         self.assertRegex(second["project_id"], r"^project-[a-f0-9]{12}$")
         self.assertNotEqual(first["project_id"], second["project_id"])
+
+    def test_mixed_script_project_names_do_not_collapse_to_the_same_identifier(self) -> None:
+        first = builder_pulse.project_identifier_from_label("Project 项目")
+        second = builder_pulse.project_identifier_from_label("Project 产品")
+
+        self.assertRegex(first, r"^project-[a-f0-9]{12}$")
+        self.assertRegex(second, r"^project-[a-f0-9]{12}$")
+        self.assertNotEqual(first, second)
+
+    def test_project_path_keys_are_private_installation_keyed_values(self) -> None:
+        first_key = builder_pulse.repository_key(self.data_dir, self.workspace)
+        second_data_dir = self.workspace / "second-plugin-data"
+        second_data_dir.mkdir()
+        second_key = builder_pulse.repository_key(second_data_dir, self.workspace)
+
+        self.assertRegex(first_key, r"^[a-f0-9]{32}$")
+        self.assertRegex(second_key, r"^[a-f0-9]{32}$")
+        self.assertNotEqual(first_key, second_key)
+        self.assertNotIn(
+            str(self.workspace),
+            builder_pulse.identity_path(self.data_dir).read_text(encoding="utf-8"),
+        )
 
     def test_non_git_enrollment_covers_descendants_without_storing_its_path(self) -> None:
         project_root = self.workspace / "non-git-product"
@@ -2487,7 +2572,7 @@ class BuilderPulseTests(unittest.TestCase):
 
         assert enrolled is not None
         key, context, matched_root = enrolled
-        self.assertEqual(key, builder_pulse.repository_key(project_root))
+        self.assertEqual(key, builder_pulse.repository_key(self.data_dir, project_root))
         self.assertEqual(context["project_label"], "Non Git Product")
         self.assertEqual(matched_root, project_root.resolve())
         self.assertNotIn(
@@ -2530,7 +2615,7 @@ class BuilderPulseTests(unittest.TestCase):
     def test_first_explicit_enrollment_does_not_revive_legacy_feature_context(self) -> None:
         project_root = self.workspace / "legacy-project"
         project_root.mkdir()
-        key = builder_pulse.repository_key(project_root)
+        key = builder_pulse.repository_key(self.data_dir, project_root)
         builder_pulse.atomic_write_json(
             self.data_dir / "contexts.json",
             {
@@ -2575,6 +2660,22 @@ class BuilderPulseTests(unittest.TestCase):
                 )
             self.assertEqual(result, 2)
             self.assertIn("not the home", output.getvalue())
+
+    def test_filesystem_root_detection_covers_windows_drives_and_unc_shares(self) -> None:
+        for root in (
+            PureWindowsPath("C:\\"),
+            PureWindowsPath("D:\\"),
+            PureWindowsPath("\\\\server\\share\\"),
+        ):
+            with self.subTest(root=str(root)):
+                self.assertTrue(builder_pulse.is_filesystem_root(root))
+
+        self.assertFalse(builder_pulse.is_filesystem_root(PureWindowsPath("C:\\project")))
+        self.assertFalse(
+            builder_pulse.is_filesystem_root(
+                PureWindowsPath("\\\\server\\share\\project")
+            )
+        )
 
     def test_project_enrollment_rejects_a_parent_of_the_home_directory(self) -> None:
         output = io.StringIO()
@@ -2675,14 +2776,19 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertNotIn(str(first_root), output.getvalue())
         self.assertNotIn(str(second_root), output.getvalue())
 
-        first_key = builder_pulse.repository_key(first_root)
-        second_key = builder_pulse.repository_key(second_root)
+        first_key = builder_pulse.repository_key(self.data_dir, first_root)
+        second_key = builder_pulse.repository_key(self.data_dir, second_root)
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
         first_scope = {
+            "_contextKey": first_key,
+            "_scopeKey": contexts[first_key]["scope_key"],
             "projectId": "first-product",
             "projectLabel": "First Product",
             "projectScope": "explicit",
         }
         second_scope = {
+            "_contextKey": second_key,
+            "_scopeKey": contexts[second_key]["scope_key"],
             "projectId": "second-product",
             "projectLabel": "Second Product",
             "projectScope": "explicit",
@@ -2704,10 +2810,20 @@ class BuilderPulseTests(unittest.TestCase):
         states_dir = self.data_dir / "states"
         states_dir.mkdir(exist_ok=True)
         builder_pulse.atomic_write_json(
-            states_dir / "first.json", {"contextKey": first_key, **first_scope}
+            states_dir / "first.json",
+            {
+                "contextKey": first_key,
+                "scopeKey": contexts[first_key]["scope_key"],
+                **builder_pulse.wire_payload(first_scope),
+            },
         )
         builder_pulse.atomic_write_json(
-            states_dir / "second.json", {"contextKey": second_key, **second_scope}
+            states_dir / "second.json",
+            {
+                "contextKey": second_key,
+                "scopeKey": contexts[second_key]["scope_key"],
+                **builder_pulse.wire_payload(second_scope),
+            },
         )
 
         unenroll_output = io.StringIO()
@@ -2765,14 +2881,141 @@ class BuilderPulseTests(unittest.TestCase):
             )
         )
 
+    def test_unenroll_preserves_another_folder_with_the_same_project_name(self) -> None:
+        first_root = self.workspace / "same-name-one"
+        second_root = self.workspace / "same-name-two"
+        first_root.mkdir()
+        second_root.mkdir()
+        self.enroll_project(
+            first_root,
+            project_id="same-product",
+            project_label="Same Product",
+        )
+        self.enroll_project(
+            second_root,
+            project_id="same-product",
+            project_label="Same Product",
+        )
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        first_key = builder_pulse.repository_key(self.data_dir, first_root)
+        second_key = builder_pulse.repository_key(self.data_dir, second_root)
+        records = []
+        for event_id, key, context in (
+            ("first", first_key, contexts[first_key]),
+            ("second", second_key, contexts[second_key]),
+        ):
+            records.append(
+                {
+                    "eventId": event_id,
+                    "_contextKey": key,
+                    "_scopeKey": context["scope_key"],
+                    "projectId": "same-product",
+                    "projectLabel": "Same Product",
+                    "projectScope": "explicit",
+                    "featureId": "member-search",
+                    "featureLabel": "Member search",
+                }
+            )
+        builder_pulse.atomic_write_jsonl(self.data_dir / "outbox.jsonl", records)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(work_command="unenroll", root=str(first_root)),
+                    self.data_dir,
+                ),
+                0,
+            )
+
+        remaining_contexts = builder_pulse.load_work_contexts(self.data_dir)
+        self.assertNotIn(first_key, remaining_contexts)
+        self.assertIn(second_key, remaining_contexts)
+        self.assertEqual(
+            [
+                record["eventId"]
+                for record in builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")
+            ],
+            ["second"],
+        )
+
+    def test_unenroll_waits_for_an_in_flight_send_and_blocks_later_sends(self) -> None:
+        self.claim_locally()
+        event = self.record(
+            {"hook_event_name": "SessionStart", "session_id": "scope-race"},
+            1_787_721_000_000,
+        )
+        assert event is not None
+        send_started = threading.Event()
+        release_send = threading.Event()
+        unenroll_done = threading.Event()
+        flush_result: dict[str, int] = {}
+
+        def blocked_delivery(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+            send_started.set()
+            self.assertTrue(release_send.wait(timeout=2))
+            return True, "delivered"
+
+        def run_flush() -> None:
+            flush_result.update(builder_pulse.flush_outbox(self.data_dir, self.config))
+
+        def run_unenroll() -> None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                builder_pulse.command_work(
+                    argparse.Namespace(
+                        work_command="unenroll", root=str(self.workspace)
+                    ),
+                    self.data_dir,
+                )
+            unenroll_done.set()
+
+        with mock.patch.object(
+            builder_pulse, "deliver_event", side_effect=blocked_delivery
+        ):
+            flush_thread = threading.Thread(target=run_flush)
+            flush_thread.start()
+            self.assertTrue(send_started.wait(timeout=2))
+            unenroll_thread = threading.Thread(target=run_unenroll)
+            unenroll_thread.start()
+            self.assertFalse(unenroll_done.wait(timeout=0.1))
+            release_send.set()
+            flush_thread.join(timeout=2)
+            unenroll_thread.join(timeout=2)
+
+        self.assertFalse(flush_thread.is_alive())
+        self.assertFalse(unenroll_thread.is_alive())
+        self.assertTrue(unenroll_done.is_set())
+        self.assertEqual(flush_result["delivered"], 1)
+        self.assertEqual(builder_pulse.load_work_contexts(self.data_dir), {})
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
+
+        with mock.patch.object(builder_pulse, "deliver_event") as delivered:
+            self.assertEqual(
+                builder_pulse.deliver_scoped_record(
+                    self.data_dir,
+                    event,
+                    self.config,
+                    "a" * 64,
+                    "https://pulse.example",
+                    prompt=False,
+                ),
+                (False, "scope_inactive"),
+            )
+        delivered.assert_not_called()
+
     def test_scope_migration_discards_only_legacy_records_and_preserves_identity(self) -> None:
         self.claim_locally()
         identity_before = builder_pulse.identity_path(self.data_dir).read_bytes()
         contexts_before = (self.data_dir / "contexts.json").read_bytes()
+        context_key = builder_pulse.repository_key(self.data_dir, self.workspace)
+        context = builder_pulse.load_work_contexts(self.data_dir)[context_key]
         explicit = {
-            "projectId": "product-alpha",
-            "projectLabel": "Product Alpha",
+            "_contextKey": context_key,
+            "_scopeKey": context["scope_key"],
+            "projectId": context["project_id"],
+            "projectLabel": context["project_label"],
             "projectScope": "explicit",
+            "featureId": context["feature_id"],
+            "featureLabel": context["feature_label"],
         }
         builder_pulse.atomic_write_jsonl(
             self.data_dir / "outbox.jsonl",
@@ -2786,14 +3029,20 @@ class BuilderPulseTests(unittest.TestCase):
         states_dir.mkdir()
         builder_pulse.atomic_write_json(states_dir / "legacy.json", {"state": "building"})
         builder_pulse.atomic_write_json(
-            states_dir / "explicit.json", {"state": "building", **explicit}
+            states_dir / "explicit.json",
+            {
+                "state": "building",
+                "contextKey": context_key,
+                "scopeKey": context["scope_key"],
+                **builder_pulse.wire_payload(explicit),
+            },
         )
 
         marker = builder_pulse.ensure_project_scope_migration(self.data_dir)
 
         self.assertEqual(
             marker["discardedUnscoped"],
-            {"lifecycle": 1, "prompts": 1, "states": 1},
+            {"contexts": 0, "lifecycle": 1, "prompts": 1, "states": 1},
         )
         self.assertEqual(
             builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
@@ -2887,6 +3136,27 @@ class BuilderPulseTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(builder_pulse.command_config(args, self.data_dir), 2)
 
+    def test_status_distinguishes_policy_from_effective_capture(self) -> None:
+        self.claim_locally()
+        with tempfile.TemporaryDirectory() as outside_directory:
+            outside = Path(outside_directory)
+            output = io.StringIO()
+
+            with mock.patch.object(builder_pulse.Path, "cwd", return_value=outside), \
+                contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    builder_pulse.command_status(
+                        argparse.Namespace(project=None, json=True), self.data_dir
+                    ),
+                    0,
+                )
+
+        status = json.loads(output.getvalue())
+        self.assertEqual(status["promptCapturePolicy"], "on")
+        self.assertTrue(status["builderPulseEnabled"])
+        self.assertFalse(status["currentProjectEnrolled"])
+        self.assertFalse(status["effectivePromptCapture"])
+
 
 class HookManifestTests(unittest.TestCase):
     def test_codex_hook_commands_use_runtime_plugin_root(self) -> None:
@@ -2900,6 +3170,7 @@ class HookManifestTests(unittest.TestCase):
         self.assertTrue(commands)
         for hook in commands:
             self.assertIn("${PLUGIN_ROOT}", hook["command"])
+            self.assertIn("builder_pulse.sh", hook["command"])
             self.assertEqual(
                 hook["commandWindows"],
                 'cd /d "%PLUGIN_ROOT%"&&scripts\\builder_pulse.cmd',
@@ -2910,6 +3181,53 @@ class HookManifestTests(unittest.TestCase):
         wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
         contents = wrapper.read_text(encoding="utf-8")
         self.assertIn('py -3 "%~dp0builder_pulse.py" hook', contents)
+
+    def test_platform_hook_launcher_really_starts_and_returns_valid_hook_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = builder_pulse.verify_hook_launcher(Path(directory))
+        self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+
+    def test_activation_stops_before_the_server_when_launcher_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            identity = builder_pulse.ensure_identity(data_dir)
+            identity.update(
+                {
+                    "builderId": "builder-1",
+                    "memberId": "growthx-member-1",
+                    "builderName": "Builder One",
+                    "installationToken": "a" * 64,
+                    "claimedEndpoint": "https://pulse.example",
+                    "promptCapture": "on",
+                }
+            )
+            builder_pulse.atomic_write_json(
+                builder_pulse.identity_path(data_dir), identity
+            )
+
+            output = io.StringIO()
+            with mock.patch.object(
+                builder_pulse,
+                "inspect_codex_hooks",
+                return_value={"ready": True, "hookStatus": "trusted"},
+            ), mock.patch.object(
+                builder_pulse,
+                "verify_hook_launcher",
+                return_value={
+                    "ready": False,
+                    "hookStatus": "launcher_unavailable",
+                },
+            ), mock.patch.object(
+                builder_pulse, "http_post_json"
+            ) as posted, contextlib.redirect_stdout(output):
+                result = builder_pulse.command_activate(data_dir)
+
+            self.assertEqual(result, 3)
+            self.assertEqual(
+                json.loads(output.getvalue())["hookStatus"],
+                "launcher_unavailable",
+            )
+            posted.assert_not_called()
 
     def test_session_end_is_synchronous_for_codex(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
             "commandWindows": "cd /d \"%PLUGIN_ROOT%\"&&scripts\\builder_pulse.cmd",
             "async": true,
             "timeout": 5
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
             "commandWindows": "cd /d \"%PLUGIN_ROOT%\"&&scripts\\builder_pulse.cmd",
             "async": true,
             "timeout": 5
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
             "commandWindows": "cd /d \"%PLUGIN_ROOT%\"&&scripts\\builder_pulse.cmd",
             "async": true,
             "timeout": 5
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
             "commandWindows": "cd /d \"%PLUGIN_ROOT%\"&&scripts\\builder_pulse.cmd",
             "async": true,
             "timeout": 5
@@ -59,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
             "commandWindows": "cd /d \"%PLUGIN_ROOT%\"&&scripts\\builder_pulse.cmd",
             "timeout": 3
           }
