@@ -3575,6 +3575,7 @@ class HookManifestTests(unittest.TestCase):
         )
         for root in roots:
             with self.subTest(root=str(root)), tempfile.TemporaryDirectory() as directory:
+                data_dir = Path(directory)
                 with mock.patch.object(
                     builder_pulse.os, "name", "nt"
                 ), mock.patch.object(
@@ -3582,7 +3583,7 @@ class HookManifestTests(unittest.TestCase):
                 ), mock.patch.object(
                     builder_pulse.subprocess, "run", return_value=completed
                 ) as run:
-                    result = builder_pulse.verify_hook_launcher(Path(directory))
+                    result = builder_pulse.verify_hook_launcher(data_dir)
 
                 self.assertEqual(
                     result, {"ready": True, "hookStatus": "launcher_verified"}
