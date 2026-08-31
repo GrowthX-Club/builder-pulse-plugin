@@ -20,9 +20,10 @@ import contextlib
 import datetime as dt
 import getpass
 import hashlib
+import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import secrets
 import shutil
@@ -49,10 +50,30 @@ TOKEN_USAGE_MAX_RECORD_BYTES = 64 * 1024
 PROMPT_MAX_BYTES = 64 * 1024
 PROMPT_RETENTION_MS = 60 * 24 * 60 * 60 * 1000
 PROMPT_CAPTURE_POLICY = "on"
+PROJECT_SCOPE_POLICY = "explicit"
+PROJECT_SCOPE_TRANSPORT = "explicit-v1"
+PROJECT_SCOPE_MIGRATION_VERSION = 2
 CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS = 0.75
 SETUP_DISCLOSURE = (
-    "Builder Pulse connects you with GrowthX so that we can track your progress "
-    "and provide you learning feedback."
+    "Builder Pulse is installed machine-wide, but it sends data only from project "
+    "folders you explicitly enroll. GrowthX stores the claimed member ID, name, email "
+    "address, and any optional default project or program copied from the member record "
+    "so telemetry can be linked to the right person. For each enrolled project, it "
+    "receives a stable installation ID, "
+    "a one-way hashed session ID, the display name you confirm and a sanitized project "
+    "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
+    "timestamps, plugin version, optional cumulative token counts, and each primary "
+    "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
+    "Builder Pulse admins can view these identity and telemetry fields for learning "
+    "feedback. Raw lifecycle events "
+    "and activity buckets are retained for 30 days; submitted prompts and their feedback "
+    "are retained for 60 days; the member identity fields, installation/member link, "
+    "latest status, and compacted "
+    "session, daily, and all-time "
+    "token aggregates remain until GrowthX removes them. It does not send "
+    "folder paths, files, patches, commands, tool input or output, assistant replies, "
+    "transcripts, or environment variables. Secret redaction is a safety layer, not a "
+    "guarantee, so do not put secrets in prompts."
 )
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS_PATH = PLUGIN_ROOT / "config" / "defaults.json"
@@ -64,9 +85,6 @@ STATES = {"building", "testing", "blocked", "ready", "idle"}
 CONFIG_KEYS = {
     "enabled",
     "endpoint",
-    "project_id",
-    "feature_id",
-    "feature_label",
     "delivery_timeout_seconds",
     "claim_timeout_seconds",
     "max_flush_events",
@@ -212,8 +230,11 @@ def data_lock(data_dir: Path) -> Iterable[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            # Do not read byte zero to initialize the lock file. Another
+            # Windows process may already hold a byte-range lock there, and a
+            # read then fails with PermissionError before LK_LOCK can wait.
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
@@ -244,8 +265,8 @@ def delivery_lease(data_dir: Path) -> Iterable[bool]:
             if os.name == "nt":
                 import msvcrt
 
-                handle.seek(0)
-                if handle.read(1) == b"":
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.seek(0)
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
@@ -273,6 +294,36 @@ def delivery_lease(data_dir: Path) -> Iterable[bool]:
 
 
 @contextlib.contextmanager
+def scope_delivery_lock(data_dir: Path) -> Iterable[None]:
+    """Serialize scope mutations with the final pre-request privacy check."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / ".scope-delivery.lock"
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
 def claim_lease(data_dir: Path) -> Iterable[None]:
     """Serialize first-claim attempts so the first pending token is never replaced."""
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -281,8 +332,8 @@ def claim_lease(data_dir: Path) -> Iterable[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
@@ -373,12 +424,29 @@ def parse_bool(value: Any) -> bool:
 
 
 def sanitize_identifier(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
     text = str(value).strip()
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")
     return cleaned[:128] or fallback
 
 
+def project_identifier_from_label(label: str) -> str:
+    """Derive a stable non-secret ID without collapsing distinct labels."""
+    normalized = label.strip().lower()
+    sanitized = sanitize_identifier(normalized)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    whitespace_normalized = re.sub(r"\s+", "-", normalized).strip("-.")
+    if not sanitized:
+        return f"project-{digest}"
+    if sanitized != whitespace_normalized:
+        return f"{sanitized[:115]}-{digest}"
+    return sanitized
+
+
 def validate_identifier(value: Any, field: str) -> str:
+    if value is None:
+        return ""
     text = str(value).strip()
     if not text:
         return ""
@@ -390,6 +458,8 @@ def validate_identifier(value: Any, field: str) -> str:
 
 
 def validate_feature_label(value: Any) -> str:
+    if value is None:
+        return ""
     text = str(value).strip()
     if not text:
         return ""
@@ -397,6 +467,19 @@ def validate_feature_label(value: Any) -> str:
         raise ValueError("feature_label must be at most 120 characters")
     if any(ord(character) < 32 for character in text):
         raise ValueError("feature_label must not contain control characters")
+    return text
+
+
+def validate_project_label(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if len(text) > 160:
+        raise ValueError("project_label must be at most 160 characters")
+    if any(ord(character) < 32 for character in text):
+        raise ValueError("project_label must not contain control characters")
     return text
 
 
@@ -440,10 +523,6 @@ def validate_config_value(key: str, value: Any) -> Any:
         if parsed <= 0 or parsed > maximum:
             raise ValueError(f"{key} must be greater than 0 and at most {maximum}")
         return parsed
-    if key in {"project_id", "feature_id"}:
-        return validate_identifier(value, key)
-    if key == "feature_label":
-        return validate_feature_label(value)
     if key == "endpoint":
         return validate_endpoint(value)
     return value
@@ -457,6 +536,7 @@ def env_override(name: str) -> str | None:
 def load_config(data_dir: Path) -> dict[str, Any]:
     config = read_json(DEFAULTS_PATH, {})
     overrides = read_json(data_dir / "config.json", {})
+    locally_disabled = isinstance(overrides, dict) and overrides.get("enabled") is False
     if isinstance(overrides, dict):
         for key, value in overrides.items():
             if key in CONFIG_KEYS:
@@ -468,12 +548,13 @@ def load_config(data_dir: Path) -> dict[str, Any]:
     env_map = {
         "enabled": "BUILDER_PULSE_ENABLED",
         "endpoint": "BUILDER_PULSE_ENDPOINT",
-        "project_id": "BUILDER_PULSE_PROJECT_ID",
-        "feature_id": "BUILDER_PULSE_FEATURE_ID",
-        "feature_label": "BUILDER_PULSE_FEATURE_LABEL",
         "claim_timeout_seconds": "BUILDER_PULSE_CLAIM_TIMEOUT_SECONDS",
     }
     for key, env_name in env_map.items():
+        # An explicit local pause is a privacy boundary. A stale inherited
+        # BUILDER_PULSE_ENABLED=1 must never silently turn capture back on.
+        if key == "enabled" and locally_disabled:
+            continue
         value = env_override(env_name)
         if value is not None:
             try:
@@ -504,12 +585,26 @@ def ensure_identity(data_dir: Path) -> dict[str, Any]:
         identity = read_json(path, {})
         if not isinstance(identity, dict):
             identity = {}
+        changed = False
         installation_id = valid_uuid(identity.get("installationId"))
         if not installation_id:
-            identity = {"installationId": str(uuid.uuid4())}
+            identity = {
+                "installationId": str(uuid.uuid4()),
+                "scopeSecret": secrets.token_hex(32),
+            }
+            changed = True
+        elif identity.get("installationId") != installation_id:
+            identity["installationId"] = installation_id
+            changed = True
+        scope_secret = identity.get("scopeSecret")
+        if not isinstance(scope_secret, str) or re.fullmatch(
+            r"[0-9a-f]{64}", scope_secret
+        ) is None:
+            identity["scopeSecret"] = secrets.token_hex(32)
+            changed = True
+        if changed:
             atomic_write_json(path, identity)
         else:
-            identity["installationId"] = installation_id
             try:
                 os.chmod(path, 0o600)
             except OSError:
@@ -531,66 +626,143 @@ def session_key(raw_session_id: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def repository_root(value: str | Path | None) -> Path:
+def repository_key(data_dir: Path, value: str | Path | None) -> str:
+    return path_key(data_dir, resolved_directory(value))
+
+
+def resolved_directory(value: str | Path | None) -> Path:
     candidate = Path(value or Path.cwd()).expanduser().resolve(strict=False)
     if candidate.is_file():
         candidate = candidate.parent
-    for path in (candidate, *candidate.parents):
-        if (path / ".git").exists():
-            return path
     return candidate
 
 
-def repository_key(value: str | Path | None) -> str:
-    root = repository_root(value)
-    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+def path_key(data_dir: Path, root: Path) -> str:
+    identity = ensure_identity(data_dir)
+    scope_secret = str(identity["scopeSecret"])
+    return hmac.new(
+        bytes.fromhex(scope_secret),
+        str(root).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:32]
 
 
-def load_work_contexts(data_dir: Path) -> dict[str, dict[str, str]]:
+def is_filesystem_root(path: PurePath) -> bool:
+    """Return true for POSIX, drive, and UNC filesystem anchors."""
+    return bool(path.anchor) and path == type(path)(path.anchor)
+
+
+def validate_enrollment_root(root: Path) -> Path:
+    resolved = root.expanduser().resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    if (
+        resolved == home
+        or resolved in home.parents
+        or is_filesystem_root(resolved)
+    ):
+        raise ValueError(
+            "enrollment must target a project folder, not the home, one of its "
+            "parents, or the filesystem root"
+        )
+    return resolved
+
+
+def load_work_contexts(data_dir: Path) -> dict[str, dict[str, Any]]:
     raw = read_json(data_dir / "contexts.json", {})
     if not isinstance(raw, dict):
         return {}
-    contexts: dict[str, dict[str, str]] = {}
+    contexts: dict[str, dict[str, Any]] = {}
     for key, value in raw.items():
         if isinstance(key, str) and isinstance(value, dict):
-            contexts[key] = {
+            context: dict[str, Any] = {
                 field: str(value[field])
-                for field in ("project_id", "feature_id", "feature_label")
+                for field in (
+                    "project_id",
+                    "project_label",
+                    "feature_id",
+                    "feature_label",
+                    "scope_key",
+                )
                 if isinstance(value.get(field), str) and value[field]
             }
+            ancestor_keys = value.get("ancestor_keys")
+            if isinstance(ancestor_keys, list):
+                context["ancestor_keys"] = [
+                    ancestor_key
+                    for ancestor_key in ancestor_keys
+                    if isinstance(ancestor_key, str)
+                    and re.fullmatch(r"[0-9a-f]{32}", ancestor_key)
+                ]
+            contexts[key] = context
     return contexts
 
 
-def scoped_work_context(
+def explicit_work_context(context: dict[str, Any]) -> bool:
+    try:
+        project_id = validate_identifier(context.get("project_id"), "project_id")
+        project_label = validate_project_label(context.get("project_label"))
+    except (TypeError, ValueError):
+        return False
+    return bool(project_id and project_label and valid_uuid(context.get("scope_key")))
+
+
+def enrolled_work_context(
     data_dir: Path, cwd: str | Path | None
-) -> tuple[str, dict[str, str], str]:
-    root = repository_root(cwd)
-    key = repository_key(root)
-    return key, load_work_contexts(data_dir).get(key, {}), root.name
+) -> tuple[str, dict[str, Any], Path] | None:
+    if cwd is None or not str(cwd).strip():
+        return None
+    root = resolved_directory(cwd)
+    contexts = load_work_contexts(data_dir)
+    # A project enrollment covers only the exact member-confirmed folder and its
+    # descendants. Start at the actual working directory instead of collapsing
+    # to a Git root: a member may deliberately enroll one package in a monorepo.
+    # Raw paths are reduced to one-way hashes before they touch persisted state.
+    for candidate in (root, *root.parents):
+        try:
+            validate_enrollment_root(candidate)
+        except ValueError:
+            continue
+        key = path_key(data_dir, candidate)
+        scoped = contexts.get(key, {})
+        if explicit_work_context(scoped):
+            return key, scoped, candidate
+    return None
 
 
-def safe_project_id(
-    payload: dict[str, Any], config: dict[str, Any], scoped: dict[str, str]
-) -> str:
-    scoped_project = str(scoped.get("project_id", "")).strip()
-    if scoped_project:
-        return scoped_project
-    configured = str(config.get("project_id", "")).strip()
-    if configured:
-        return configured
-    cwd = payload.get("cwd")
-    if isinstance(cwd, str) and cwd.strip():
-        return sanitize_identifier(repository_root(cwd).name, "unknown-project")
-    return "unknown-project"
+def enrollment_ancestor_keys(data_dir: Path, root: Path) -> list[str]:
+    """Return private keys for candidate ancestors without persisting raw paths."""
+    keys: list[str] = []
+    for candidate in root.parents:
+        try:
+            validate_enrollment_root(candidate)
+        except ValueError:
+            continue
+        keys.append(path_key(data_dir, candidate))
+    return keys
 
 
-def feature_context(
-    config: dict[str, Any], scoped: dict[str, str]
-) -> tuple[str | None, str | None]:
-    label = str(scoped.get("feature_label") or config.get("feature_label") or "").strip()
-    configured_id = str(
-        scoped.get("feature_id") or config.get("feature_id") or ""
-    ).strip()
+def overlapping_enrollment(
+    contexts: dict[str, dict[str, Any]],
+    key: str,
+    ancestor_keys: list[str],
+) -> bool:
+    """Reject nested allowlist roots so removal always has unambiguous semantics."""
+    if any(
+        explicit_work_context(contexts.get(ancestor_key, {}))
+        for ancestor_key in ancestor_keys
+    ):
+        return True
+    return any(
+        existing_key != key
+        and explicit_work_context(context)
+        and key in context.get("ancestor_keys", [])
+        for existing_key, context in contexts.items()
+    )
+
+
+def feature_context(scoped: dict[str, Any]) -> tuple[str | None, str | None]:
+    label = str(scoped.get("feature_label") or "").strip()
+    configured_id = str(scoped.get("feature_id") or "").strip()
     if not label:
         return None, None
     feature_id = configured_id or sanitize_identifier(label.lower(), "feature")
@@ -675,8 +847,11 @@ def classify_state(payload: dict[str, Any], previous_state: str) -> str:
     return "building"
 
 
-def state_path(data_dir: Path, key: str) -> Path:
-    return data_dir / "states" / f"{key}.json"
+def state_path(data_dir: Path, key: str, context_key: str) -> Path:
+    # A Codex session can move between repositories. Keep state and heartbeat
+    # windows separate per enrolled folder so one project's activity can never
+    # suppress or inherit another project's lifecycle event.
+    return data_dir / "states" / f"{key}-{context_key}.json"
 
 
 def heartbeat_due(previous: dict[str, Any], now_ms: int) -> bool:
@@ -976,6 +1151,7 @@ def telemetry_payload(
     installation_id: str,
     key: str,
     project_id: str,
+    project_label: str,
     feature_id: str | None,
     feature_label: str | None,
     state: str,
@@ -994,6 +1170,8 @@ def telemetry_payload(
         "installationId": installation_id,
         "sessionKey": key,
         "projectId": project_id,
+        "projectLabel": project_label,
+        "projectScope": PROJECT_SCOPE_POLICY,
         "state": state,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
@@ -1013,6 +1191,7 @@ def prompt_payload(
     installation_id: str,
     key: str,
     project_id: str,
+    project_label: str,
     feature_id: str | None,
     feature_label: str | None,
     prompt_text: str,
@@ -1026,6 +1205,8 @@ def prompt_payload(
         "installationId": installation_id,
         "sessionKey": key,
         "projectId": project_id,
+        "projectLabel": project_label,
+        "projectScope": PROJECT_SCOPE_POLICY,
         "promptText": prompt_text,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
@@ -1107,9 +1288,224 @@ def prune_prompt_outbox_unlocked(
     return retained, expired
 
 
+def explicit_project_record(record: dict[str, Any]) -> bool:
+    try:
+        project_id = validate_identifier(record.get("projectId"), "projectId")
+        project_label = validate_project_label(record.get("projectLabel"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        project_id
+        and project_label
+        and record.get("projectScope") == PROJECT_SCOPE_POLICY
+    )
+
+
+def local_scope_record(record: dict[str, Any]) -> bool:
+    context_key = record.get("_contextKey")
+    scope_key = valid_uuid(record.get("_scopeKey"))
+    return bool(
+        explicit_project_record(record)
+        and isinstance(context_key, str)
+        and re.fullmatch(r"[0-9a-f]{32}", context_key)
+        and scope_key
+    )
+
+
+def record_scope_active_unlocked(data_dir: Path, record: dict[str, Any]) -> bool:
+    if not local_scope_record(record):
+        return False
+    context = load_work_contexts(data_dir).get(str(record["_contextKey"]), {})
+    feature_id, feature_label = feature_context(context)
+    return bool(
+        explicit_work_context(context)
+        and context.get("scope_key") == record.get("_scopeKey")
+        and context.get("project_id") == record.get("projectId")
+        and context.get("project_label") == record.get("projectLabel")
+        and feature_id == record.get("featureId")
+        and feature_label == record.get("featureLabel")
+    )
+
+
+def wire_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Remove local-only allowlist keys before any network serialization."""
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
+def prune_unscoped_records_unlocked(
+    data_dir: Path,
+    path: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    records = read_jsonl(path)
+    retained = [
+        record for record in records if record_scope_active_unlocked(data_dir, record)
+    ]
+    discarded = len(records) - len(retained)
+    if discarded:
+        if retained:
+            atomic_write_jsonl(path, retained)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    return retained, discarded
+
+
+def discard_project_scope_data_unlocked(
+    data_dir: Path,
+    scope_key: str,
+) -> dict[str, int]:
+    """Discard pending data for one removed enrollment, preserving others."""
+
+    def belongs_to_removed_project(record: dict[str, Any]) -> bool:
+        return record.get("_scopeKey") == scope_key
+
+    discarded: dict[str, int] = {"lifecycle": 0, "prompts": 0, "states": 0}
+    for name, filename in (
+        ("lifecycle", "outbox.jsonl"),
+        ("prompts", "prompt-outbox.jsonl"),
+    ):
+        path = data_dir / filename
+        records = read_jsonl(path)
+        retained = [record for record in records if not belongs_to_removed_project(record)]
+        discarded[name] = len(records) - len(retained)
+        if discarded[name]:
+            if retained:
+                atomic_write_jsonl(path, retained)
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    states_dir = data_dir / "states"
+    if states_dir.exists():
+        for path in states_dir.glob("*.json"):
+            state = read_json(path, {})
+            if not isinstance(state, dict):
+                continue
+            if state.get("scopeKey") != scope_key:
+                continue
+            try:
+                path.unlink()
+                discarded["states"] += 1
+            except FileNotFoundError:
+                pass
+    return discarded
+
+
+def discard_all_pending_data_unlocked(data_dir: Path) -> dict[str, int]:
+    """Purge unsent telemetry when capture is explicitly disabled."""
+    discarded = {
+        "lifecycle": len(read_jsonl(data_dir / "outbox.jsonl")),
+        "prompts": len(read_jsonl(data_dir / "prompt-outbox.jsonl")),
+        "states": 0,
+    }
+    for filename in ("outbox.jsonl", "prompt-outbox.jsonl"):
+        try:
+            (data_dir / filename).unlink()
+        except FileNotFoundError:
+            pass
+    states_dir = data_dir / "states"
+    if states_dir.exists():
+        for path in states_dir.glob("*.json"):
+            try:
+                path.unlink()
+                discarded["states"] += 1
+            except FileNotFoundError:
+                pass
+    return discarded
+
+
+def prune_unscoped_scope_data_unlocked(data_dir: Path) -> dict[str, int]:
+    contexts_path = data_dir / "contexts.json"
+    raw_contexts = read_json(contexts_path, {})
+    retained_contexts = {
+        key: value
+        for key, value in raw_contexts.items()
+        if isinstance(key, str)
+        and isinstance(value, dict)
+        and explicit_work_context(value)
+    } if isinstance(raw_contexts, dict) else {}
+    discarded_contexts = (
+        len(raw_contexts) - len(retained_contexts)
+        if isinstance(raw_contexts, dict)
+        else 0
+    )
+    if discarded_contexts:
+        atomic_write_json(contexts_path, retained_contexts)
+
+    _, lifecycle = prune_unscoped_records_unlocked(
+        data_dir, data_dir / "outbox.jsonl"
+    )
+    _, prompts = prune_unscoped_records_unlocked(
+        data_dir, data_dir / "prompt-outbox.jsonl"
+    )
+
+    states = 0
+    states_dir = data_dir / "states"
+    if states_dir.exists():
+        for path in states_dir.glob("*.json"):
+            state = read_json(path, {})
+            if (
+                isinstance(state, dict)
+                and isinstance(state.get("contextKey"), str)
+                and valid_uuid(state.get("scopeKey"))
+                and explicit_project_record(state)
+                and load_work_contexts(data_dir)
+                .get(str(state["contextKey"]), {})
+                .get("scope_key")
+                == state.get("scopeKey")
+            ):
+                continue
+            try:
+                path.unlink()
+                states += 1
+            except FileNotFoundError:
+                pass
+    return {
+        "contexts": discarded_contexts,
+        "lifecycle": lifecycle,
+        "prompts": prompts,
+        "states": states,
+    }
+
+
+def ensure_project_scope_migration(data_dir: Path) -> dict[str, Any]:
+    marker_path = data_dir / "project-scope-migration.json"
+    marker = read_json(marker_path, {})
+    if (
+        isinstance(marker, dict)
+        and marker.get("version") == PROJECT_SCOPE_MIGRATION_VERSION
+    ):
+        return marker
+    with data_lock(data_dir):
+        marker = read_json(marker_path, {})
+        if (
+            isinstance(marker, dict)
+            and marker.get("version") == PROJECT_SCOPE_MIGRATION_VERSION
+        ):
+            return marker
+        discarded = prune_unscoped_scope_data_unlocked(data_dir)
+        marker = {
+            "version": PROJECT_SCOPE_MIGRATION_VERSION,
+            "migratedAt": utc_now_ms(),
+            "discardedUnscoped": discarded,
+        }
+        atomic_write_json(marker_path, marker)
+        return marker
+
+
 def record_prompt_event(
     data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any] | None:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    enrolled = enrolled_work_context(data_dir, cwd)
+    if enrolled is None:
+        return None
+    context_key, scoped, _ = enrolled
+
     if not is_primary_user_prompt(payload):
         return None
     prepared = bounded_redacted_prompt(payload.get("prompt"))
@@ -1130,16 +1526,17 @@ def record_prompt_event(
         or "unknown-session"
     )
     key = session_key(raw_session_id)
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-    _, scoped, _ = scoped_work_context(data_dir, cwd)
-    project_id = safe_project_id(payload, config, scoped)
-    feature_id, feature_label = feature_context(config, scoped)
+    project_id = str(scoped["project_id"])
+    project_label = str(scoped["project_label"])
+    scope_key = str(scoped["scope_key"])
+    feature_id, feature_label = feature_context(scoped)
     prompt_text, redacted, truncated = prepared
     occurred_at = utc_now_ms()
     event = prompt_payload(
         installation_id=str(identity["installationId"]),
         key=key,
         project_id=project_id,
+        project_label=project_label,
         feature_id=feature_id,
         feature_label=feature_label,
         prompt_text=prompt_text,
@@ -1147,29 +1544,45 @@ def record_prompt_event(
         redacted=redacted,
         truncated=truncated,
     )
-    with data_lock(data_dir):
-        current_identity = read_json(identity_path(data_dir), {})
-        if (
-            not isinstance(current_identity, dict)
-            or current_identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
-            or current_identity.get("installationToken")
-            != identity.get("installationToken")
-            or current_identity.get("claimedEndpoint")
-            != identity.get("claimedEndpoint")
-        ):
-            return None
-        enqueue_prompt_unlocked(
-            data_dir,
-            event,
-            int(config.get("max_outbox_events", 500)),
-            occurred_at,
-        )
+    event["_contextKey"] = context_key
+    event["_scopeKey"] = scope_key
+    with scope_delivery_lock(data_dir):
+        with data_lock(data_dir):
+            current_identity = read_json(identity_path(data_dir), {})
+            current_context = load_work_contexts(data_dir).get(context_key, {})
+            if (
+                load_config(data_dir).get("enabled") is not True
+                or not isinstance(current_identity, dict)
+                or current_identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
+                or current_identity.get("installationToken")
+                != identity.get("installationToken")
+                or current_identity.get("claimedEndpoint")
+                != identity.get("claimedEndpoint")
+                or current_context.get("project_id") != project_id
+                or current_context.get("project_label") != project_label
+                or current_context.get("scope_key") != scope_key
+                or current_context.get("feature_id") != feature_id
+                or current_context.get("feature_label") != feature_label
+            ):
+                return None
+            enqueue_prompt_unlocked(
+                data_dir,
+                event,
+                int(config.get("max_outbox_events", 500)),
+                occurred_at,
+            )
     return event
 
 
 def record_hook_event(
     data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any] | None:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    enrolled = enrolled_work_context(data_dir, cwd)
+    if enrolled is None:
+        return None
+    context_key, scoped, _ = enrolled
+
     explicit_key = payload.get("_session_key")
     if isinstance(explicit_key, str) and explicit_key:
         key = validate_identifier(explicit_key, "session_key")
@@ -1183,80 +1596,102 @@ def record_hook_event(
     identity = ensure_identity(data_dir)
     installation_id = str(identity["installationId"])
     now_ms = utc_now_ms()
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-    context_key, scoped, _ = scoped_work_context(data_dir, cwd)
-    project_id = safe_project_id(payload, config, scoped)
-    feature_id, feature_label = feature_context(config, scoped)
+    project_id = str(scoped["project_id"])
+    project_label = str(scoped["project_label"])
+    scope_key = str(scoped["scope_key"])
+    feature_id, feature_label = feature_context(scoped)
 
-    with data_lock(data_dir):
-        path = state_path(data_dir, key)
-        previous = read_json(path, {})
-        if not isinstance(previous, dict):
-            previous = {}
-        previous_state = str(previous.get("state") or "idle")
-        next_state = classify_state(payload, previous_state)
-        changed = next_state != previous_state
-        should_emit = changed or heartbeat_due(previous, now_ms)
+    with scope_delivery_lock(data_dir):
+        with data_lock(data_dir):
+            current_context = load_work_contexts(data_dir).get(context_key, {})
+            if (
+                load_config(data_dir).get("enabled") is not True
+                or current_context.get("project_id") != project_id
+                or current_context.get("project_label") != project_label
+                or current_context.get("scope_key") != scope_key
+                or current_context.get("feature_id") != feature_id
+                or current_context.get("feature_label") != feature_label
+            ):
+                return None
+            path = state_path(data_dir, key, context_key)
+            previous = read_json(path, {})
+            if not isinstance(previous, dict):
+                previous = {}
+            previous_state = str(previous.get("state") or "idle")
+            next_state = classify_state(payload, previous_state)
+            changed = next_state != previous_state
+            should_emit = changed or heartbeat_due(previous, now_ms)
 
-        active_from = capped_active_from(previous, now_ms) if should_emit else None
-        token_usage = token_usage_snapshot(payload) if should_emit else None
-        event = (
-            telemetry_payload(
-                installation_id=installation_id,
-                key=key,
-                project_id=project_id,
-                feature_id=feature_id,
-                feature_label=feature_label,
-                state=next_state,
-                occurred_at=now_ms,
-                active_from=active_from,
-                token_usage=token_usage,
+            active_from = capped_active_from(previous, now_ms) if should_emit else None
+            token_usage = token_usage_snapshot(payload) if should_emit else None
+            event = (
+                telemetry_payload(
+                    installation_id=installation_id,
+                    key=key,
+                    project_id=project_id,
+                    project_label=project_label,
+                    feature_id=feature_id,
+                    feature_label=feature_label,
+                    state=next_state,
+                    occurred_at=now_ms,
+                    active_from=active_from,
+                    token_usage=token_usage,
+                )
+                if should_emit
+                else None
             )
-            if should_emit
-            else None
-        )
-        previous_last_observed = previous.get("lastObservedAt")
-        continuous = (
-            previous_state != "idle"
-            and isinstance(previous_last_observed, int)
-            and now_ms - previous_last_observed <= MAX_ACTIVE_MINUTES * 60 * 1000
-        )
-        previous_window = previous.get("activeWindowStartAt")
-        next_window = (
-            previous_window
-            if continuous and isinstance(previous_window, int) and not should_emit
-            else now_ms
-        )
-        state = {
-            "schemaVersion": SCHEMA_VERSION,
-            "sessionKey": key,
-            "contextKey": context_key,
-            "projectId": project_id,
-            "state": next_state,
-            "stateChangedAt": (
-                now_ms if changed else previous.get("stateChangedAt", now_ms)
-            ),
-            "lastObservedAt": now_ms,
-            "activeWindowStartAt": next_window,
-            "lastEmittedAt": now_ms if should_emit else previous.get("lastEmittedAt"),
-            "lastEventId": event["eventId"] if event else previous.get("lastEventId"),
-        }
-        if feature_id and feature_label:
-            state["featureId"] = feature_id
-            state["featureLabel"] = feature_label
-        atomic_write_json(path, state)
-
-        if event is None:
-            return None
-        token = identity.get("installationToken")
-        claimed_endpoint = identity.get("claimedEndpoint")
-        if isinstance(token, str) and token and isinstance(claimed_endpoint, str):
-            enqueue_event_unlocked(
-                data_dir,
-                event,
-                int(config.get("max_outbox_events", 500)),
+            previous_last_observed = previous.get("lastObservedAt")
+            continuous = (
+                previous_state != "idle"
+                and isinstance(previous_last_observed, int)
+                and now_ms - previous_last_observed
+                <= MAX_ACTIVE_MINUTES * 60 * 1000
             )
-        return event
+            previous_window = previous.get("activeWindowStartAt")
+            next_window = (
+                previous_window
+                if continuous and isinstance(previous_window, int) and not should_emit
+                else now_ms
+            )
+            state = {
+                "schemaVersion": SCHEMA_VERSION,
+                "sessionKey": key,
+                "contextKey": context_key,
+                "scopeKey": scope_key,
+                "projectId": project_id,
+                "projectLabel": project_label,
+                "projectScope": PROJECT_SCOPE_POLICY,
+                "state": next_state,
+                "stateChangedAt": (
+                    now_ms if changed else previous.get("stateChangedAt", now_ms)
+                ),
+                "lastObservedAt": now_ms,
+                "activeWindowStartAt": next_window,
+                "lastEmittedAt": (
+                    now_ms if should_emit else previous.get("lastEmittedAt")
+                ),
+                "lastEventId": (
+                    event["eventId"] if event else previous.get("lastEventId")
+                ),
+            }
+            if feature_id and feature_label:
+                state["featureId"] = feature_id
+                state["featureLabel"] = feature_label
+            atomic_write_json(path, state)
+
+            if event is None:
+                return None
+            event["_contextKey"] = context_key
+            event["_scopeKey"] = scope_key
+            token = identity.get("installationToken")
+            claimed_endpoint = identity.get("claimedEndpoint")
+            if isinstance(token, str) and token and isinstance(claimed_endpoint, str):
+                enqueue_event_unlocked(
+                    data_dir,
+                    event,
+                    int(load_config(data_dir).get("max_outbox_events", 500)),
+                )
+            return event
 
 
 def sanitized_endpoint(endpoint: str) -> str:
@@ -1280,6 +1715,7 @@ def http_post_json(
     token: str | None,
     timeout: float,
     expect_json: bool,
+    explicit_project_scope_transport: bool = False,
 ) -> tuple[bool, str, dict[str, Any] | None]:
     headers = {
         "Content-Type": "application/json",
@@ -1287,6 +1723,8 @@ def http_post_json(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if explicit_project_scope_transport:
+        headers["X-Builder-Pulse-Project-Scope"] = PROJECT_SCOPE_TRANSPORT
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urlrequest.Request(url, data=body, headers=headers, method="POST")
     try:
@@ -1323,10 +1761,11 @@ def deliver_event(
         return False, "not_claimed"
     ok, result, _ = http_post_json(
         endpoint_url(bound_endpoint, "/v1/telemetry"),
-        event,
+        wire_payload(event),
         token=token,
         timeout=float(config.get("delivery_timeout_seconds", 1.0)),
         expect_json=False,
+        explicit_project_scope_transport=True,
     )
     return ok, result
 
@@ -1339,12 +1778,39 @@ def deliver_prompt(
         return False, "not_claimed"
     ok, result, _ = http_post_json(
         endpoint_url(bound_endpoint, "/v1/prompts"),
-        event,
+        wire_payload(event),
         token=token,
         timeout=float(config.get("delivery_timeout_seconds", 1.0)),
         expect_json=False,
+        explicit_project_scope_transport=True,
     )
     return ok, result
+
+
+def deliver_scoped_record(
+    data_dir: Path,
+    event: dict[str, Any],
+    config: dict[str, Any],
+    token: str,
+    endpoint: str,
+    *,
+    prompt: bool,
+) -> tuple[bool, str]:
+    """Revalidate the exact local enrollment immediately before sending."""
+    with scope_delivery_lock(data_dir):
+        with data_lock(data_dir):
+            current_config = load_config(data_dir)
+            if current_config.get("enabled") is not True:
+                return False, "disabled"
+            if not record_scope_active_unlocked(data_dir, event):
+                return False, "scope_inactive"
+        if prompt:
+            current_config["delivery_timeout_seconds"] = min(
+                float(current_config.get("delivery_timeout_seconds", 1.0)),
+                float(config.get("delivery_timeout_seconds", 1.0)),
+            )
+            return deliver_prompt(event, current_config, token, endpoint)
+        return deliver_event(event, current_config, token, endpoint)
 
 
 def permanent_delivery_failure(result: str) -> bool:
@@ -1356,17 +1822,34 @@ def permanent_delivery_failure(result: str) -> bool:
 
 
 def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
+    ensure_project_scope_migration(data_dir)
+    path = data_dir / "outbox.jsonl"
+    config = load_config(data_dir)
+    if config.get("enabled") is not True:
+        return {
+            "delivered": 0,
+            "discarded": 0,
+            "quarantined": 0,
+            "remaining": len(read_jsonl(path)),
+        }
+    with data_lock(data_dir):
+        records, unscoped_count = prune_unscoped_records_unlocked(data_dir, path)
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
-    path = data_dir / "outbox.jsonl"
     if not isinstance(token, str) or not token or not endpoint:
-        return {"delivered": 0, "quarantined": 0, "remaining": len(read_jsonl(path))}
+        return {
+            "delivered": 0,
+            "discarded": unscoped_count,
+            "quarantined": 0,
+            "remaining": len(records),
+        }
 
     with delivery_lease(data_dir) as acquired:
         if not acquired:
             return {
                 "delivered": 0,
+                "discarded": unscoped_count,
                 "quarantined": 0,
                 "remaining": len(read_jsonl(path)),
                 "busy": 1,
@@ -1379,7 +1862,14 @@ def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
         delivered_ids: set[str] = set()
         quarantined: list[dict[str, Any]] = []
         for event in attempted:
-            ok, result = deliver_event(event, config, token, str(endpoint))
+            ok, result = deliver_scoped_record(
+                data_dir,
+                event,
+                config,
+                token,
+                str(endpoint),
+                prompt=False,
+            )
             if ok and isinstance(event.get("eventId"), str):
                 delivered_ids.add(event["eventId"])
             elif permanent_delivery_failure(result):
@@ -1411,15 +1901,25 @@ def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
             remaining = read_jsonl(path)
         return {
             "delivered": len(delivered_ids),
+            "discarded": unscoped_count,
             "quarantined": len(quarantined),
             "remaining": len(remaining),
         }
 
 
 def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
+    ensure_project_scope_migration(data_dir)
     now_ms = utc_now_ms()
     path = data_dir / "prompt-outbox.jsonl"
+    config = load_config(data_dir)
+    if config.get("enabled") is not True:
+        return {
+            "delivered": 0,
+            "discarded": 0,
+            "remaining": len(read_jsonl(path)),
+        }
     with data_lock(data_dir):
+        _, unscoped_count = prune_unscoped_records_unlocked(data_dir, path)
         records, expired_count = prune_prompt_outbox_unlocked(path, now_ms)
 
     identity = claimed_identity(data_dir)
@@ -1433,7 +1933,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
     ):
         return {
             "delivered": 0,
-            "discarded": expired_count,
+            "discarded": unscoped_count + expired_count,
             "remaining": len(records),
         }
 
@@ -1441,7 +1941,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
         if not acquired:
             return {
                 "delivered": 0,
-                "discarded": expired_count,
+                "discarded": unscoped_count + expired_count,
                 "remaining": len(read_jsonl(path)),
                 "busy": 1,
             }
@@ -1455,7 +1955,14 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
         discarded_ids: set[str] = set()
         capture_rejected = False
         for event in attempted:
-            ok, result = deliver_prompt(event, config, token, str(endpoint))
+            ok, result = deliver_scoped_record(
+                data_dir,
+                event,
+                config,
+                token,
+                str(endpoint),
+                prompt=True,
+            )
             prompt_id = event.get("promptId")
             if ok and isinstance(prompt_id, str):
                 delivered_ids.add(prompt_id)
@@ -1478,7 +1985,8 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
                     pass
             return {
                 "delivered": len(delivered_ids),
-                "discarded": expired_count
+                "discarded": unscoped_count
+                + expired_count
                 + max(0, len(current) - len(delivered_ids)),
                 "remaining": 0,
             }
@@ -1503,7 +2011,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
             remaining = read_jsonl(path)
         return {
             "delivered": len(delivered_ids),
-            "discarded": expired_count + len(discarded_ids),
+            "discarded": unscoped_count + expired_count + len(discarded_ids),
             "remaining": len(remaining),
         }
 
@@ -1511,7 +2019,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
 def attempt_current_prompt(
     data_dir: Path, config: dict[str, Any], event: dict[str, Any]
 ) -> dict[str, int]:
-    """Attempt only the just-queued prompt under a short synchronous deadline."""
+    """Attempt only the just-queued prompt under a short delivery deadline."""
     path = data_dir / "prompt-outbox.jsonl"
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
@@ -1535,7 +2043,14 @@ def attempt_current_prompt(
         float(config.get("delivery_timeout_seconds", 1.0)),
         CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS,
     )
-    ok, result = deliver_prompt(event, prompt_config, token, endpoint)
+    ok, result = deliver_scoped_record(
+        data_dir,
+        event,
+        prompt_config,
+        token,
+        endpoint,
+        prompt=True,
+    )
 
     if result in {"http_401", "http_403"}:
         with data_lock(data_dir):
@@ -1585,13 +2100,14 @@ def ingest_hook(data_dir: Path) -> int:
         return 0
 
     try:
+        ensure_project_scope_migration(data_dir)
         config = load_config(data_dir)
         if config.get("enabled", True):
             prompt_event = record_prompt_event(data_dir, payload, config)
             event = record_hook_event(data_dir, payload, config)
             if prompt_event is not None:
-                # UserPromptSubmit is synchronous. Prioritize only the current
-                # prompt under a strict deadline; async hooks drain all backlog.
+                # Prioritize this prompt under a strict deadline. Codex runs the
+                # hook in the background so telemetry can never block submission.
                 attempt_current_prompt(data_dir, config, prompt_event)
             # SessionEnd is synchronous in Codex even for async hooks. Persist
             # idle locally and let the next hook/manual flush deliver it.
@@ -1650,15 +2166,36 @@ def safe_identity_summary(data_dir: Path) -> dict[str, Any]:
 
 
 def command_status(args: argparse.Namespace, data_dir: Path) -> int:
+    ensure_project_scope_migration(data_dir)
     records = status_records(data_dir)
     if args.project:
         records = [item for item in records if item.get("projectId") == args.project]
     identity = safe_identity_summary(data_dir)
+    current_enrollment = enrolled_work_context(data_dir, Path.cwd())
+    config = load_config(data_dir)
+    enabled = config.get("enabled") is True
+    current_project_enrolled = current_enrollment is not None
+    effective_prompt_capture = bool(
+        enabled
+        and current_project_enrolled
+        and identity["promptCapture"] == PROMPT_CAPTURE_POLICY
+    )
+    enrolled_projects = [
+        context
+        for context in load_work_contexts(data_dir).values()
+        if explicit_work_context(context)
+    ]
     result = {
         "schemaVersion": SCHEMA_VERSION,
         "identity": identity,
         "heartbeatMinutes": HEARTBEAT_MINUTES,
         "promptCapture": identity["promptCapture"],
+        "promptCapturePolicy": identity["promptCapture"],
+        "builderPulseEnabled": enabled,
+        "captureScope": "enrolled-projects-only",
+        "currentProjectEnrolled": current_project_enrolled,
+        "effectivePromptCapture": effective_prompt_capture,
+        "enrolledProjects": len(enrolled_projects),
         "outboxEvents": len(read_jsonl(data_dir / "outbox.jsonl")),
         "promptOutboxEvents": len(read_jsonl(data_dir / "prompt-outbox.jsonl")),
         "sessions": records,
@@ -1668,7 +2205,10 @@ def command_status(args: argparse.Namespace, data_dir: Path) -> int:
         return 0
     builder = identity.get("builderName") or identity.get("builderId") or "unclaimed"
     print(
-        f"Builder: {builder} | prompt capture: {result['promptCapture']} | "
+        f"Builder: {builder} | prompt policy: {result['promptCapturePolicy']} | "
+        f"Builder Pulse enabled: {str(enabled).lower()} | "
+        f"current project enrolled: {str(current_project_enrolled).lower()} | "
+        f"effective prompt capture: {str(effective_prompt_capture).lower()} | "
         f"state queued: {result['outboxEvents']} | "
         f"prompts queued: {result['promptOutboxEvents']}"
     )
@@ -1705,8 +2245,15 @@ def command_mark(args: argparse.Namespace, data_dir: Path) -> int:
         "hook_event_name": "ExplicitStateMark",
         "_session_key": key,
         "explicit_state": args.state,
+        "cwd": str(Path.cwd()),
     }
     event = record_hook_event(data_dir, payload, config)
+    if event is None:
+        print(
+            "This project is not enrolled. Run work enroll before marking state.",
+            file=sys.stderr,
+        )
+        return 2
     if event is not None:
         flush_outbox(data_dir, config)
         flush_prompt_outbox(data_dir, config)
@@ -1739,49 +2286,170 @@ def command_config(args: argparse.Namespace, data_dir: Path) -> int:
     if args.config_command == "set":
         try:
             value = validate_config_value(args.key, args.value)
-            if args.key == "endpoint":
-                bound = claimed_identity(data_dir).get("claimedEndpoint")
-                if isinstance(bound, str) and bound and value != bound:
-                    raise ValueError(
-                        "endpoint is bound to the claimed identity and cannot be changed"
-                    )
-            overrides[args.key] = value
         except (TypeError, ValueError) as exc:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 2
-        save_config_overrides(data_dir, overrides)
-        print(json.dumps(display_config(load_config(data_dir), data_dir), indent=2, sort_keys=True))
+        discarded = None
+        with scope_delivery_lock(data_dir):
+            with data_lock(data_dir):
+                overrides = read_json(path, {})
+                if not isinstance(overrides, dict):
+                    overrides = {}
+                if args.key == "endpoint":
+                    identity = read_json(identity_path(data_dir), {})
+                    bound = (
+                        identity.get("claimedEndpoint")
+                        if isinstance(identity, dict)
+                        else None
+                    )
+                    if isinstance(bound, str) and bound and value != bound:
+                        print(
+                            "Configuration error: endpoint is bound to the claimed "
+                            "identity and cannot be changed",
+                            file=sys.stderr,
+                        )
+                        return 2
+                overrides[args.key] = value
+                save_config_overrides(data_dir, overrides)
+                if args.key == "enabled" and value is False:
+                    discarded = discard_all_pending_data_unlocked(data_dir)
+        result = display_config(load_config(data_dir), data_dir)
+        if discarded is not None:
+            result["discardedPendingOnDisable"] = discarded
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.config_command == "unset":
-        overrides.pop(args.key, None)
-        save_config_overrides(data_dir, overrides)
+        with scope_delivery_lock(data_dir):
+            with data_lock(data_dir):
+                overrides = read_json(path, {})
+                if not isinstance(overrides, dict):
+                    overrides = {}
+                overrides.pop(args.key, None)
+                save_config_overrides(data_dir, overrides)
         print(json.dumps(display_config(load_config(data_dir), data_dir), indent=2, sort_keys=True))
         return 0
     return 2
 
 
 def command_work(args: argparse.Namespace, data_dir: Path) -> int:
-    target_root = repository_root(getattr(args, "root", None))
-    key = repository_key(target_root)
+    ensure_project_scope_migration(data_dir)
+    requested_root = getattr(args, "root", None)
+    requested_project = getattr(args, "project", None)
+    if args.work_command == "enroll" and sys.stdin.isatty():
+        if not requested_root:
+            current_folder = Path.cwd().resolve(strict=False)
+            repository_root: Path | None = None
+            try:
+                detected = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(current_folder),
+                        "rev-parse",
+                        "--show-toplevel",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if detected.returncode == 0 and detected.stdout.strip():
+                    candidate = Path(detected.stdout.strip()).resolve(strict=False)
+                    if candidate.is_dir() and candidate != current_folder:
+                        repository_root = candidate
+            except (OSError, subprocess.SubprocessError):
+                repository_root = None
+            print(
+                "Builder Pulse project choices (shown only in this terminal):",
+                file=sys.stderr,
+            )
+            print(f"- Current folder: {current_folder}", file=sys.stderr)
+            if repository_root is not None:
+                print(
+                    f"- Nearest Git repository root: {repository_root}",
+                    file=sys.stderr,
+                )
+            entered_root = input(
+                "Which exact project folder should Builder Pulse monitor? "
+                f"[{current_folder}]: "
+            ).strip()
+            requested_root = entered_root or str(current_folder)
+        if not requested_project:
+            requested_project = input(
+                "What display name should GrowthX use for this project?: "
+            ).strip()
+    target_root = resolved_directory(requested_root)
+    exact_key = path_key(data_dir, target_root)
     path = data_dir / "contexts.json"
     contexts = load_work_contexts(data_dir)
-    scoped = dict(contexts.get(key, {}))
+    matched = enrolled_work_context(data_dir, target_root)
+    if args.work_command == "show" and matched is not None:
+        key, matched_context, target_root = matched
+        scoped = dict(matched_context)
+    else:
+        key = exact_key
+        scoped = dict(contexts.get(key, {}))
+    if args.work_command == "list":
+        projects = [
+            {
+                "contextKey": context_key,
+                "projectId": context.get("project_id"),
+                "projectLabel": context.get("project_label"),
+            }
+            for context_key, context in contexts.items()
+            if explicit_work_context(context)
+        ]
+        print(
+            json.dumps(
+                {"scope": "explicit-project-allowlist", "projects": projects},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.work_command == "show":
-        config = load_config(data_dir)
+        enrolled = explicit_work_context(scoped)
         print(
             json.dumps(
                 {
                     "contextKey": key,
+                    "root": str(target_root),
                     "rootLabel": target_root.name,
-                    "projectId": scoped.get("project_id")
-                    or config.get("project_id")
-                    or sanitize_identifier(target_root.name, "unknown-project"),
-                    "featureId": scoped.get("feature_id")
-                    or config.get("feature_id")
-                    or None,
-                    "featureLabel": scoped.get("feature_label")
-                    or config.get("feature_label")
-                    or None,
+                    "enrolled": enrolled,
+                    "projectId": scoped.get("project_id") if enrolled else None,
+                    "projectLabel": scoped.get("project_label") if enrolled else None,
+                    "featureId": scoped.get("feature_id") if enrolled else None,
+                    "featureLabel": scoped.get("feature_label") if enrolled else None,
+                    "capture": "enrolled-projects-only",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.work_command == "unenroll":
+        with scope_delivery_lock(data_dir):
+            with data_lock(data_dir):
+                contexts = load_work_contexts(data_dir)
+                removed_context = contexts.pop(key, None)
+                removed = removed_context is not None
+                atomic_write_json(path, contexts)
+                discarded = (
+                    discard_project_scope_data_unlocked(
+                        data_dir,
+                        str(removed_context.get("scope_key") or ""),
+                    )
+                    if isinstance(removed_context, dict)
+                    else {"lifecycle": 0, "prompts": 0, "states": 0}
+                )
+        effective = enrolled_work_context(data_dir, target_root)
+        print(
+            json.dumps(
+                {
+                    "enrolled": effective is not None,
+                    "removed": removed,
+                    "root": str(target_root),
+                    "discardedPending": discarded,
                 },
                 indent=2,
                 sort_keys=True,
@@ -1789,43 +2457,144 @@ def command_work(args: argparse.Namespace, data_dir: Path) -> int:
         )
         return 0
     if args.work_command == "clear-feature":
-        scoped.pop("feature_id", None)
-        scoped.pop("feature_label", None)
-        with data_lock(data_dir):
-            contexts = load_work_contexts(data_dir)
-            if scoped:
-                contexts[key] = scoped
-            else:
-                contexts.pop(key, None)
-            atomic_write_json(path, contexts)
-        print(f"Feature cleared for repository {target_root.name}; project remains unchanged.")
+        with scope_delivery_lock(data_dir):
+            with data_lock(data_dir):
+                contexts = load_work_contexts(data_dir)
+                current = contexts.get(key, {})
+                if not explicit_work_context(current):
+                    print(
+                        "Work context error: this exact project folder is not enrolled",
+                        file=sys.stderr,
+                    )
+                    return 2
+                updated = dict(current)
+                updated.pop("feature_id", None)
+                updated.pop("feature_label", None)
+                contexts[key] = updated
+                atomic_write_json(path, contexts)
+        print(f"Feature cleared for project folder {target_root.name}; project remains unchanged.")
         return 0
-    if args.work_command == "set":
-        if args.project is None and args.feature is None:
-            print("Set --project, --feature, or both.", file=sys.stderr)
+    if args.work_command in {"enroll", "set"}:
+        if args.work_command == "enroll":
+            try:
+                target_root = validate_enrollment_root(target_root)
+                if not target_root.is_dir():
+                    raise ValueError("project folder does not exist")
+                key = path_key(data_dir, target_root)
+                project_label = validate_project_label(requested_project)
+                if not project_label:
+                    raise ValueError(
+                        "project name is required; run interactively or pass --project"
+                    )
+                requested_project_id = (
+                    validate_identifier(args.project_id, "project_id")
+                    if args.project_id
+                    else None
+                )
+                if args.project_id and not requested_project_id:
+                    raise ValueError("project name must contain letters or numbers")
+                ancestor_keys = enrollment_ancestor_keys(data_dir, target_root)
+            except ValueError as exc:
+                print(f"Work context error: {exc}", file=sys.stderr)
+                return 2
+            with scope_delivery_lock(data_dir):
+                with data_lock(data_dir):
+                    contexts = load_work_contexts(data_dir)
+                    replace_existing = bool(
+                        getattr(args, "replace_existing", False)
+                    )
+                    candidate_contexts = {} if replace_existing else contexts
+                    if overlapping_enrollment(candidate_contexts, key, ancestor_keys):
+                        print(
+                            "Work context error: this folder overlaps an already "
+                            "enrolled project; enroll only one project boundary",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    existing = {} if replace_existing else contexts.get(key, {})
+                    # Contexts written before explicit project enrollment had no
+                    # member-confirmed project label. Do not revive a legacy feature
+                    # label merely because its old path hash happens to match the
+                    # newly confirmed folder. Already-explicit contexts may retain
+                    # their separately confirmed feature when renamed/re-enrolled.
+                    scoped = dict(existing) if explicit_work_context(existing) else {}
+                    project_id = (
+                        requested_project_id
+                        or scoped.get("project_id")
+                        or project_identifier_from_label(project_label)
+                    )
+                    unchanged_scope = bool(
+                        scoped.get("project_id") == project_id
+                        and scoped.get("project_label") == project_label
+                        and valid_uuid(scoped.get("scope_key"))
+                    )
+                    previous_scope_key = str(scoped.get("scope_key") or "")
+                    scoped["scope_key"] = (
+                        previous_scope_key if unchanged_scope else str(uuid.uuid4())
+                    )
+                    scoped["project_id"] = project_id
+                    scoped["project_label"] = project_label
+                    scoped["ancestor_keys"] = ancestor_keys
+                    if replace_existing:
+                        # Commit the new fail-closed allowlist before deleting
+                        # anything. If this atomic write fails, the old scope and
+                        # all of its pending local data remain untouched.
+                        contexts = {key: scoped}
+                        atomic_write_json(path, contexts)
+                        discard_all_pending_data_unlocked(data_dir)
+                        try:
+                            (data_dir / "quarantine.jsonl").unlink()
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        contexts[key] = scoped
+                        atomic_write_json(path, contexts)
+                    if previous_scope_key and not unchanged_scope:
+                        discard_project_scope_data_unlocked(
+                            data_dir, previous_scope_key
+                        )
+            return command_work(
+                argparse.Namespace(work_command="show", root=str(target_root)), data_dir
+            )
+
+        if args.project is not None:
+            print(
+                "Work context error: --project cannot be changed with work set; "
+                "use work enroll --project with the member-confirmed display name",
+                file=sys.stderr,
+            )
+            return 2
+        if args.feature is None:
+            print("Set --feature, or use work enroll to add a project folder.", file=sys.stderr)
             return 2
         try:
-            if args.project is not None:
-                scoped["project_id"] = validate_identifier(args.project, "project_id")
-            if args.feature is not None:
-                label = validate_feature_label(args.feature)
-                if not label:
-                    raise ValueError("feature must not be empty")
-                scoped["feature_label"] = label
-                scoped["feature_id"] = (
-                    validate_identifier(args.feature_id, "feature_id")
-                    if args.feature_id
-                    else sanitize_identifier(label.lower(), "feature")
-                )
-            elif args.feature_id:
-                raise ValueError("--feature-id requires --feature")
+            label = validate_feature_label(args.feature)
+            if not label:
+                raise ValueError("feature must not be empty")
+            feature_id = (
+                validate_identifier(args.feature_id, "feature_id")
+                if args.feature_id
+                else sanitize_identifier(label.lower(), "feature")
+            )
         except ValueError as exc:
             print(f"Work context error: {exc}", file=sys.stderr)
             return 2
-        with data_lock(data_dir):
-            contexts = load_work_contexts(data_dir)
-            contexts[key] = scoped
-            atomic_write_json(path, contexts)
+        with scope_delivery_lock(data_dir):
+            with data_lock(data_dir):
+                contexts = load_work_contexts(data_dir)
+                current = contexts.get(key, {})
+                if not explicit_work_context(current):
+                    print(
+                        "Work context error: enroll this exact project folder with "
+                        "work enroll --project before setting a feature",
+                        file=sys.stderr,
+                    )
+                    return 2
+                updated = dict(current)
+                updated["feature_label"] = label
+                updated["feature_id"] = feature_id
+                contexts[key] = updated
+                atomic_write_json(path, contexts)
         return command_work(
             argparse.Namespace(work_command="show", root=str(target_root)), data_dir
         )
@@ -1942,6 +2711,20 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                 )
                 return 1
 
+            # The server is authoritative for mutable roster/capture fields.
+            # Preserve the installation identity, token, endpoint, and local
+            # scope secret exactly while repairing stale promptCapture/name.
+            refreshed_identity = dict(identity)
+            refreshed_identity.update(
+                {
+                    "builderId": builder_id,
+                    "memberId": member_id,
+                    "builderName": builder_name,
+                    "promptCapture": PROMPT_CAPTURE_POLICY,
+                }
+            )
+            atomic_write_json(identity_path(data_dir), refreshed_identity)
+
             print(
                 json.dumps(
                     {
@@ -1955,6 +2738,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                         "tokenConfigured": True,
                         "heartbeatMinutes": HEARTBEAT_MINUTES,
                         "promptCapture": PROMPT_CAPTURE_POLICY,
+                        "captureScope": "enrolled-projects-only",
+                        "projectEnrollmentRequired": True,
                     },
                     indent=2,
                     sort_keys=True,
@@ -1977,6 +2762,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                         if identity.get("promptCapture") == PROMPT_CAPTURE_POLICY
                         else "off"
                     ),
+                    "captureScope": "enrolled-projects-only",
+                    "projectEnrollmentRequired": True,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2037,6 +2824,7 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
 
     claimed = {
         "installationId": identity["installationId"],
+        "scopeSecret": identity["scopeSecret"],
         "installationToken": pending_token,
         "builderId": builder_id,
         "memberId": member_id,
@@ -2050,10 +2838,9 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
     if not isinstance(overrides, dict):
         overrides = {}
     overrides["endpoint"] = endpoint
-    default_project = response.get("defaultProject")
-    effective_project = str(config.get("project_id") or "").strip()
-    if isinstance(default_project, str) and default_project.strip() and not effective_project:
-        overrides["project_id"] = sanitize_identifier(default_project, "unknown-project")
+    # Older versions treated the roster's cohort/default value as a machine-wide
+    # project fallback. Project identity is now member-confirmed per folder.
+    overrides.pop("project_id", None)
     save_config_overrides(data_dir, overrides)
 
     print(
@@ -2067,6 +2854,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                 "tokenConfigured": True,
                 "heartbeatMinutes": HEARTBEAT_MINUTES,
                 "promptCapture": PROMPT_CAPTURE_POLICY,
+                "captureScope": "enrolled-projects-only",
+                "projectEnrollmentRequired": True,
             },
             indent=2,
             sort_keys=True,
@@ -2271,6 +3060,40 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 process.kill()
 
 
+def verify_hook_launcher(data_dir: Path) -> dict[str, Any]:
+    """Execute the exact platform launcher Codex will invoke for a hook."""
+    environment = dict(os.environ)
+    environment["BUILDER_PULSE_DATA_DIR"] = str(data_dir)
+    if os.name == "nt":
+        environment["PLUGIN_ROOT"] = str(PLUGIN_ROOT)
+        # Expand PLUGIN_ROOT exactly once. CALL reparses the expanded path and
+        # corrupts legal roots containing paired percent tokens such as %TEAM%.
+        command = 'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""'
+    else:
+        command = ["sh", str(PLUGIN_ROOT / "scripts" / "builder_pulse.sh")]
+    try:
+        completed = subprocess.run(
+            command,
+            input="{}\n",
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ready": False, "hookStatus": "launcher_unavailable"}
+    if completed.returncode != 0:
+        return {"ready": False, "hookStatus": "launcher_unavailable"}
+    try:
+        output = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError:
+        return {"ready": False, "hookStatus": "launcher_invalid_output"}
+    if output != {}:
+        return {"ready": False, "hookStatus": "launcher_invalid_output"}
+    return {"ready": True, "hookStatus": "launcher_verified"}
+
+
 def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
     """Verify Codex hook readiness and the claimed server connection."""
     identity = claimed_identity(data_dir)
@@ -2291,6 +3114,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
             json.dumps(
                 {
                     "connected": False,
+                    "activationReady": False,
                     "ready": False,
                     "reviewRequired": False,
                     "hookStatus": "disabled",
@@ -2307,9 +3131,26 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
             json.dumps(
                 {
                     "connected": False,
+                    "activationReady": False,
                     "reviewRequired": hook_result.get("hookStatus")
                     in {"modified", "review_required"},
                     **hook_result,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 3
+
+    launcher_result = verify_hook_launcher(data_dir)
+    if not launcher_result.get("ready"):
+        print(
+            json.dumps(
+                {
+                    "connected": False,
+                    "activationReady": False,
+                    "reviewRequired": False,
+                    **launcher_result,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2332,12 +3173,39 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         print(f"Activation failed: {result}.", file=sys.stderr)
         return 1
 
+    telemetry_received = response.get("telemetryReceived") is True
+    telemetry_received_since_activation = (
+        response.get("telemetryReceivedSincePreviousActivation") is True
+    )
+    last_signal_at = response.get("lastSignalAt")
+    last_signal_plugin_version = response.get("lastSignalPluginVersion")
+    current_version_receipt = bool(
+        telemetry_received_since_activation
+        and isinstance(last_signal_at, int)
+        and not isinstance(last_signal_at, bool)
+        and last_signal_at > 0
+        and last_signal_plugin_version == PLUGIN_VERSION
+    )
     print(
         json.dumps(
             {
-                "connected": True,
+                # A successful activation proves identity and hook trust. Only
+                # a same-version server receipt after the previous activation
+                # proves this repaired hook path delivered telemetry.
+                "connected": current_version_receipt,
+                "activationReady": True,
                 "hooksTrusted": True,
                 "serverVerified": True,
+                "telemetryReceived": telemetry_received,
+                "telemetryReceivedSincePreviousActivation": (
+                    telemetry_received_since_activation
+                ),
+                "lastSignalAt": last_signal_at
+                if isinstance(last_signal_at, int)
+                else None,
+                "lastSignalPluginVersion": last_signal_plugin_version
+                if isinstance(last_signal_plugin_version, str)
+                else None,
                 "hookStatus": hook_result["hookStatus"],
                 "hookCount": hook_result["hookCount"],
                 "installationId": identity.get("installationId"),
@@ -2375,15 +3243,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     work = subparsers.add_parser("work", help="Set project and feature context")
     work_sub = work.add_subparsers(dest="work_command", required=True)
+    work_sub.add_parser("list", help="List explicitly enrolled projects")
     work_show = work_sub.add_parser("show")
-    work_show.add_argument("--root", help="Repository root (defaults to current directory)")
+    work_show.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_enroll = work_sub.add_parser(
+        "enroll", help="Explicitly allow telemetry for one project folder"
+    )
+    work_enroll.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_enroll.add_argument(
+        "--project", help="Member-confirmed project display name"
+    )
+    work_enroll.add_argument(
+        "--project-id", help="Optional stable project identifier"
+    )
+    work_enroll.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="Replace the project allowlist with only this confirmed folder",
+    )
+    work_unenroll = work_sub.add_parser(
+        "unenroll", help="Stop telemetry for one project folder"
+    )
+    work_unenroll.add_argument(
+        "--root", help="Project folder (defaults to current directory)"
+    )
     work_set = work_sub.add_parser("set")
-    work_set.add_argument("--root", help="Repository root (defaults to current directory)")
-    work_set.add_argument("--project", help="Concise product/project identifier")
+    work_set.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_set.add_argument(
+        "--project",
+        help="Deprecated; project folders and names must be confirmed with work enroll",
+    )
     work_set.add_argument("--feature", help="Explicit feature label (max 120 chars)")
     work_set.add_argument("--feature-id", help="Optional stable feature identifier")
     work_clear = work_sub.add_parser("clear-feature")
-    work_clear.add_argument("--root", help="Repository root (defaults to current directory)")
+    work_clear.add_argument("--root", help="Project folder (defaults to current directory)")
 
     config = subparsers.add_parser("config", help="Inspect or change local settings")
     config_sub = config.add_subparsers(dest="config_command", required=True)

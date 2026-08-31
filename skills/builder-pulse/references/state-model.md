@@ -27,9 +27,34 @@ unless the claimed identity stores that exact server policy.
 The installation token is stored in `identity.json` with mode `0600` and sent
 only as the bearer header to `/v1/telemetry` and `/v1/prompts`. It is never
 printed in full. A
-server default project is adopted only when no project is already configured.
+`defaultProject` is legacy roster/program metadata and is never adopted as
+telemetry project context. Project identity comes only from an explicit local
+folder enrollment.
+Older context records without a member-confirmed project label remain inactive.
+Their legacy feature fields are cleared when that folder is first explicitly
+enrolled, so inferred or stale labels cannot silently become active telemetry.
 The token is bound to the claimed HTTPS endpoint; HTTP is permitted only for a
 loopback development server.
+
+Raw lifecycle events and activity buckets are retained for 30 days. Submitted
+prompts and their feedback are retained for 60 days. The installation/member
+link, latest state, and compacted per-session, daily, and all-time token
+aggregates remain until GrowthX removes them.
+
+## Data labels
+
+| Data group | GrowthX receives | GrowthX does not receive |
+| --- | --- | --- |
+| Claimed identity | Member ID, name, email, optional roster/program default, installation ID, claim policy. | Local identity-file path or installation token in response bodies. |
+| Project context | Member-confirmed display name, sanitized stable project ID, `projectScope: "explicit"`. | Enrolled folder path or the private HMAC keys used to match it. |
+| Optional feature | Explicit feature display name and sanitized stable feature ID. | A feature inferred from prompts, commands, or folder names. |
+| Lifecycle | Hashed session ID, coarse state, event/activity timestamps, plugin version, optional five cumulative token counters. | Files, patches, commands, tool I/O, transcripts, assistant replies, paths, or environment variables. |
+| Prompt | The primary submitted prompt after local secret redaction and the 64 KiB bound, plus project/feature identifiers and redacted/truncated flags. | Tool-hook text, subagent/fork prompts, assistant replies, or transcript content. |
+
+The roster/program `defaultProject` is identity metadata only. It is never used
+as event project context. Legacy or incomplete events without both a
+member-confirmed `projectLabel` and `projectScope: "explicit"` are rejected,
+not relabeled.
 
 ## Exact telemetry contract
 
@@ -41,6 +66,8 @@ schema v1 payload:
 - stable UUID `installationId`;
 - one-way hashed `sessionKey`;
 - sanitized `projectId`;
+- member-confirmed `projectLabel` (maximum 160 characters);
+- `projectScope: "explicit"`;
 - optional explicit `featureId` and `featureLabel` (maximum 120 characters);
 - `state`;
 - epoch-millisecond `occurredAt`;
@@ -114,6 +141,8 @@ On a claimed primary `UserPromptSubmit`, `POST /v1/prompts` sends exactly:
 - stable UUID `installationId`;
 - one-way hashed `sessionKey`;
 - sanitized `projectId`;
+- member-confirmed `projectLabel` (maximum 160 characters);
+- `projectScope: "explicit"`;
 - optional explicit `featureId` and `featureLabel`;
 - UTF-8-bounded `promptText` (at most 65,536 bytes);
 - epoch-millisecond `occurredAt`;
@@ -121,8 +150,9 @@ On a claimed primary `UserPromptSubmit`, `POST /v1/prompts` sends exactly:
 - boolean `redacted` and `truncated` flags.
 
 Before bounding, prompt text is scanned for high-confidence private-key blocks,
-Authorization/Bearer values, and common API-token formats. Recognized values
-are replaced. This is deliberately not described as complete secret detection.
+Authorization/Bearer values, common API-token formats, and labeled Builder
+Pulse invite-code forms used by older setup prompts. Recognized values are
+replaced. This is deliberately not described as complete secret detection.
 The event is stored in a separate bounded `prompt-outbox.jsonl`, created with
 mode `0600` before any prompt bytes are written. Network failures retain the
 same `promptId` for idempotent retry for at most 60 days; older local captures
@@ -138,8 +168,16 @@ response, subagent, or fork.
 
 ## Privacy and exclusion contract
 
-Builder Pulse captures only the submitted user prompt under the exact contract
-above. It must never add these values to either wire contract or outbox:
+Builder Pulse is installed machine-wide, but it captures only hooks whose
+working directory is inside a project folder the member explicitly enrolled.
+An enrollment includes that folder's descendants, including non-Git projects;
+it does not widen a confirmed monorepo package to the repository root. The home
+directory, its parents, and filesystem root cannot be enrolled. Missing
+working-directory metadata, missing enrollment, or incomplete project context
+fails closed before prompt text or transcript metadata is inspected and before
+any lifecycle or prompt event is created. Builder Pulse captures only the
+submitted user prompt under the exact contract above.
+It must never add these values to either wire contract or outbox:
 
 - shell commands;
 - tool input or output;
@@ -157,10 +195,15 @@ complete secret detector. A submitted prompt may itself mention command, path,
 or source content; that user-authored content remains part of `promptText`.
 
 A shell command may be inspected in memory only long enough to distinguish
-testing or successful review-artifact creation. The product/project defaults to
-a sanitized folder basename when not explicitly configured. Feature labels are
-explicit and must not be inferred from prompt content.
+testing or successful review-artifact creation. Project names are explicitly
+confirmed by the member and must not be inferred from a folder basename, prompt
+content, or roster default. Feature labels are explicit and must not be inferred
+from prompt content.
 
-Project and feature overrides are keyed by a one-way hash of the repository root.
-Full repository paths are not persisted. Global configured values are explicit
-fallbacks only.
+Project and feature overrides are keyed by private HMACs of the exact enrolled
+folder and its ancestors so descendants can be matched without storing paths.
+Full folder paths are not persisted or sent. There is no global project or
+feature fallback. The v0.4.6 migration deletes ambiguous legacy queued records
+and local state that do not carry both `projectLabel` and
+`projectScope: "explicit"`; it preserves claimed identity and explicit
+per-folder contexts.

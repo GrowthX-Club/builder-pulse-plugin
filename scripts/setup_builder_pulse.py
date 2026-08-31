@@ -4,25 +4,77 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import http.client
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
+import re
 import shutil
 import subprocess
 import sys
-from typing import Any
+import tempfile
+from typing import Any, Iterable, NamedTuple
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 
-REPOSITORY = "https://github.com/udayanwalvekar/builder-pulse-plugin.git"
+REPOSITORY = "https://github.com/GrowthX-Club/builder-pulse-plugin.git"
+APPROVED_EXISTING_REPOSITORIES = {
+    REPOSITORY,
+    REPOSITORY.removesuffix(".git"),
+    "https://github.com/udayanwalvekar/builder-pulse-plugin.git",
+    "https://github.com/udayanwalvekar/builder-pulse-plugin",
+}
 MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
-TARGET_RELEASE = "v0.4.5"
+TARGET_RELEASE = "v0.4.6"
 DEFAULT_ENDPOINT = "https://precious-ant-429.convex.site"
+RELEASE_API = (
+    "https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/"
+)
+COMMITS_API = "https://api.github.com/repos/{repository}/commits/{commit}"
+SETUP_DISCLOSURE = (
+    "Builder Pulse is installed machine-wide, but it sends data only from project "
+    "folders you explicitly enroll. GrowthX stores the claimed member ID, name, email "
+    "address, and any optional default project or program copied from the member record "
+    "so telemetry can be linked to the right person. For each enrolled project, it "
+    "receives a stable installation ID, "
+    "a one-way hashed session ID, the display name you confirm and a sanitized project "
+    "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
+    "timestamps, plugin version, optional cumulative token counts, and each primary "
+    "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
+    "Builder Pulse admins can view these identity and telemetry fields for learning "
+    "feedback. Raw lifecycle events "
+    "and activity buckets are retained for 30 days; submitted prompts and their feedback "
+    "are retained for 60 days; the member identity fields, installation/member link, "
+    "latest status, and compacted "
+    "session, daily, and all-time "
+    "token aggregates remain until GrowthX removes them. It does not send "
+    "folder paths, files, patches, commands, tool input or output, assistant replies, "
+    "transcripts, or environment variables. Secret redaction is a safety layer, not a "
+    "guarantee, so do not put secrets in prompts."
+)
 
 
 class SetupError(RuntimeError):
     pass
+
+
+class RollbackSource(NamedTuple):
+    version: str
+    commit: str
+    repository: str
+
+
+class PausedCapture(NamedTuple):
+    data_dir: Path
+    identity: dict[str, Any]
+
+
+def is_filesystem_root(path: PurePath) -> bool:
+    return bool(path.anchor) and path == type(path)(path.anchor)
 
 
 def run_command(
@@ -31,13 +83,16 @@ def run_command(
     env: dict[str, str] | None = None,
     expect_json: bool = False,
 ) -> Any:
-    completed = subprocess.run(
-        arguments,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupError(f"Command could not start: {arguments[0]}") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise SetupError(detail or f"Command failed: {arguments[0]}")
@@ -47,6 +102,73 @@ def run_command(
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise SetupError(f"{arguments[0]} returned invalid JSON") from exc
+
+
+def cli_command(cli: Path, *arguments: str) -> list[str]:
+    """Run a verified single-file CLI without local/site import shadowing."""
+    return [sys.executable, "-I", "-S", str(cli), *arguments]
+
+
+def read_object(path: Path, *, required: bool = False) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if required:
+            raise SetupError(f"Required Builder Pulse data is missing: {path.name}")
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SetupError(f"Builder Pulse data is invalid: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise SetupError(f"Builder Pulse data is invalid: {path.name}")
+    return value
+
+
+def atomic_write_object(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    try:
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(path: Path) -> Iterable[None]:
+    """Use the same one-byte lock protocol as every supported plugin release."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def installed_builder() -> dict[str, Any] | None:
@@ -62,6 +184,350 @@ def installed_builder() -> dict[str, Any] | None:
     if len(matches) > 1:
         raise SetupError("Codex reported more than one Builder Pulse installation")
     return matches[0] if matches else None
+
+
+def installed_cli(installation: dict[str, Any]) -> Path:
+    version = installation.get("version")
+    if not isinstance(version, str) or not version or any(
+        character not in "0123456789.-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for character in version
+    ):
+        raise SetupError("Codex reported an invalid Builder Pulse version")
+    def verified_cli(plugin_root: Path) -> Path | None:
+        cli = plugin_root / "scripts" / "builder_pulse.py"
+        if not cli.is_file():
+            return None
+        manifest = plugin_root / ".codex-plugin" / "plugin.json"
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            isinstance(manifest_data, dict)
+            and manifest_data.get("version") == version.removeprefix("v")
+        ):
+            return cli
+        return None
+
+    installed_path = installation.get("installedPath")
+    if isinstance(installed_path, str) and installed_path:
+        reported_cli = verified_cli(
+            Path(installed_path).expanduser().resolve(strict=False)
+        )
+        if reported_cli is not None:
+            return reported_cli
+
+    # Only consult the user-home fallback when Codex did not report a usable
+    # absolute installation path. Some restricted Windows environments omit
+    # HOME and USERPROFILE, but a valid installedPath is still sufficient.
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    fallback_cli = verified_cli(
+        codex_home
+        / "plugins"
+        / "cache"
+        / MARKETPLACE
+        / "builder-pulse"
+        / version.removeprefix("v")
+    )
+    if fallback_cli is not None:
+        return fallback_cli
+    raise SetupError("The existing Builder Pulse script could not be located safely")
+
+
+def configured_plugin_data_dir() -> Path | None:
+    explicit = os.environ.get("BUILDER_PULSE_DATA_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve(strict=False)
+    plugin_data = os.environ.get("PLUGIN_DATA") or os.environ.get(
+        "CLAUDE_PLUGIN_DATA"
+    )
+    if plugin_data:
+        return Path(plugin_data).expanduser().resolve(strict=False)
+    return None
+
+
+def canonical_plugin_data_dir() -> Path:
+    configured = configured_plugin_data_dir()
+    if configured is not None:
+        return configured
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    return (
+        codex_home / "plugins" / "data" / f"builder-pulse-{MARKETPLACE}"
+    ).expanduser().resolve(strict=False)
+
+
+def plugin_data_dir(cli: Path) -> Path:
+    configured = configured_plugin_data_dir()
+    if configured is not None:
+        return configured
+    plugin_root = cli.parent.parent.resolve(strict=False)
+    try:
+        cache_dir = plugin_root.parent.parent.parent
+        if (
+            cache_dir.name == "cache"
+            and plugin_root.parent.name == "builder-pulse"
+            and plugin_root.parent.parent.name == MARKETPLACE
+        ):
+            return (
+                cache_dir.parent / "data" / f"builder-pulse-{MARKETPLACE}"
+            ).resolve(strict=False)
+    except (IndexError, OSError):
+        pass
+    raise SetupError("The existing Builder Pulse data directory could not be derived safely")
+
+
+def existing_plugin_data_dir(installation: dict[str, Any] | None) -> Path:
+    if installation is None:
+        return canonical_plugin_data_dir()
+    return plugin_data_dir(installed_cli(installation))
+
+
+def authoritative_identity(data_dir: Path) -> dict[str, Any]:
+    paused_path = data_dir / "setup-paused-identity.json"
+    current_path = data_dir / "identity.json"
+    paused = read_object(paused_path) if paused_path.exists() else {}
+    current = read_object(current_path) if current_path.exists() else {}
+    if paused:
+        paused_installation = paused.get("installationId")
+        current_installation = current.get("installationId")
+        if (
+            isinstance(current_installation, str)
+            and current_installation
+            and current_installation != paused_installation
+        ):
+            raise SetupError("The paused Builder Pulse identity does not match local data")
+        return paused
+    return current
+
+
+def pause_server_capture(identity: dict[str, Any], plugin_version: str) -> bool:
+    """Create a server barrier before legacy processes lose local credentials."""
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    installation_id = identity.get("installationId")
+    token_present = token is not None
+    endpoint_present = endpoint is not None
+    if token_present != endpoint_present:
+        raise SetupError("The existing Builder Pulse delivery identity is incomplete")
+    if not token_present:
+        # A first claim whose response was lost has an installation ID and a
+        # pending token, but no finalized delivery credential pair. Preserve it
+        # for an idempotent retry; there is no authenticated server capture to
+        # pause yet.
+        return False
+    if not (
+        isinstance(token, str)
+        and token
+        and isinstance(endpoint, str)
+        and endpoint
+        and isinstance(installation_id, str)
+        and installation_id
+    ):
+        raise SetupError("The existing Builder Pulse delivery identity is incomplete")
+    payload = json.dumps(
+        {
+            "installationId": installation_id,
+            "pluginVersion": plugin_version,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urlrequest.Request(
+        f"{str(endpoint).rstrip('/')}/v1/privacy-pause",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"builder-pulse-installer/{TARGET_RELEASE.removeprefix('v')}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (
+        OSError,
+        ValueError,
+        urlerror.URLError,
+        http.client.HTTPException,
+    ) as exc:
+        raise SetupError(
+            "GrowthX could not pause the existing Builder Pulse installation safely"
+        ) from exc
+    if len(raw) > 65_536:
+        raise SetupError("GrowthX returned an invalid Builder Pulse privacy-pause response")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(
+            "GrowthX returned an invalid Builder Pulse privacy-pause response"
+        ) from exc
+    if not (
+        isinstance(result, dict)
+        and result.get("paused") is True
+        and result.get("installationId") == installation_id
+    ):
+        raise SetupError("GrowthX did not confirm the Builder Pulse privacy pause")
+    return True
+
+
+def resume_server_capture(identity: dict[str, Any], plugin_version: str) -> None:
+    """Resume only after the replacement is installed and locally enrolled."""
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    installation_id = identity.get("installationId")
+    if not (
+        isinstance(token, str)
+        and token
+        and isinstance(endpoint, str)
+        and endpoint
+        and isinstance(installation_id, str)
+        and installation_id
+    ):
+        raise SetupError("The Builder Pulse delivery identity is incomplete")
+    payload = json.dumps(
+        {
+            "installationId": installation_id,
+            "pluginVersion": plugin_version,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urlrequest.Request(
+        f"{str(endpoint).rstrip('/')}/v1/privacy-resume",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"builder-pulse-installer/{TARGET_RELEASE.removeprefix('v')}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (
+        OSError,
+        ValueError,
+        urlerror.URLError,
+        http.client.HTTPException,
+    ) as exc:
+        raise SetupError(
+            "GrowthX could not resume the enrolled Builder Pulse installation safely"
+        ) from exc
+    if len(raw) > 65_536:
+        raise SetupError("GrowthX returned an invalid Builder Pulse privacy-resume response")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(
+            "GrowthX returned an invalid Builder Pulse privacy-resume response"
+        ) from exc
+    if not (
+        isinstance(result, dict)
+        and result.get("resumed") is True
+        and result.get("installationId") == installation_id
+    ):
+        raise SetupError("GrowthX did not confirm the Builder Pulse privacy resume")
+
+
+def quarantine_local_capture(data_dir: Path, identity: dict[str, Any]) -> None:
+    """Disable local capture and preserve any retryable identity atomically."""
+    identity_path = data_dir / "identity.json"
+    paused_path = data_dir / "setup-paused-identity.json"
+    config_path = data_dir / "config.json"
+    with exclusive_file_lock(data_dir / ".delivery.lock"):
+        with exclusive_file_lock(data_dir / ".scope-delivery.lock"):
+            with exclusive_file_lock(data_dir / ".lock"):
+                if identity and not paused_path.exists():
+                    atomic_write_object(paused_path, identity)
+                paused_identity = dict(identity)
+                for key in ("installationToken", "pendingInstallationToken"):
+                    paused_identity.pop(key, None)
+                if paused_identity:
+                    paused_identity["promptCapture"] = "off"
+                    atomic_write_object(identity_path, paused_identity)
+
+                config = read_object(config_path) if config_path.exists() else {}
+                config["enabled"] = False
+                atomic_write_object(config_path, config)
+
+                # Queued machine-wide records cannot be safely attributed to the
+                # project the member is about to confirm.
+                for relative in (
+                    "outbox.jsonl",
+                    "prompt-outbox.jsonl",
+                    "quarantine.jsonl",
+                ):
+                    try:
+                        (data_dir / relative).unlink()
+                    except FileNotFoundError:
+                        pass
+
+
+def pause_existing_capture(
+    installation: dict[str, Any] | None,
+) -> PausedCapture:
+    data_dir = existing_plugin_data_dir(installation)
+    identity = authoritative_identity(data_dir)
+    installed_version = (
+        installation.get("version") if isinstance(installation, dict) else None
+    )
+    server_pause_error: BaseException | None = None
+    try:
+        pause_server_capture(
+            identity,
+            str(installed_version or TARGET_RELEASE.removeprefix("v")),
+        )
+    except BaseException as exc:
+        server_pause_error = exc
+
+    # Quarantine locally even when the server cannot acknowledge the barrier.
+    # This stops every new process and preserves pending first-claim tokens for
+    # an idempotent retry. A running legacy process may have cached a token, so
+    # the caller must stop until the server pause is known and old sessions exit.
+    try:
+        quarantine_local_capture(data_dir, identity)
+    except (OSError, SetupError) as exc:
+        detail = (
+            " GrowthX server privacy-pause status is also unknown."
+            if server_pause_error is not None
+            else ""
+        )
+        raise SetupError(
+            "Builder Pulse could not be disabled locally."
+            f"{detail} Exit all running Codex sessions now and do not continue "
+            "until setup is repaired."
+        ) from exc
+
+    if server_pause_error is not None:
+        detail = (
+            "GrowthX server privacy-pause status is unknown. Builder Pulse was "
+            "disabled locally and its pending queues were removed. Exit all "
+            "running Codex sessions now, then retry setup when the server is reachable."
+        )
+        if isinstance(server_pause_error, (KeyboardInterrupt, SystemExit)):
+            print(detail, file=sys.stderr)
+            raise server_pause_error
+        raise SetupError(detail) from server_pause_error
+    return PausedCapture(data_dir=data_dir, identity=identity)
+
+
+def restore_paused_identity(cli: Path, paused: PausedCapture | None) -> None:
+    if paused is None or not paused.identity:
+        return
+    target_data_dir = plugin_data_dir(cli)
+    if target_data_dir != paused.data_dir.resolve(strict=False):
+        raise SetupError("The replacement plugin resolved a different data directory")
+    paused_path = target_data_dir / "setup-paused-identity.json"
+    with exclusive_file_lock(target_data_dir / ".delivery.lock"):
+        with exclusive_file_lock(target_data_dir / ".scope-delivery.lock"):
+            with exclusive_file_lock(target_data_dir / ".lock"):
+                stored = read_object(paused_path, required=True)
+                if stored != paused.identity:
+                    raise SetupError(
+                        "The preserved Builder Pulse identity changed during repair"
+                    )
+                atomic_write_object(target_data_dir / "identity.json", stored)
+                paused_path.unlink()
 
 
 def marketplace_state() -> dict[str, Any] | None:
@@ -82,11 +548,143 @@ def marketplace_state() -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
+def approved_existing_repository(value: Any) -> bool:
+    return isinstance(value, str) and value in APPROVED_EXISTING_REPOSITORIES
+
+
+def normalized_repository(value: str) -> str:
+    return value.removesuffix(".git").rstrip("/")
+
+
+def repository_slug(value: str) -> str:
+    normalized = normalized_repository(value)
+    prefix = "https://github.com/"
+    if not approved_existing_repository(value) or not normalized.startswith(prefix):
+        raise SetupError("The GrowthX marketplace source is not approved")
+    slug = normalized.removeprefix(prefix)
+    if slug not in {
+        "GrowthX-Club/builder-pulse-plugin",
+        "udayanwalvekar/builder-pulse-plugin",
+    }:
+        raise SetupError("The GrowthX marketplace source is not approved")
+    return slug
+
+
+def verified_git_checkout(root: Path) -> tuple[str, str]:
+    try:
+        resolved = root.expanduser().resolve(strict=True)
+        top_level = Path(
+            str(
+                run_command(
+                    ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"]
+                )
+            ).strip()
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise SetupError("The existing Builder Pulse checkout root is invalid") from exc
+    if top_level != resolved:
+        raise SetupError("The existing Builder Pulse checkout root is invalid")
+    repository = str(
+        run_command(["git", "-C", str(resolved), "remote", "get-url", "origin"])
+    ).strip()
+    if not approved_existing_repository(repository):
+        raise SetupError("The existing Builder Pulse checkout has an unapproved origin")
+    checkout_changes = str(
+        run_command(
+            [
+                "git",
+                "-C",
+                str(resolved),
+                "status",
+                "--porcelain",
+                "--ignored=matching",
+                "--untracked-files=all",
+            ]
+        )
+    ).strip()
+    if checkout_changes:
+        raise SetupError(
+            "The existing Builder Pulse checkout has modified, untracked, or ignored files"
+        )
+    commit = str(
+        run_command(["git", "-C", str(resolved), "rev-parse", "HEAD"])
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SetupError("The existing Builder Pulse checkout commit is invalid")
+    return repository, commit
+
+
+def verify_remote_commit(repository: str, commit: str) -> None:
+    request = urlrequest.Request(
+        COMMITS_API.format(repository=repository_slug(repository), commit=commit),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "builder-pulse-installer",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError("The previous Builder Pulse commit could not be verified") from exc
+    if len(raw) > 65_536:
+        raise SetupError("GitHub returned an invalid Builder Pulse commit response")
+    try:
+        commit_data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("GitHub returned an invalid Builder Pulse commit response") from exc
+    if not isinstance(commit_data, dict) or commit_data.get("sha") != commit:
+        raise SetupError("The previous Builder Pulse commit could not be verified")
+
+
+def verified_rollback_source(
+    installation: dict[str, Any] | None,
+    marketplace: dict[str, Any] | None,
+) -> RollbackSource | None:
+    if installation is None:
+        return None
+    version = installation.get("version")
+    if not isinstance(version, str) or not version:
+        raise SetupError("Codex reported an invalid previous Builder Pulse version")
+    installed_root = installed_cli(installation).parent.parent
+    repository, commit = verified_git_checkout(installed_root)
+
+    if marketplace is not None:
+        marketplace_root = marketplace.get("root")
+        if not isinstance(marketplace_root, str) or not marketplace_root:
+            raise SetupError("Codex did not report the GrowthX marketplace checkout")
+        marketplace_repository, marketplace_commit = verified_git_checkout(
+            Path(marketplace_root)
+        )
+        source = marketplace.get("marketplaceSource")
+        declared_repository = source.get("source") if isinstance(source, dict) else None
+        if (
+            not approved_existing_repository(declared_repository)
+            or normalized_repository(str(declared_repository))
+            != normalized_repository(marketplace_repository)
+        ):
+            raise SetupError(
+                "The GrowthX marketplace declaration and checkout provenance differ"
+            )
+        if (
+            normalized_repository(marketplace_repository)
+            != normalized_repository(repository)
+            or marketplace_commit != commit
+        ):
+            raise SetupError(
+                "The installed Builder Pulse package and marketplace provenance differ"
+            )
+
+    verify_remote_commit(repository, commit)
+    return RollbackSource(version.removeprefix("v"), commit, repository)
+
+
 def remove_current(
     *,
     plugin_installed: bool,
     marketplace_configured: bool,
-    rollback_version: str | None = None,
+    rollback_source: RollbackSource | None = None,
 ) -> None:
     plugin_removed = False
     if plugin_installed:
@@ -98,17 +696,27 @@ def remove_current(
                 ["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"]
             )
         except SetupError as removal_error:
-            if plugin_removed and rollback_version:
+            if plugin_removed and rollback_source is not None:
                 try:
-                    add_plugin_from_configured_marketplace(rollback_version)
-                except SetupError:
-                    try:
-                        install_release(f"v{rollback_version.removeprefix('v')}")
-                    except SetupError as rollback_error:
-                        raise SetupError(
-                            "Builder Pulse removal failed and the previous version "
-                            f"could not be restored: {rollback_error}"
-                        ) from rollback_error
+                    # Do not trust a marketplace merely because it was exact
+                    # earlier. Remove it on a second attempt, then pin and
+                    # verify the full approved commit during restoration.
+                    run_command(
+                        [
+                            "codex",
+                            "plugin",
+                            "marketplace",
+                            "remove",
+                            MARKETPLACE,
+                            "--json",
+                        ]
+                    )
+                    install_verified_rollback(rollback_source)
+                except SetupError as rollback_error:
+                    raise SetupError(
+                        "Builder Pulse removal failed and the verified previous plugin "
+                        f"could not be restored: {rollback_error}"
+                    ) from rollback_error
             raise removal_error
 
 
@@ -138,21 +746,45 @@ def add_plugin_from_configured_marketplace(expected_version: str) -> Path:
     return cli
 
 
-def install_release(release: str) -> Path:
+def install_release(
+    release: str,
+    *,
+    expected_version: str | None = None,
+    repository: str = REPOSITORY,
+    expected_commit: str | None = None,
+) -> Path:
     run_command(
         [
             "codex",
             "plugin",
             "marketplace",
             "add",
-            "udayanwalvekar/builder-pulse-plugin",
+            repository_slug(repository),
             "--ref",
             release,
             "--json",
         ]
     )
-    expected_version = release.removeprefix("v")
-    return add_plugin_from_configured_marketplace(expected_version)
+    package_version = expected_version or release.removeprefix("v")
+    cli = add_plugin_from_configured_marketplace(package_version)
+    if expected_commit is not None:
+        installed_repository, installed_commit = verified_git_checkout(cli.parent.parent)
+        if (
+            normalized_repository(installed_repository)
+            != normalized_repository(repository)
+            or installed_commit != expected_commit
+        ):
+            raise SetupError("The installed Builder Pulse package has different provenance")
+    return cli
+
+
+def install_verified_rollback(source: RollbackSource) -> Path:
+    return install_release(
+        source.commit,
+        expected_version=source.version,
+        repository=source.repository,
+        expected_commit=source.commit,
+    )
 
 
 def cleanup_partial() -> None:
@@ -165,17 +797,65 @@ def cleanup_partial() -> None:
         pass
 
 
-def verify_release_exists(release: str) -> None:
-    run_command(
-        [
-            "git",
-            "ls-remote",
-            "--exit-code",
-            "--refs",
-            REPOSITORY,
-            f"refs/tags/{release}",
-        ]
+def verified_remote_tag_commit(release: str) -> str:
+    direct_ref = f"refs/tags/{release}"
+    peeled_ref = f"{direct_ref}^{{}}"
+    output = str(
+        run_command(
+            [
+                "git",
+                "ls-remote",
+                "--exit-code",
+                REPOSITORY,
+                direct_ref,
+                peeled_ref,
+            ]
+        )
     )
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-fA-F]{40}", fields[0]):
+            raise SetupError("GitHub returned an invalid Builder Pulse release tag")
+        if fields[1] in {direct_ref, peeled_ref}:
+            refs[fields[1]] = fields[0].lower()
+    commit = refs.get(peeled_ref) or refs.get(direct_ref)
+    if commit is None:
+        raise SetupError("The immutable Builder Pulse release tag could not be verified")
+    return commit
+
+
+def verify_release_exists(release: str) -> str:
+    commit = verified_remote_tag_commit(release)
+    request = urlrequest.Request(
+        f"{RELEASE_API}{release}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "builder-pulse-installer",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError("The immutable Builder Pulse release could not be verified") from exc
+    if len(raw) > 65_536:
+        raise SetupError("GitHub returned an invalid Builder Pulse release response")
+    try:
+        release_data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("GitHub returned an invalid Builder Pulse release response") from exc
+    if not (
+        isinstance(release_data, dict)
+        and release_data.get("tag_name") == release
+        and release_data.get("draft") is False
+        and release_data.get("immutable") is True
+    ):
+        raise SetupError(
+            "Builder Pulse setup requires a published immutable GitHub release"
+        )
+    return commit
 
 
 def parse_activation(output: str) -> dict[str, Any]:
@@ -189,12 +869,15 @@ def parse_activation(output: str) -> dict[str, Any]:
 
 
 def activate(cli: Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        [sys.executable, str(cli), "activate"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            cli_command(cli, "activate"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupError("Builder Pulse activation could not start") from exc
     output = completed.stdout.strip()
     if output:
         try:
@@ -209,38 +892,120 @@ def activate(cli: Path) -> dict[str, Any]:
     raise SetupError(detail or "Builder Pulse activation failed")
 
 
-def setup(invite_code: str, endpoint: str) -> None:
+def claimed_identity_fields(identity: Any) -> dict[str, str]:
+    if not isinstance(identity, dict):
+        raise SetupError("Builder Pulse status returned an invalid identity")
+    fields = {
+        key: identity.get(key)
+        for key in ("installationId", "builderId", "memberId")
+    }
+    if (
+        identity.get("claimed") is not True
+        or identity.get("tokenConfigured") is not True
+        or any(not isinstance(value, str) or not value for value in fields.values())
+    ):
+        raise SetupError("The existing Builder Pulse identity is not fully claimed")
+    return {key: str(value) for key, value in fields.items()}
+
+
+def local_claimed_identity_fields(identity: Any) -> dict[str, str]:
+    if not isinstance(identity, dict):
+        raise SetupError("The existing Builder Pulse identity is invalid")
+    fields = {
+        key: identity.get(key)
+        for key in ("installationId", "builderId", "memberId")
+    }
+    if (
+        not isinstance(identity.get("installationToken"), str)
+        or not identity.get("installationToken")
+        or not isinstance(identity.get("claimedEndpoint"), str)
+        or not identity.get("claimedEndpoint")
+        or any(not isinstance(value, str) or not value for value in fields.values())
+    ):
+        raise SetupError("The existing Builder Pulse identity is not fully claimed")
+    return {key: str(value) for key, value in fields.items()}
+
+
+def claimed_identity(cli: Path) -> dict[str, str]:
+    status = run_command(cli_command(cli, "status", "--json"), expect_json=True)
+    identity = status.get("identity") if isinstance(status, dict) else None
+    return claimed_identity_fields(identity)
+
+
+def setup(
+    invite_code: str,
+    endpoint: str,
+    project_root: str | Path,
+    project_label: str,
+    *,
+    reuse_existing_claim: bool = False,
+) -> None:
     if sys.version_info < (3, 11):
         raise SetupError("Builder Pulse requires Python 3.11 or newer")
     if shutil.which("git") is None:
         raise SetupError("Builder Pulse requires git")
     if shutil.which("codex") is None:
         raise SetupError("Builder Pulse requires Codex")
-    if len(invite_code) < 16 or len(invite_code) > 256:
+    if reuse_existing_claim and invite_code:
+        raise SetupError("Existing-claim repair must not use a new invite code")
+    if not reuse_existing_claim and (len(invite_code) < 16 or len(invite_code) > 256):
         raise SetupError("The Builder Pulse invite code is invalid")
+    if not str(project_root).strip():
+        raise SetupError("A member-confirmed Builder Pulse project folder is required")
+    enrolled_root = Path(project_root).expanduser().resolve(strict=False)
+    if not enrolled_root.is_dir():
+        raise SetupError("The confirmed Builder Pulse project folder does not exist")
+    confirmed_label = project_label.strip()
+    if not confirmed_label or len(confirmed_label) > 160:
+        raise SetupError("The confirmed Builder Pulse project name is invalid")
+    if any(ord(character) < 32 for character in confirmed_label):
+        raise SetupError("The confirmed Builder Pulse project name is invalid")
+    home = Path.home().resolve(strict=False)
+    if (
+        enrolled_root == home
+        or enrolled_root in home.parents
+        or is_filesystem_root(enrolled_root)
+    ):
+        raise SetupError(
+            "The confirmed folder must be a project folder, not the home, one of "
+            "its parents, or the filesystem root"
+        )
 
-    verify_release_exists(TARGET_RELEASE)
+    target_commit = verify_release_exists(TARGET_RELEASE)
     previous = installed_builder()
-    previous_version = previous.get("version") if previous else None
     previous_marketplace = marketplace_state()
     if previous_marketplace:
         source = previous_marketplace.get("marketplaceSource")
         repository = source.get("source") if isinstance(source, dict) else None
-        if repository not in {REPOSITORY, REPOSITORY.removesuffix(".git")}:
+        if not approved_existing_repository(repository):
             raise SetupError("The GrowthX marketplace name points to a different source")
 
+    # Resolve and remotely verify the exact currently installed commit before
+    # reading its data or changing either Codex registration. A tag is not
+    # rollback provenance because it may move later.
+    rollback_source = verified_rollback_source(previous, previous_marketplace)
+    preserved_identity: dict[str, str] | None = None
+    if reuse_existing_claim:
+        preserved_identity = local_claimed_identity_fields(
+            authoritative_identity(existing_plugin_data_dir(previous))
+        )
+
+    # Stop older machine-wide capture without executing the old checkout. The
+    # authentication token remains quarantined on any failed replacement, so
+    # an inherited legacy BUILDER_PULSE_ENABLED=1 cannot resume capture.
+    paused = pause_existing_capture(previous)
     remove_current(
         plugin_installed=previous is not None,
         marketplace_configured=previous_marketplace is not None,
-        rollback_version=previous_version if isinstance(previous_version, str) else None,
+        rollback_source=rollback_source,
     )
     try:
-        cli = install_release(TARGET_RELEASE)
+        cli = install_release(TARGET_RELEASE, expected_commit=target_commit)
     except SetupError:
         cleanup_partial()
-        if isinstance(previous_version, str) and previous_version:
+        if rollback_source is not None:
             try:
-                install_release(f"v{previous_version.removeprefix('v')}")
+                install_verified_rollback(rollback_source)
             except SetupError as rollback_error:
                 raise SetupError(
                     "Builder Pulse update failed and the previous version could not be restored: "
@@ -248,40 +1013,170 @@ def setup(invite_code: str, endpoint: str) -> None:
                 ) from rollback_error
         raise
 
-    claim_env = dict(os.environ)
-    claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
+    # A bare package is inert. Preserve that state while restoring or claiming
+    # identity and replacing the project allowlist.
+    run_command(cli_command(cli, "config", "set", "enabled", "false"))
+    restore_paused_identity(cli, paused)
+    if reuse_existing_claim:
+        if claimed_identity(cli) != preserved_identity:
+            raise SetupError("The Builder Pulse identity changed during repair")
+    else:
+        claim_env = dict(os.environ)
+        claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
+        run_command(
+            cli_command(cli, "claim", "--endpoint", endpoint),
+            env=claim_env,
+        )
     run_command(
-        [sys.executable, str(cli), "claim", "--endpoint", endpoint],
-        env=claim_env,
+        cli_command(
+            cli,
+            "work",
+            "enroll",
+            "--root",
+            str(enrolled_root),
+            "--project",
+            confirmed_label,
+            "--replace-existing",
+        )
     )
-    activation = activate(cli)
-    if not (
-        activation.get("connected") is True
-        and activation.get("hooksTrusted") is True
-        and activation.get("serverVerified") is True
-    ):
-        if activation.get("reviewRequired") is True:
-            raise SetupError(
-                "Codex requires its official one-time Builder Pulse hook review"
+    target_plugin_version = TARGET_RELEASE.removeprefix("v")
+    resume_attempted = False
+    delivery_data_dir = plugin_data_dir(cli)
+    delivery_identity = authoritative_identity(delivery_data_dir)
+    setup_succeeded = False
+    setup_failure: BaseException | None = None
+    try:
+        # A network failure can happen after the service commits the resume but
+        # before this process receives the acknowledgement. Treat every attempt
+        # as potentially successful and restore the server barrier on any later
+        # error, including an ambiguous resume response.
+        resume_attempted = True
+        resume_server_capture(delivery_identity, target_plugin_version)
+        run_command(cli_command(cli, "config", "set", "enabled", "true"))
+        activation = activate(cli)
+        if not (
+            activation.get("activationReady") is True
+            and activation.get("hooksTrusted") is True
+            and activation.get("serverVerified") is True
+        ):
+            if activation.get("reviewRequired") is True:
+                raise SetupError(
+                    "Codex requires its official one-time Builder Pulse hook review"
+                )
+            raise SetupError("Builder Pulse activation was not server-verified")
+        run_command(cli_command(cli, "flush"))
+        setup_succeeded = True
+    except BaseException as exc:
+        setup_failure = exc
+        raise
+    finally:
+        cleanup_errors: list[str] = []
+        if not setup_succeeded and resume_attempted:
+            try:
+                pause_server_capture(delivery_identity, target_plugin_version)
+            except BaseException:
+                cleanup_errors.append("server privacy-pause status is unknown")
+        if not setup_succeeded:
+            try:
+                quarantine_local_capture(delivery_data_dir, delivery_identity)
+            except BaseException:
+                cleanup_errors.append("local capture could not be disabled")
+        if not setup_succeeded and cleanup_errors and not isinstance(
+            setup_failure, (KeyboardInterrupt, SystemExit)
+        ):
+            original = (
+                str(setup_failure)
+                if setup_failure is not None and str(setup_failure)
+                else "Builder Pulse setup did not complete"
             )
-        raise SetupError("Builder Pulse activation was not server-verified")
-    run_command([sys.executable, str(cli), "flush"])
+            raise SetupError(
+                f"{original}; " + "; ".join(cleanup_errors)
+            ) from setup_failure
+        if not setup_succeeded and cleanup_errors:
+            print(
+                "Builder Pulse emergency shutdown was incomplete: "
+                + "; ".join(cleanup_errors)
+                + ". Exit all running Codex sessions now.",
+                file=sys.stderr,
+            )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--code")
+    parser.add_argument("--project-root")
+    parser.add_argument("--project-label")
+    parser.add_argument(
+        "--reuse-existing-claim",
+        action="store_true",
+        help="Repair an already-claimed installation without a new invite",
+    )
     args = parser.parse_args()
+    print(SETUP_DISCLOSURE, file=sys.stderr)
     invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE") or ""
-    if not invite_code and sys.stdin.isatty():
+    if not args.reuse_existing_claim and not invite_code and sys.stdin.isatty():
         invite_code = getpass.getpass("Builder Pulse invite code: ")
+    project_root = args.project_root or ""
+    project_label = args.project_label or ""
+    if sys.stdin.isatty() and not project_root:
+        current_folder = Path.cwd().resolve(strict=False)
+        repository_root: Path | None = None
+        try:
+            detected = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(current_folder),
+                    "rev-parse",
+                    "--show-toplevel",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if detected.returncode == 0 and detected.stdout.strip():
+                candidate = Path(detected.stdout.strip()).resolve(strict=False)
+                if candidate.is_dir() and candidate != current_folder:
+                    repository_root = candidate
+        except (OSError, subprocess.SubprocessError):
+            repository_root = None
+        print(
+            "Builder Pulse project choices (shown only in this terminal):",
+            file=sys.stderr,
+        )
+        print(f"- Current folder: {current_folder}", file=sys.stderr)
+        if repository_root is not None:
+            print(
+                f"- Nearest Git repository root: {repository_root}",
+                file=sys.stderr,
+            )
+        entered_root = input(
+            "Which exact project folder should Builder Pulse monitor? "
+            f"[{current_folder}]: "
+        ).strip()
+        project_root = entered_root or str(current_folder)
+    if sys.stdin.isatty() and not project_label:
+        project_label = input("Project name GrowthX should display: ").strip()
     try:
-        setup(invite_code, args.endpoint)
+        setup(
+            invite_code,
+            args.endpoint,
+            project_root,
+            project_label,
+            reuse_existing_claim=args.reuse_existing_claim,
+        )
     except SetupError as exc:
-        print(f"Builder Pulse setup failed safely: {exc}", file=sys.stderr)
+        print(f"Builder Pulse setup stopped: {exc}", file=sys.stderr)
         return 1
-    print("Builder Pulse is connected. Send one new normal Codex prompt to verify telemetry.")
+    print(
+        "Builder Pulse is installed and its hooks are trusted. "
+        "The prior project allowlist was replaced; only the confirmed project "
+        "folder is enrolled. "
+        "Exit all running Codex sessions, start a fresh Codex session, "
+        "then send one normal prompt to verify server receipt."
+    )
     return 0
 
 

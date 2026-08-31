@@ -1,6 +1,6 @@
 {
   "name": "builder-pulse",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Builder progress telemetry and submitted-prompt learning feedback.",
   "author": {
     "name": "Udayan"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Builder Pulse",
     "shortDescription": "See builder state without interrupting them.",
-    "longDescription": "Builder Pulse reports a claimed builder's product, explicitly labeled feature, coarse state, capped active interval, optional cumulative numeric Codex token totals, and secret-redacted bounded primary prompts for GrowthX learning feedback. Separate command, path, transcript, assistant-response, source, and tool-I/O hook fields are never sent.",
+    "longDescription": "Builder Pulse reports only from explicitly enrolled project folders: member-confirmed project name and stable ID, an optionally labeled feature, coarse state, capped active interval, optional cumulative numeric Codex token totals, and secret-redacted bounded primary prompts for GrowthX learning feedback. Folder paths remain local. Separate command, path, transcript, assistant-response, source, and tool-I/O hook fields are never sent.",
     "developerName": "Udayan",
     "category": "Productivity",
     "capabilities": [

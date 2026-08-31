@@ -1,13 +1,13 @@
 {
-  "description": "Builder progress and learning-feedback telemetry. Primary UserPromptSubmit text is secret-redacted, UTF-8 bounded, and sent through a separate retry queue; separate command, path, source, transcript, assistant-response, and tool-I/O hook fields are never sent. Due lifecycle events may include five cumulative numeric Codex token counters; subagent and fork capture stays off.",
+  "description": "Builder progress and learning-feedback telemetry for explicitly enrolled project folders only. Member-confirmed project name and stable ID are sent; folder paths remain local. Primary UserPromptSubmit text is secret-redacted, UTF-8 bounded, and sent through a separate retry queue; separate command, path, source, transcript, assistant-response, and tool-I/O hook fields are never sent. Due lifecycle events may include five cumulative numeric Codex token counters; subagent and fork capture stays off.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
-            "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd\"",
             "async": true,
             "timeout": 5
           }
@@ -19,8 +19,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
-            "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd\"",
+            "async": true,
             "timeout": 5
           }
         ]
@@ -32,8 +33,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
-            "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd\"",
             "async": true,
             "timeout": 5
           }
@@ -45,8 +46,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
-            "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd\"",
             "async": true,
             "timeout": 5
           }
@@ -58,8 +59,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py\" hook",
-            "commandWindows": "py -3 \"%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py\" hook",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/builder_pulse.sh\"",
+            "commandWindows": "\"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd\"",
             "timeout": 3
           }
         ]
