@@ -49,10 +49,24 @@ TOKEN_USAGE_MAX_RECORD_BYTES = 64 * 1024
 PROMPT_MAX_BYTES = 64 * 1024
 PROMPT_RETENTION_MS = 60 * 24 * 60 * 60 * 1000
 PROMPT_CAPTURE_POLICY = "on"
+PROJECT_SCOPE_POLICY = "explicit"
+PROJECT_SCOPE_MIGRATION_VERSION = 1
 CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS = 0.75
 SETUP_DISCLOSURE = (
-    "Builder Pulse connects you with GrowthX so that we can track your progress "
-    "and provide you learning feedback."
+    "Builder Pulse is installed machine-wide, but it sends data only from project "
+    "folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX "
+    "member record. For each enrolled project, it receives a stable installation ID, "
+    "a one-way hashed session ID, the display name you confirm and a sanitized project "
+    "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
+    "timestamps, plugin version, optional cumulative token counts, and each primary "
+    "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
+    "Builder Pulse admins can view this data for learning feedback. Raw lifecycle events "
+    "and activity buckets are retained for 30 days; submitted prompts and their feedback "
+    "are retained for 60 days; the installation/member link, latest status, and compacted "
+    "session, daily, and all-time "
+    "token aggregates remain until GrowthX removes them. It does not send "
+    "folder paths, files, patches, commands, tool input or output, assistant replies, "
+    "transcripts, or environment variables."
 )
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS_PATH = PLUGIN_ROOT / "config" / "defaults.json"
@@ -64,9 +78,6 @@ STATES = {"building", "testing", "blocked", "ready", "idle"}
 CONFIG_KEYS = {
     "enabled",
     "endpoint",
-    "project_id",
-    "feature_id",
-    "feature_label",
     "delivery_timeout_seconds",
     "claim_timeout_seconds",
     "max_flush_events",
@@ -373,12 +384,25 @@ def parse_bool(value: Any) -> bool:
 
 
 def sanitize_identifier(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
     text = str(value).strip()
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-.")
     return cleaned[:128] or fallback
 
 
+def project_identifier_from_label(label: str) -> str:
+    """Derive a stable non-secret ID without collapsing non-Latin names."""
+    sanitized = sanitize_identifier(label.lower())
+    if sanitized:
+        return sanitized
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+    return f"project-{digest}"
+
+
 def validate_identifier(value: Any, field: str) -> str:
+    if value is None:
+        return ""
     text = str(value).strip()
     if not text:
         return ""
@@ -390,6 +414,8 @@ def validate_identifier(value: Any, field: str) -> str:
 
 
 def validate_feature_label(value: Any) -> str:
+    if value is None:
+        return ""
     text = str(value).strip()
     if not text:
         return ""
@@ -397,6 +423,19 @@ def validate_feature_label(value: Any) -> str:
         raise ValueError("feature_label must be at most 120 characters")
     if any(ord(character) < 32 for character in text):
         raise ValueError("feature_label must not contain control characters")
+    return text
+
+
+def validate_project_label(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if len(text) > 160:
+        raise ValueError("project_label must be at most 160 characters")
+    if any(ord(character) < 32 for character in text):
+        raise ValueError("project_label must not contain control characters")
     return text
 
 
@@ -440,10 +479,6 @@ def validate_config_value(key: str, value: Any) -> Any:
         if parsed <= 0 or parsed > maximum:
             raise ValueError(f"{key} must be greater than 0 and at most {maximum}")
         return parsed
-    if key in {"project_id", "feature_id"}:
-        return validate_identifier(value, key)
-    if key == "feature_label":
-        return validate_feature_label(value)
     if key == "endpoint":
         return validate_endpoint(value)
     return value
@@ -468,9 +503,6 @@ def load_config(data_dir: Path) -> dict[str, Any]:
     env_map = {
         "enabled": "BUILDER_PULSE_ENABLED",
         "endpoint": "BUILDER_PULSE_ENDPOINT",
-        "project_id": "BUILDER_PULSE_PROJECT_ID",
-        "feature_id": "BUILDER_PULSE_FEATURE_ID",
-        "feature_label": "BUILDER_PULSE_FEATURE_LABEL",
         "claim_timeout_seconds": "BUILDER_PULSE_CLAIM_TIMEOUT_SECONDS",
     }
     for key, env_name in env_map.items():
@@ -531,19 +563,30 @@ def session_key(raw_session_id: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def repository_root(value: str | Path | None) -> Path:
+def repository_key(value: str | Path | None) -> str:
+    return path_key(resolved_directory(value))
+
+
+def resolved_directory(value: str | Path | None) -> Path:
     candidate = Path(value or Path.cwd()).expanduser().resolve(strict=False)
     if candidate.is_file():
         candidate = candidate.parent
-    for path in (candidate, *candidate.parents):
-        if (path / ".git").exists():
-            return path
     return candidate
 
 
-def repository_key(value: str | Path | None) -> str:
-    root = repository_root(value)
+def path_key(root: Path) -> str:
     return hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+
+
+def validate_enrollment_root(root: Path) -> Path:
+    resolved = root.expanduser().resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    if resolved == home or resolved in home.parents:
+        raise ValueError(
+            "enrollment must target a project folder, not the home, one of its "
+            "parents, or the filesystem root"
+        )
+    return resolved
 
 
 def load_work_contexts(data_dir: Path) -> dict[str, dict[str, str]]:
@@ -555,42 +598,52 @@ def load_work_contexts(data_dir: Path) -> dict[str, dict[str, str]]:
         if isinstance(key, str) and isinstance(value, dict):
             contexts[key] = {
                 field: str(value[field])
-                for field in ("project_id", "feature_id", "feature_label")
+                for field in (
+                    "project_id",
+                    "project_label",
+                    "feature_id",
+                    "feature_label",
+                )
                 if isinstance(value.get(field), str) and value[field]
             }
     return contexts
 
 
-def scoped_work_context(
+def explicit_work_context(context: dict[str, str]) -> bool:
+    try:
+        project_id = validate_identifier(context.get("project_id"), "project_id")
+        project_label = validate_project_label(context.get("project_label"))
+    except (TypeError, ValueError):
+        return False
+    return bool(project_id and project_label)
+
+
+def enrolled_work_context(
     data_dir: Path, cwd: str | Path | None
-) -> tuple[str, dict[str, str], str]:
-    root = repository_root(cwd)
-    key = repository_key(root)
-    return key, load_work_contexts(data_dir).get(key, {}), root.name
+) -> tuple[str, dict[str, str], Path] | None:
+    if cwd is None or not str(cwd).strip():
+        return None
+    root = resolved_directory(cwd)
+    contexts = load_work_contexts(data_dir)
+    # A project enrollment covers only the exact member-confirmed folder and its
+    # descendants. Start at the actual working directory instead of collapsing
+    # to a Git root: a member may deliberately enroll one package in a monorepo.
+    # Raw paths are reduced to one-way hashes before they touch persisted state.
+    for candidate in (root, *root.parents):
+        try:
+            validate_enrollment_root(candidate)
+        except ValueError:
+            continue
+        key = path_key(candidate)
+        scoped = contexts.get(key, {})
+        if explicit_work_context(scoped):
+            return key, scoped, candidate
+    return None
 
 
-def safe_project_id(
-    payload: dict[str, Any], config: dict[str, Any], scoped: dict[str, str]
-) -> str:
-    scoped_project = str(scoped.get("project_id", "")).strip()
-    if scoped_project:
-        return scoped_project
-    configured = str(config.get("project_id", "")).strip()
-    if configured:
-        return configured
-    cwd = payload.get("cwd")
-    if isinstance(cwd, str) and cwd.strip():
-        return sanitize_identifier(repository_root(cwd).name, "unknown-project")
-    return "unknown-project"
-
-
-def feature_context(
-    config: dict[str, Any], scoped: dict[str, str]
-) -> tuple[str | None, str | None]:
-    label = str(scoped.get("feature_label") or config.get("feature_label") or "").strip()
-    configured_id = str(
-        scoped.get("feature_id") or config.get("feature_id") or ""
-    ).strip()
+def feature_context(scoped: dict[str, str]) -> tuple[str | None, str | None]:
+    label = str(scoped.get("feature_label") or "").strip()
+    configured_id = str(scoped.get("feature_id") or "").strip()
     if not label:
         return None, None
     feature_id = configured_id or sanitize_identifier(label.lower(), "feature")
@@ -675,8 +728,11 @@ def classify_state(payload: dict[str, Any], previous_state: str) -> str:
     return "building"
 
 
-def state_path(data_dir: Path, key: str) -> Path:
-    return data_dir / "states" / f"{key}.json"
+def state_path(data_dir: Path, key: str, context_key: str) -> Path:
+    # A Codex session can move between repositories. Keep state and heartbeat
+    # windows separate per enrolled folder so one project's activity can never
+    # suppress or inherit another project's lifecycle event.
+    return data_dir / "states" / f"{key}-{context_key}.json"
 
 
 def heartbeat_due(previous: dict[str, Any], now_ms: int) -> bool:
@@ -976,6 +1032,7 @@ def telemetry_payload(
     installation_id: str,
     key: str,
     project_id: str,
+    project_label: str,
     feature_id: str | None,
     feature_label: str | None,
     state: str,
@@ -994,6 +1051,8 @@ def telemetry_payload(
         "installationId": installation_id,
         "sessionKey": key,
         "projectId": project_id,
+        "projectLabel": project_label,
+        "projectScope": PROJECT_SCOPE_POLICY,
         "state": state,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
@@ -1013,6 +1072,7 @@ def prompt_payload(
     installation_id: str,
     key: str,
     project_id: str,
+    project_label: str,
     feature_id: str | None,
     feature_label: str | None,
     prompt_text: str,
@@ -1026,6 +1086,8 @@ def prompt_payload(
         "installationId": installation_id,
         "sessionKey": key,
         "projectId": project_id,
+        "projectLabel": project_label,
+        "projectScope": PROJECT_SCOPE_POLICY,
         "promptText": prompt_text,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
@@ -1107,9 +1169,141 @@ def prune_prompt_outbox_unlocked(
     return retained, expired
 
 
+def explicit_project_record(record: dict[str, Any]) -> bool:
+    try:
+        project_id = validate_identifier(record.get("projectId"), "projectId")
+        project_label = validate_project_label(record.get("projectLabel"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        project_id
+        and project_label
+        and record.get("projectScope") == PROJECT_SCOPE_POLICY
+    )
+
+
+def prune_unscoped_records_unlocked(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    records = read_jsonl(path)
+    retained = [record for record in records if explicit_project_record(record)]
+    discarded = len(records) - len(retained)
+    if discarded:
+        if retained:
+            atomic_write_jsonl(path, retained)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    return retained, discarded
+
+
+def discard_project_scope_data_unlocked(
+    data_dir: Path,
+    context_key: str,
+    project_id: str,
+    project_label: str,
+) -> dict[str, int]:
+    """Discard pending data for one removed enrollment, preserving others."""
+
+    def belongs_to_removed_project(record: dict[str, Any]) -> bool:
+        return bool(
+            project_id
+            and project_label
+            and record.get("projectId") == project_id
+            and record.get("projectLabel") == project_label
+        )
+
+    discarded: dict[str, int] = {"lifecycle": 0, "prompts": 0, "states": 0}
+    for name, filename in (
+        ("lifecycle", "outbox.jsonl"),
+        ("prompts", "prompt-outbox.jsonl"),
+    ):
+        path = data_dir / filename
+        records = read_jsonl(path)
+        retained = [record for record in records if not belongs_to_removed_project(record)]
+        discarded[name] = len(records) - len(retained)
+        if discarded[name]:
+            if retained:
+                atomic_write_jsonl(path, retained)
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    states_dir = data_dir / "states"
+    if states_dir.exists():
+        for path in states_dir.glob("*.json"):
+            state = read_json(path, {})
+            if not isinstance(state, dict):
+                continue
+            if state.get("contextKey") != context_key and not belongs_to_removed_project(
+                state
+            ):
+                continue
+            try:
+                path.unlink()
+                discarded["states"] += 1
+            except FileNotFoundError:
+                pass
+    return discarded
+
+
+def prune_unscoped_scope_data_unlocked(data_dir: Path) -> dict[str, int]:
+    _, lifecycle = prune_unscoped_records_unlocked(data_dir / "outbox.jsonl")
+    _, prompts = prune_unscoped_records_unlocked(data_dir / "prompt-outbox.jsonl")
+
+    states = 0
+    states_dir = data_dir / "states"
+    if states_dir.exists():
+        for path in states_dir.glob("*.json"):
+            state = read_json(path, {})
+            if isinstance(state, dict) and explicit_project_record(state):
+                continue
+            try:
+                path.unlink()
+                states += 1
+            except FileNotFoundError:
+                pass
+    return {"lifecycle": lifecycle, "prompts": prompts, "states": states}
+
+
+def ensure_project_scope_migration(data_dir: Path) -> dict[str, Any]:
+    marker_path = data_dir / "project-scope-migration.json"
+    marker = read_json(marker_path, {})
+    if (
+        isinstance(marker, dict)
+        and marker.get("version") == PROJECT_SCOPE_MIGRATION_VERSION
+    ):
+        return marker
+    with data_lock(data_dir):
+        marker = read_json(marker_path, {})
+        if (
+            isinstance(marker, dict)
+            and marker.get("version") == PROJECT_SCOPE_MIGRATION_VERSION
+        ):
+            return marker
+        discarded = prune_unscoped_scope_data_unlocked(data_dir)
+        marker = {
+            "version": PROJECT_SCOPE_MIGRATION_VERSION,
+            "migratedAt": utc_now_ms(),
+            "discardedUnscoped": discarded,
+        }
+        atomic_write_json(marker_path, marker)
+        return marker
+
+
 def record_prompt_event(
     data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any] | None:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    enrolled = enrolled_work_context(data_dir, cwd)
+    if enrolled is None:
+        return None
+    context_key, scoped, _ = enrolled
+
     if not is_primary_user_prompt(payload):
         return None
     prepared = bounded_redacted_prompt(payload.get("prompt"))
@@ -1130,16 +1324,16 @@ def record_prompt_event(
         or "unknown-session"
     )
     key = session_key(raw_session_id)
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-    _, scoped, _ = scoped_work_context(data_dir, cwd)
-    project_id = safe_project_id(payload, config, scoped)
-    feature_id, feature_label = feature_context(config, scoped)
+    project_id = str(scoped["project_id"])
+    project_label = str(scoped["project_label"])
+    feature_id, feature_label = feature_context(scoped)
     prompt_text, redacted, truncated = prepared
     occurred_at = utc_now_ms()
     event = prompt_payload(
         installation_id=str(identity["installationId"]),
         key=key,
         project_id=project_id,
+        project_label=project_label,
         feature_id=feature_id,
         feature_label=feature_label,
         prompt_text=prompt_text,
@@ -1149,6 +1343,7 @@ def record_prompt_event(
     )
     with data_lock(data_dir):
         current_identity = read_json(identity_path(data_dir), {})
+        current_context = load_work_contexts(data_dir).get(context_key, {})
         if (
             not isinstance(current_identity, dict)
             or current_identity.get("promptCapture") != PROMPT_CAPTURE_POLICY
@@ -1156,6 +1351,10 @@ def record_prompt_event(
             != identity.get("installationToken")
             or current_identity.get("claimedEndpoint")
             != identity.get("claimedEndpoint")
+            or current_context.get("project_id") != project_id
+            or current_context.get("project_label") != project_label
+            or current_context.get("feature_id") != feature_id
+            or current_context.get("feature_label") != feature_label
         ):
             return None
         enqueue_prompt_unlocked(
@@ -1170,6 +1369,12 @@ def record_prompt_event(
 def record_hook_event(
     data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any] | None:
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    enrolled = enrolled_work_context(data_dir, cwd)
+    if enrolled is None:
+        return None
+    context_key, scoped, _ = enrolled
+
     explicit_key = payload.get("_session_key")
     if isinstance(explicit_key, str) and explicit_key:
         key = validate_identifier(explicit_key, "session_key")
@@ -1183,13 +1388,20 @@ def record_hook_event(
     identity = ensure_identity(data_dir)
     installation_id = str(identity["installationId"])
     now_ms = utc_now_ms()
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
-    context_key, scoped, _ = scoped_work_context(data_dir, cwd)
-    project_id = safe_project_id(payload, config, scoped)
-    feature_id, feature_label = feature_context(config, scoped)
+    project_id = str(scoped["project_id"])
+    project_label = str(scoped["project_label"])
+    feature_id, feature_label = feature_context(scoped)
 
     with data_lock(data_dir):
-        path = state_path(data_dir, key)
+        current_context = load_work_contexts(data_dir).get(context_key, {})
+        if (
+            current_context.get("project_id") != project_id
+            or current_context.get("project_label") != project_label
+            or current_context.get("feature_id") != feature_id
+            or current_context.get("feature_label") != feature_label
+        ):
+            return None
+        path = state_path(data_dir, key, context_key)
         previous = read_json(path, {})
         if not isinstance(previous, dict):
             previous = {}
@@ -1205,6 +1417,7 @@ def record_hook_event(
                 installation_id=installation_id,
                 key=key,
                 project_id=project_id,
+                project_label=project_label,
                 feature_id=feature_id,
                 feature_label=feature_label,
                 state=next_state,
@@ -1232,6 +1445,8 @@ def record_hook_event(
             "sessionKey": key,
             "contextKey": context_key,
             "projectId": project_id,
+            "projectLabel": project_label,
+            "projectScope": PROJECT_SCOPE_POLICY,
             "state": next_state,
             "stateChangedAt": (
                 now_ms if changed else previous.get("stateChangedAt", now_ms)
@@ -1356,17 +1571,26 @@ def permanent_delivery_failure(result: str) -> bool:
 
 
 def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
+    ensure_project_scope_migration(data_dir)
+    path = data_dir / "outbox.jsonl"
+    with data_lock(data_dir):
+        records, unscoped_count = prune_unscoped_records_unlocked(path)
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
-    path = data_dir / "outbox.jsonl"
     if not isinstance(token, str) or not token or not endpoint:
-        return {"delivered": 0, "quarantined": 0, "remaining": len(read_jsonl(path))}
+        return {
+            "delivered": 0,
+            "discarded": unscoped_count,
+            "quarantined": 0,
+            "remaining": len(records),
+        }
 
     with delivery_lease(data_dir) as acquired:
         if not acquired:
             return {
                 "delivered": 0,
+                "discarded": unscoped_count,
                 "quarantined": 0,
                 "remaining": len(read_jsonl(path)),
                 "busy": 1,
@@ -1411,15 +1635,18 @@ def flush_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
             remaining = read_jsonl(path)
         return {
             "delivered": len(delivered_ids),
+            "discarded": unscoped_count,
             "quarantined": len(quarantined),
             "remaining": len(remaining),
         }
 
 
 def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int]:
+    ensure_project_scope_migration(data_dir)
     now_ms = utc_now_ms()
     path = data_dir / "prompt-outbox.jsonl"
     with data_lock(data_dir):
+        _, unscoped_count = prune_unscoped_records_unlocked(path)
         records, expired_count = prune_prompt_outbox_unlocked(path, now_ms)
 
     identity = claimed_identity(data_dir)
@@ -1433,7 +1660,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
     ):
         return {
             "delivered": 0,
-            "discarded": expired_count,
+            "discarded": unscoped_count + expired_count,
             "remaining": len(records),
         }
 
@@ -1441,7 +1668,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
         if not acquired:
             return {
                 "delivered": 0,
-                "discarded": expired_count,
+                "discarded": unscoped_count + expired_count,
                 "remaining": len(read_jsonl(path)),
                 "busy": 1,
             }
@@ -1478,7 +1705,8 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
                     pass
             return {
                 "delivered": len(delivered_ids),
-                "discarded": expired_count
+                "discarded": unscoped_count
+                + expired_count
                 + max(0, len(current) - len(delivered_ids)),
                 "remaining": 0,
             }
@@ -1503,7 +1731,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
             remaining = read_jsonl(path)
         return {
             "delivered": len(delivered_ids),
-            "discarded": expired_count + len(discarded_ids),
+            "discarded": unscoped_count + expired_count + len(discarded_ids),
             "remaining": len(remaining),
         }
 
@@ -1511,7 +1739,7 @@ def flush_prompt_outbox(data_dir: Path, config: dict[str, Any]) -> dict[str, int
 def attempt_current_prompt(
     data_dir: Path, config: dict[str, Any], event: dict[str, Any]
 ) -> dict[str, int]:
-    """Attempt only the just-queued prompt under a short synchronous deadline."""
+    """Attempt only the just-queued prompt under a short delivery deadline."""
     path = data_dir / "prompt-outbox.jsonl"
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
@@ -1585,13 +1813,14 @@ def ingest_hook(data_dir: Path) -> int:
         return 0
 
     try:
+        ensure_project_scope_migration(data_dir)
         config = load_config(data_dir)
         if config.get("enabled", True):
             prompt_event = record_prompt_event(data_dir, payload, config)
             event = record_hook_event(data_dir, payload, config)
             if prompt_event is not None:
-                # UserPromptSubmit is synchronous. Prioritize only the current
-                # prompt under a strict deadline; async hooks drain all backlog.
+                # Prioritize this prompt under a strict deadline. Codex runs the
+                # hook in the background so telemetry can never block submission.
                 attempt_current_prompt(data_dir, config, prompt_event)
             # SessionEnd is synchronous in Codex even for async hooks. Persist
             # idle locally and let the next hook/manual flush deliver it.
@@ -1650,15 +1879,25 @@ def safe_identity_summary(data_dir: Path) -> dict[str, Any]:
 
 
 def command_status(args: argparse.Namespace, data_dir: Path) -> int:
+    ensure_project_scope_migration(data_dir)
     records = status_records(data_dir)
     if args.project:
         records = [item for item in records if item.get("projectId") == args.project]
     identity = safe_identity_summary(data_dir)
+    current_enrollment = enrolled_work_context(data_dir, Path.cwd())
+    enrolled_projects = [
+        context
+        for context in load_work_contexts(data_dir).values()
+        if explicit_work_context(context)
+    ]
     result = {
         "schemaVersion": SCHEMA_VERSION,
         "identity": identity,
         "heartbeatMinutes": HEARTBEAT_MINUTES,
         "promptCapture": identity["promptCapture"],
+        "captureScope": "enrolled-projects-only",
+        "currentProjectEnrolled": current_enrollment is not None,
+        "enrolledProjects": len(enrolled_projects),
         "outboxEvents": len(read_jsonl(data_dir / "outbox.jsonl")),
         "promptOutboxEvents": len(read_jsonl(data_dir / "prompt-outbox.jsonl")),
         "sessions": records,
@@ -1705,8 +1944,15 @@ def command_mark(args: argparse.Namespace, data_dir: Path) -> int:
         "hook_event_name": "ExplicitStateMark",
         "_session_key": key,
         "explicit_state": args.state,
+        "cwd": str(Path.cwd()),
     }
     event = record_hook_event(data_dir, payload, config)
+    if event is None:
+        print(
+            "This project is not enrolled. Run work enroll before marking state.",
+            file=sys.stderr,
+        )
+        return 2
     if event is not None:
         flush_outbox(data_dir, config)
         flush_prompt_outbox(data_dir, config)
@@ -1761,27 +2007,79 @@ def command_config(args: argparse.Namespace, data_dir: Path) -> int:
 
 
 def command_work(args: argparse.Namespace, data_dir: Path) -> int:
-    target_root = repository_root(getattr(args, "root", None))
-    key = repository_key(target_root)
+    ensure_project_scope_migration(data_dir)
+    target_root = resolved_directory(getattr(args, "root", None))
+    exact_key = path_key(target_root)
     path = data_dir / "contexts.json"
     contexts = load_work_contexts(data_dir)
-    scoped = dict(contexts.get(key, {}))
+    matched = enrolled_work_context(data_dir, target_root)
+    if args.work_command != "enroll" and matched is not None:
+        key, matched_context, target_root = matched
+        scoped = dict(matched_context)
+    else:
+        key = exact_key
+        scoped = dict(contexts.get(key, {}))
+    if args.work_command == "list":
+        projects = [
+            {
+                "contextKey": context_key,
+                "projectId": context.get("project_id"),
+                "projectLabel": context.get("project_label"),
+            }
+            for context_key, context in contexts.items()
+            if explicit_work_context(context)
+        ]
+        print(
+            json.dumps(
+                {"scope": "explicit-project-allowlist", "projects": projects},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.work_command == "show":
-        config = load_config(data_dir)
+        enrolled = explicit_work_context(scoped)
         print(
             json.dumps(
                 {
                     "contextKey": key,
+                    "root": str(target_root),
                     "rootLabel": target_root.name,
-                    "projectId": scoped.get("project_id")
-                    or config.get("project_id")
-                    or sanitize_identifier(target_root.name, "unknown-project"),
-                    "featureId": scoped.get("feature_id")
-                    or config.get("feature_id")
-                    or None,
-                    "featureLabel": scoped.get("feature_label")
-                    or config.get("feature_label")
-                    or None,
+                    "enrolled": enrolled,
+                    "projectId": scoped.get("project_id") if enrolled else None,
+                    "projectLabel": scoped.get("project_label") if enrolled else None,
+                    "featureId": scoped.get("feature_id") if enrolled else None,
+                    "featureLabel": scoped.get("feature_label") if enrolled else None,
+                    "capture": "enrolled-projects-only",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.work_command == "unenroll":
+        with data_lock(data_dir):
+            contexts = load_work_contexts(data_dir)
+            removed_context = contexts.pop(key, None)
+            removed = removed_context is not None
+            atomic_write_json(path, contexts)
+            discarded = (
+                discard_project_scope_data_unlocked(
+                    data_dir,
+                    key,
+                    str(removed_context.get("project_id") or ""),
+                    str(removed_context.get("project_label") or ""),
+                )
+                if isinstance(removed_context, dict)
+                else {"lifecycle": 0, "prompts": 0, "states": 0}
+            )
+        print(
+            json.dumps(
+                {
+                    "enrolled": False,
+                    "removed": removed,
+                    "root": str(target_root),
+                    "discardedPending": discarded,
                 },
                 indent=2,
                 sort_keys=True,
@@ -1789,42 +2087,100 @@ def command_work(args: argparse.Namespace, data_dir: Path) -> int:
         )
         return 0
     if args.work_command == "clear-feature":
-        scoped.pop("feature_id", None)
-        scoped.pop("feature_label", None)
         with data_lock(data_dir):
             contexts = load_work_contexts(data_dir)
-            if scoped:
-                contexts[key] = scoped
-            else:
-                contexts.pop(key, None)
+            current = contexts.get(key, {})
+            if not explicit_work_context(current):
+                print(
+                    "Work context error: this project folder is not enrolled",
+                    file=sys.stderr,
+                )
+                return 2
+            updated = dict(current)
+            updated.pop("feature_id", None)
+            updated.pop("feature_label", None)
+            contexts[key] = updated
             atomic_write_json(path, contexts)
-        print(f"Feature cleared for repository {target_root.name}; project remains unchanged.")
+        print(f"Feature cleared for project folder {target_root.name}; project remains unchanged.")
         return 0
-    if args.work_command == "set":
-        if args.project is None and args.feature is None:
-            print("Set --project, --feature, or both.", file=sys.stderr)
+    if args.work_command in {"enroll", "set"}:
+        if args.work_command == "enroll":
+            try:
+                target_root = validate_enrollment_root(target_root)
+                if not target_root.is_dir():
+                    raise ValueError("project folder does not exist")
+                key = path_key(target_root)
+                project_label = validate_project_label(args.project)
+                if not project_label:
+                    raise ValueError("project name must not be empty")
+                requested_project_id = (
+                    validate_identifier(args.project_id, "project_id")
+                    if args.project_id
+                    else None
+                )
+                if args.project_id and not requested_project_id:
+                    raise ValueError("project name must contain letters or numbers")
+            except ValueError as exc:
+                print(f"Work context error: {exc}", file=sys.stderr)
+                return 2
+            with data_lock(data_dir):
+                contexts = load_work_contexts(data_dir)
+                existing = contexts.get(key, {})
+                # Contexts written before explicit project enrollment had no
+                # member-confirmed project label. Do not revive a legacy feature
+                # label merely because its old path hash happens to match the
+                # newly confirmed folder. Already-explicit contexts may retain
+                # their separately confirmed feature when renamed/re-enrolled.
+                scoped = dict(existing) if explicit_work_context(existing) else {}
+                project_id = (
+                    requested_project_id
+                    or scoped.get("project_id")
+                    or project_identifier_from_label(project_label)
+                )
+                scoped["project_id"] = project_id
+                scoped["project_label"] = project_label
+                contexts[key] = scoped
+                atomic_write_json(path, contexts)
+            return command_work(
+                argparse.Namespace(work_command="show", root=str(target_root)), data_dir
+            )
+
+        if args.project is not None:
+            print(
+                "Work context error: --project cannot be changed with work set; "
+                "use work enroll --project with the member-confirmed display name",
+                file=sys.stderr,
+            )
+            return 2
+        if args.feature is None:
+            print("Set --feature, or use work enroll to add a project folder.", file=sys.stderr)
             return 2
         try:
-            if args.project is not None:
-                scoped["project_id"] = validate_identifier(args.project, "project_id")
-            if args.feature is not None:
-                label = validate_feature_label(args.feature)
-                if not label:
-                    raise ValueError("feature must not be empty")
-                scoped["feature_label"] = label
-                scoped["feature_id"] = (
-                    validate_identifier(args.feature_id, "feature_id")
-                    if args.feature_id
-                    else sanitize_identifier(label.lower(), "feature")
-                )
-            elif args.feature_id:
-                raise ValueError("--feature-id requires --feature")
+            label = validate_feature_label(args.feature)
+            if not label:
+                raise ValueError("feature must not be empty")
+            feature_id = (
+                validate_identifier(args.feature_id, "feature_id")
+                if args.feature_id
+                else sanitize_identifier(label.lower(), "feature")
+            )
         except ValueError as exc:
             print(f"Work context error: {exc}", file=sys.stderr)
             return 2
         with data_lock(data_dir):
             contexts = load_work_contexts(data_dir)
-            contexts[key] = scoped
+            current = contexts.get(key, {})
+            if not explicit_work_context(current):
+                print(
+                    "Work context error: enroll this project folder with work enroll "
+                    "--project before setting a feature",
+                    file=sys.stderr,
+                )
+                return 2
+            updated = dict(current)
+            updated["feature_label"] = label
+            updated["feature_id"] = feature_id
+            contexts[key] = updated
             atomic_write_json(path, contexts)
         return command_work(
             argparse.Namespace(work_command="show", root=str(target_root)), data_dir
@@ -1955,6 +2311,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                         "tokenConfigured": True,
                         "heartbeatMinutes": HEARTBEAT_MINUTES,
                         "promptCapture": PROMPT_CAPTURE_POLICY,
+                        "captureScope": "enrolled-projects-only",
+                        "projectEnrollmentRequired": True,
                     },
                     indent=2,
                     sort_keys=True,
@@ -1977,6 +2335,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                         if identity.get("promptCapture") == PROMPT_CAPTURE_POLICY
                         else "off"
                     ),
+                    "captureScope": "enrolled-projects-only",
+                    "projectEnrollmentRequired": True,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2050,10 +2410,9 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
     if not isinstance(overrides, dict):
         overrides = {}
     overrides["endpoint"] = endpoint
-    default_project = response.get("defaultProject")
-    effective_project = str(config.get("project_id") or "").strip()
-    if isinstance(default_project, str) and default_project.strip() and not effective_project:
-        overrides["project_id"] = sanitize_identifier(default_project, "unknown-project")
+    # Older versions treated the roster's cohort/default value as a machine-wide
+    # project fallback. Project identity is now member-confirmed per folder.
+    overrides.pop("project_id", None)
     save_config_overrides(data_dir, overrides)
 
     print(
@@ -2067,6 +2426,8 @@ def _command_claim_locked(args: argparse.Namespace, data_dir: Path) -> int:
                 "tokenConfigured": True,
                 "heartbeatMinutes": HEARTBEAT_MINUTES,
                 "promptCapture": PROMPT_CAPTURE_POLICY,
+                "captureScope": "enrolled-projects-only",
+                "projectEnrollmentRequired": True,
             },
             indent=2,
             sort_keys=True,
@@ -2291,6 +2652,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
             json.dumps(
                 {
                     "connected": False,
+                    "activationReady": False,
                     "ready": False,
                     "reviewRequired": False,
                     "hookStatus": "disabled",
@@ -2307,6 +2669,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
             json.dumps(
                 {
                     "connected": False,
+                    "activationReady": False,
                     "reviewRequired": hook_result.get("hookStatus")
                     in {"modified", "review_required"},
                     **hook_result,
@@ -2332,12 +2695,32 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         print(f"Activation failed: {result}.", file=sys.stderr)
         return 1
 
+    telemetry_received = response.get("telemetryReceived") is True
+    telemetry_received_since_activation = (
+        response.get("telemetryReceivedSincePreviousActivation") is True
+    )
+    last_signal_at = response.get("lastSignalAt")
+    last_signal_plugin_version = response.get("lastSignalPluginVersion")
     print(
         json.dumps(
             {
-                "connected": True,
+                # A successful activation proves identity and hook trust. Only
+                # a same-version server receipt after the previous activation
+                # proves this repaired hook path delivered telemetry.
+                "connected": telemetry_received_since_activation,
+                "activationReady": True,
                 "hooksTrusted": True,
                 "serverVerified": True,
+                "telemetryReceived": telemetry_received,
+                "telemetryReceivedSincePreviousActivation": (
+                    telemetry_received_since_activation
+                ),
+                "lastSignalAt": last_signal_at
+                if isinstance(last_signal_at, int)
+                else None,
+                "lastSignalPluginVersion": last_signal_plugin_version
+                if isinstance(last_signal_plugin_version, str)
+                else None,
                 "hookStatus": hook_result["hookStatus"],
                 "hookCount": hook_result["hookCount"],
                 "installationId": identity.get("installationId"),
@@ -2375,15 +2758,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     work = subparsers.add_parser("work", help="Set project and feature context")
     work_sub = work.add_subparsers(dest="work_command", required=True)
+    work_sub.add_parser("list", help="List explicitly enrolled projects")
     work_show = work_sub.add_parser("show")
-    work_show.add_argument("--root", help="Repository root (defaults to current directory)")
+    work_show.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_enroll = work_sub.add_parser(
+        "enroll", help="Explicitly allow telemetry for one project folder"
+    )
+    work_enroll.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_enroll.add_argument(
+        "--project", required=True, help="Member-confirmed project display name"
+    )
+    work_enroll.add_argument(
+        "--project-id", help="Optional stable project identifier"
+    )
+    work_unenroll = work_sub.add_parser(
+        "unenroll", help="Stop telemetry for one project folder"
+    )
+    work_unenroll.add_argument(
+        "--root", help="Project folder (defaults to current directory)"
+    )
     work_set = work_sub.add_parser("set")
-    work_set.add_argument("--root", help="Repository root (defaults to current directory)")
-    work_set.add_argument("--project", help="Concise product/project identifier")
+    work_set.add_argument("--root", help="Project folder (defaults to current directory)")
+    work_set.add_argument(
+        "--project",
+        help="Deprecated; project folders and names must be confirmed with work enroll",
+    )
     work_set.add_argument("--feature", help="Explicit feature label (max 120 chars)")
     work_set.add_argument("--feature-id", help="Optional stable feature identifier")
     work_clear = work_sub.add_parser("clear-feature")
-    work_clear.add_argument("--root", help="Repository root (defaults to current directory)")
+    work_clear.add_argument("--root", help="Project folder (defaults to current directory)")
 
     config = subparsers.add_parser("config", help="Inspect or change local settings")
     config_sub = config.add_subparsers(dest="config_command", required=True)

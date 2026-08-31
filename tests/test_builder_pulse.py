@@ -118,17 +118,36 @@ class BuilderPulseTests(unittest.TestCase):
         )
         builder_pulse.atomic_write_json(
             self.data_dir / "config.json",
-            {
-                "endpoint": endpoint,
-                "project_id": "product-alpha",
-                "feature_id": "member-search",
-                "feature_label": "Member search",
-            },
+            {"endpoint": endpoint},
         )
+        self.enroll_project(self.workspace)
         self.config = builder_pulse.load_config(self.data_dir)
         return identity
 
+    def enroll_project(
+        self,
+        root: str | Path,
+        *,
+        project_id: str = "product-alpha",
+        project_label: str = "Product Alpha",
+    ) -> None:
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        key = builder_pulse.repository_key(root)
+        if key not in contexts:
+            contexts[key] = {
+                "project_id": project_id,
+                "project_label": project_label,
+                "feature_id": "member-search",
+                "feature_label": "Member search",
+            }
+            builder_pulse.atomic_write_json(
+                self.data_dir / "contexts.json", contexts
+            )
+
     def record(self, payload: dict, now_ms: int) -> dict | None:
+        payload = dict(payload)
+        payload.setdefault("cwd", str(self.workspace))
+        self.enroll_project(payload["cwd"])
         with mock.patch.object(builder_pulse, "utc_now_ms", return_value=now_ms):
             return builder_pulse.record_hook_event(
                 self.data_dir, payload, self.config
@@ -138,6 +157,8 @@ class BuilderPulseTests(unittest.TestCase):
         self, payload: dict, now_ms: int, *, add_primary_transcript: bool = True
     ) -> dict | None:
         hook_payload = dict(payload)
+        hook_payload.setdefault("cwd", str(self.workspace))
+        self.enroll_project(hook_payload["cwd"])
         if (
             add_primary_transcript
             and hook_payload.get("hook_event_name") == "UserPromptSubmit"
@@ -208,7 +229,33 @@ class BuilderPulseTests(unittest.TestCase):
                 0o600,
             )
         config = builder_pulse.load_config(self.data_dir)
-        self.assertEqual(config["project_id"], "community-app")
+        self.assertNotIn("project_id", config)
+        self.assertEqual(
+            builder_pulse.load_work_contexts(self.data_dir),
+            {},
+        )
+
+    def test_canonical_disclosure_is_present_in_all_member_facing_guides(self) -> None:
+        canonical = " ".join(builder_pulse.SETUP_DISCLOSURE.split())
+        for relative_path in (
+            "README.md",
+            "SETUP.md",
+            "skills/builder-pulse/SKILL.md",
+        ):
+            document = " ".join(
+                (SCRIPT.parents[1] / relative_path).read_text(encoding="utf-8").split()
+            )
+            self.assertIn(canonical, document, relative_path)
+
+        for required_fact in (
+            "authenticated Builder Pulse admins",
+            "retained for 30 days",
+            "retained for 60 days",
+            "compacted session, daily, and all-time token aggregates",
+            "folder paths",
+            "environment variables",
+        ):
+            self.assertIn(required_fact, builder_pulse.SETUP_DISCLOSURE)
 
     def test_activate_succeeds_only_after_codex_and_server_verify_connection(self) -> None:
         identity = self.claim_locally()
@@ -224,7 +271,17 @@ class BuilderPulseTests(unittest.TestCase):
         ), mock.patch.object(
             builder_pulse,
             "http_post_json",
-            return_value=(True, "delivered", {"accepted": True}),
+            return_value=(
+                True,
+                "delivered",
+                {
+                    "accepted": True,
+                    "telemetryReceived": True,
+                    "telemetryReceivedSincePreviousActivation": True,
+                    "lastSignalAt": 1_787_721_000_000,
+                    "lastSignalPluginVersion": builder_pulse.PLUGIN_VERSION,
+                },
+            ),
         ) as posted, contextlib.redirect_stdout(output):
             result = builder_pulse.command_activate(self.data_dir)
 
@@ -236,14 +293,98 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(activation["pluginVersion"], builder_pulse.PLUGIN_VERSION)
         response = json.loads(output.getvalue())
         self.assertEqual(response["connected"], True)
+        self.assertEqual(response["activationReady"], True)
         self.assertEqual(response["hooksTrusted"], True)
         self.assertEqual(response["serverVerified"], True)
+        self.assertEqual(response["telemetryReceived"], True)
+        self.assertEqual(
+            response["telemetryReceivedSincePreviousActivation"], True
+        )
+        self.assertEqual(response["lastSignalAt"], 1_787_721_000_000)
+        self.assertEqual(
+            response["lastSignalPluginVersion"], builder_pulse.PLUGIN_VERSION
+        )
         self.assertEqual(response["hookCount"], 5)
         self.assertNotIn(identity["installationToken"], output.getvalue())
         self.assertEqual(
             builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
             [],
         )
+
+    def test_activate_does_not_call_hook_trust_a_telemetry_receipt(self) -> None:
+        self.claim_locally()
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "inspect_codex_hooks",
+            return_value={
+                "ready": True,
+                "hookStatus": "trusted",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(
+                True,
+                "delivered",
+                {
+                    "accepted": True,
+                    "telemetryReceived": False,
+                    "telemetryReceivedSincePreviousActivation": False,
+                    "lastSignalAt": None,
+                    "lastSignalPluginVersion": None,
+                },
+            ),
+        ), contextlib.redirect_stdout(output):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 0)
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["activationReady"], True)
+        self.assertEqual(response["connected"], False)
+        self.assertEqual(response["telemetryReceived"], False)
+        self.assertEqual(
+            response["telemetryReceivedSincePreviousActivation"], False
+        )
+        self.assertIsNone(response["lastSignalAt"])
+
+    def test_activate_does_not_call_old_telemetry_a_current_connection(self) -> None:
+        self.claim_locally()
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "inspect_codex_hooks",
+            return_value={
+                "ready": True,
+                "hookStatus": "trusted",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(
+                True,
+                "delivered",
+                {
+                    "accepted": True,
+                    "telemetryReceived": True,
+                    "telemetryReceivedSincePreviousActivation": False,
+                    "lastSignalAt": 1_787_721_000_000,
+                    "lastSignalPluginVersion": "0.4.5",
+                },
+            ),
+        ), contextlib.redirect_stdout(output):
+            result = builder_pulse.command_activate(self.data_dir)
+
+        self.assertEqual(result, 0)
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["connected"], False)
+        self.assertEqual(response["telemetryReceived"], True)
+        self.assertEqual(
+            response["telemetryReceivedSincePreviousActivation"], False
+        )
+        self.assertEqual(response["lastSignalPluginVersion"], "0.4.5")
 
     def test_activate_requires_official_codex_hook_review(self) -> None:
         self.claim_locally()
@@ -411,9 +552,14 @@ class BuilderPulseTests(unittest.TestCase):
         telemetry_flush.assert_not_called()
         prompt_flush.assert_not_called()
 
-    def test_existing_project_wins_over_claim_default(self) -> None:
+    def test_claim_removes_legacy_global_project_and_preserves_enrollment(self) -> None:
         builder_pulse.atomic_write_json(
             self.data_dir / "config.json", {"project_id": "explicit-product"}
+        )
+        self.enroll_project(
+            self.workspace,
+            project_id="confirmed-product",
+            project_label="Confirmed Product",
         )
         response = {
             "builderId": "builder-17",
@@ -432,10 +578,12 @@ class BuilderPulseTests(unittest.TestCase):
             return_value=FakeResponse(response),
         ), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(builder_pulse.command_claim(args, self.data_dir), 0)
-        self.assertEqual(
-            builder_pulse.load_config(self.data_dir)["project_id"],
-            "explicit-product",
-        )
+        self.assertNotIn("project_id", builder_pulse.load_config(self.data_dir))
+        context = builder_pulse.load_work_contexts(self.data_dir)[
+            builder_pulse.repository_key(self.workspace)
+        ]
+        self.assertEqual(context["project_id"], "confirmed-product")
+        self.assertEqual(context["project_label"], "Confirmed Product")
 
     def test_claim_timeout_reuses_the_persisted_pending_token(self) -> None:
         response = {
@@ -751,6 +899,8 @@ class BuilderPulseTests(unittest.TestCase):
                 "installationId",
                 "sessionKey",
                 "projectId",
+                "projectLabel",
+                "projectScope",
                 "featureId",
                 "featureLabel",
                 "state",
@@ -760,6 +910,8 @@ class BuilderPulseTests(unittest.TestCase):
         )
         self.assertIsInstance(event["occurredAt"], int)
         self.assertEqual(event["installationId"], identity["installationId"])
+        self.assertEqual(event["projectLabel"], "Product Alpha")
+        self.assertEqual(event["projectScope"], "explicit")
 
         with mock.patch.object(
             builder_pulse.urlrequest,
@@ -802,6 +954,8 @@ class BuilderPulseTests(unittest.TestCase):
                 "installationId",
                 "sessionKey",
                 "projectId",
+                "projectLabel",
+                "projectScope",
                 "featureId",
                 "featureLabel",
                 "promptText",
@@ -842,6 +996,149 @@ class BuilderPulseTests(unittest.TestCase):
             request.get_header("Authorization"), f"Bearer {'a' * 64}"
         )
         self.assertEqual(json.loads(request.data.decode("utf-8")), event)
+
+    def test_unenrolled_or_missing_cwd_fails_closed_without_local_capture(self) -> None:
+        self.claim_locally()
+        builder_pulse.atomic_write_json(self.data_dir / "contexts.json", {})
+        prompt_payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "private-session",
+            "prompt": "This prompt belongs to another project.",
+            "transcript_path": str(self.primary_transcript),
+        }
+        lifecycle_payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": "private-session",
+        }
+
+        for cwd in (None, str(self.workspace), str(self.workspace / "other-project")):
+            prompt = dict(prompt_payload)
+            lifecycle = dict(lifecycle_payload)
+            if cwd is not None:
+                prompt["cwd"] = cwd
+                lifecycle["cwd"] = cwd
+            self.assertIsNone(
+                builder_pulse.record_prompt_event(self.data_dir, prompt, self.config)
+            )
+            self.assertIsNone(
+                builder_pulse.record_hook_event(self.data_dir, lifecycle, self.config)
+            )
+
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"), []
+        )
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
+        states_dir = self.data_dir / "states"
+        self.assertFalse(states_dir.exists() and any(states_dir.iterdir()))
+
+    def test_unenrolled_prompt_is_rejected_before_prompt_text_or_transcript_processing(
+        self,
+    ) -> None:
+        self.claim_locally()
+        builder_pulse.atomic_write_json(self.data_dir / "contexts.json", {})
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "private-session",
+            "cwd": str(self.workspace / "not-enrolled"),
+            "prompt": "This must not be inspected.",
+            "transcript_path": str(self.primary_transcript),
+        }
+
+        with (
+            mock.patch.object(builder_pulse, "is_primary_user_prompt") as primary,
+            mock.patch.object(builder_pulse, "bounded_redacted_prompt") as redact,
+        ):
+            self.assertIsNone(
+                builder_pulse.record_prompt_event(self.data_dir, payload, self.config)
+            )
+
+        primary.assert_not_called()
+        redact.assert_not_called()
+
+    def test_enrollment_is_rechecked_under_lock_before_any_event_is_queued(self) -> None:
+        self.claim_locally()
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        prompt_payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "race-prompt",
+            "prompt": "Do not queue this after unenrollment.",
+            "transcript_path": str(self.primary_transcript),
+            "cwd": str(self.workspace),
+        }
+        with mock.patch.object(
+            builder_pulse, "load_work_contexts", side_effect=[contexts, {}]
+        ):
+            self.assertIsNone(
+                builder_pulse.record_prompt_event(
+                    self.data_dir, prompt_payload, self.config
+                )
+            )
+
+        lifecycle_payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": "race-lifecycle",
+            "cwd": str(self.workspace),
+        }
+        with mock.patch.object(
+            builder_pulse, "load_work_contexts", side_effect=[contexts, {}]
+        ):
+            self.assertIsNone(
+                builder_pulse.record_hook_event(
+                    self.data_dir, lifecycle_payload, self.config
+                )
+            )
+
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"), []
+        )
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
+
+    def test_feature_context_is_rechecked_under_lock_before_any_event_is_queued(self) -> None:
+        self.claim_locally()
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        changed_contexts = json.loads(json.dumps(contexts))
+        context_key = builder_pulse.repository_key(self.workspace)
+        changed_contexts[context_key]["feature_id"] = "new-feature"
+        changed_contexts[context_key]["feature_label"] = "New feature"
+
+        prompt_payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "race-prompt-feature",
+            "prompt": "Do not queue this with a stale feature.",
+            "transcript_path": str(self.primary_transcript),
+            "cwd": str(self.workspace),
+        }
+        with mock.patch.object(
+            builder_pulse,
+            "load_work_contexts",
+            side_effect=[contexts, changed_contexts],
+        ):
+            self.assertIsNone(
+                builder_pulse.record_prompt_event(
+                    self.data_dir, prompt_payload, self.config
+                )
+            )
+
+        lifecycle_payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": "race-lifecycle-feature",
+            "cwd": str(self.workspace),
+        }
+        with mock.patch.object(
+            builder_pulse,
+            "load_work_contexts",
+            side_effect=[contexts, changed_contexts],
+        ):
+            self.assertIsNone(
+                builder_pulse.record_hook_event(
+                    self.data_dir, lifecycle_payload, self.config
+                )
+            )
+
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"), []
+        )
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
 
     def test_prompt_redaction_is_high_confidence_and_persisted_secrets_are_absent(self) -> None:
         self.claim_locally()
@@ -1069,6 +1366,7 @@ class BuilderPulseTests(unittest.TestCase):
                 installation_id="installation",
                 key="session",
                 project_id="project",
+                project_label="Project",
                 feature_id=None,
                 feature_label=None,
                 prompt_text=f"prompt-{index}",
@@ -1094,6 +1392,7 @@ class BuilderPulseTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "integrated-prompt-session",
                 "prompt": "first private prompt",
+                "cwd": str(self.workspace),
                 "tool_input": {"command": "private command"},
                 "transcript_path": str(self.primary_transcript),
             },
@@ -1101,6 +1400,7 @@ class BuilderPulseTests(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "integrated-prompt-session",
                 "prompt": "second private prompt",
+                "cwd": str(self.workspace),
                 "assistant_response": "private response",
                 "transcript_path": str(self.primary_transcript),
             },
@@ -1161,6 +1461,7 @@ class BuilderPulseTests(unittest.TestCase):
             "hook_event_name": "UserPromptSubmit",
             "session_id": "current-session",
             "prompt": "current prompt must go first",
+            "cwd": str(self.workspace),
             "transcript_path": str(self.primary_transcript),
         }
         self.config["delivery_timeout_seconds"] = 3.0
@@ -1316,6 +1617,7 @@ class BuilderPulseTests(unittest.TestCase):
                     installation_id="installation",
                     key="session",
                     project_id="project",
+                    project_label="Project",
                     feature_id=None,
                     feature_label=None,
                     prompt_text=name,
@@ -1418,6 +1720,8 @@ class BuilderPulseTests(unittest.TestCase):
                 "installationId",
                 "sessionKey",
                 "projectId",
+                "projectLabel",
+                "projectScope",
                 "featureId",
                 "featureLabel",
                 "state",
@@ -1718,7 +2022,10 @@ class BuilderPulseTests(unittest.TestCase):
             builder_pulse, "deliver_event", return_value=(False, "network_error")
         ):
             result = builder_pulse.flush_outbox(self.data_dir, self.config)
-        self.assertEqual(result, {"delivered": 0, "quarantined": 0, "remaining": 1})
+        self.assertEqual(
+            result,
+            {"delivered": 0, "discarded": 0, "quarantined": 0, "remaining": 1},
+        )
         queued = builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")
         self.assertEqual(queued[0]["eventId"], original_id)
         self.assertEqual(queued[0]["tokenUsage"], original_usage)
@@ -1735,7 +2042,10 @@ class BuilderPulseTests(unittest.TestCase):
 
         with mock.patch.object(builder_pulse, "deliver_event", side_effect=succeed):
             result = builder_pulse.flush_outbox(self.data_dir, self.config)
-        self.assertEqual(result, {"delivered": 1, "quarantined": 0, "remaining": 0})
+        self.assertEqual(
+            result,
+            {"delivered": 1, "discarded": 0, "quarantined": 0, "remaining": 0},
+        )
         self.assertEqual(delivered, [event])
         serialized = json.dumps(event)
         self.assertNotIn(private_marker, serialized)
@@ -1882,7 +2192,10 @@ class BuilderPulseTests(unittest.TestCase):
             builder_pulse, "deliver_event", return_value=(False, "network_error")
         ):
             result = builder_pulse.flush_outbox(self.data_dir, self.config)
-        self.assertEqual(result, {"delivered": 0, "quarantined": 0, "remaining": 1})
+        self.assertEqual(
+            result,
+            {"delivered": 0, "discarded": 0, "quarantined": 0, "remaining": 1},
+        )
         self.assertEqual(
             builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl")[0]["eventId"],
             original_id,
@@ -1899,7 +2212,10 @@ class BuilderPulseTests(unittest.TestCase):
         with mock.patch.object(builder_pulse, "deliver_event", side_effect=succeed):
             result = builder_pulse.flush_outbox(self.data_dir, self.config)
         self.assertEqual(delivered, [original_id])
-        self.assertEqual(result, {"delivered": 1, "quarantined": 0, "remaining": 0})
+        self.assertEqual(
+            result,
+            {"delivered": 1, "discarded": 0, "quarantined": 0, "remaining": 0},
+        )
 
     def test_session_end_emits_idle(self) -> None:
         self.claim_locally()
@@ -1937,9 +2253,14 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(ended["tokenUsage"]["totalTokens"], 500)
 
     def test_feature_validation_and_sanitized_id(self) -> None:
+        self.enroll_project(
+            self.data_dir,
+            project_id="community-app",
+            project_label="Community App",
+        )
         args = argparse.Namespace(
             work_command="set",
-            project="community-app",
+            project=None,
             feature="Member Search Filters",
             feature_id=None,
             root=str(self.data_dir),
@@ -1961,17 +2282,27 @@ class BuilderPulseTests(unittest.TestCase):
         (second_root / ".git").mkdir(parents=True)
         first_args = argparse.Namespace(
             work_command="set",
-            project="product-one",
+            project=None,
             feature="Feature one",
             feature_id=None,
             root=str(first_root),
         )
         second_args = argparse.Namespace(
             work_command="set",
-            project="product-two",
+            project=None,
             feature="Feature two",
             feature_id=None,
             root=str(second_root),
+        )
+        self.enroll_project(
+            first_root,
+            project_id="product-one",
+            project_label="Product One",
+        )
+        self.enroll_project(
+            second_root,
+            project_id="product-two",
+            project_label="Product Two",
         )
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(builder_pulse.command_work(first_args, self.data_dir), 0)
@@ -1986,6 +2317,497 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertNotIn(str(first_root), persisted)
         self.assertNotIn(str(second_root), persisted)
 
+    def test_work_set_cannot_bypass_explicit_project_enrollment(self) -> None:
+        project_root = self.workspace / "not-enrolled"
+        project_root.mkdir()
+        args = argparse.Namespace(
+            work_command="set",
+            project="Unconfirmed Project",
+            feature="Feature one",
+            feature_id=None,
+            root=str(project_root),
+        )
+        error = io.StringIO()
+
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(builder_pulse.command_work(args, self.data_dir), 2)
+
+        self.assertIn("use work enroll", error.getvalue())
+        self.assertEqual(builder_pulse.load_work_contexts(self.data_dir), {})
+
+    def test_work_set_does_not_resurrect_a_concurrently_unenrolled_project(self) -> None:
+        project_root = self.workspace / "concurrent-unenroll"
+        project_root.mkdir()
+        self.enroll_project(project_root)
+        builder_pulse.ensure_project_scope_migration(self.data_dir)
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        args = argparse.Namespace(
+            work_command="set",
+            project=None,
+            feature="Private feature",
+            feature_id=None,
+            root=str(project_root),
+        )
+
+        with (
+            mock.patch.object(
+                builder_pulse,
+                "load_work_contexts",
+                side_effect=[contexts, contexts, {}],
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(builder_pulse.command_work(args, self.data_dir), 2)
+
+        self.assertEqual(
+            builder_pulse.read_json(self.data_dir / "contexts.json", {}), contexts
+        )
+
+    def test_clear_feature_does_not_resurrect_a_concurrently_unenrolled_project(
+        self,
+    ) -> None:
+        project_root = self.workspace / "concurrent-clear"
+        project_root.mkdir()
+        self.enroll_project(project_root)
+        builder_pulse.ensure_project_scope_migration(self.data_dir)
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        args = argparse.Namespace(
+            work_command="clear-feature",
+            root=str(project_root),
+        )
+
+        with (
+            mock.patch.object(
+                builder_pulse,
+                "load_work_contexts",
+                side_effect=[contexts, contexts, {}],
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(builder_pulse.command_work(args, self.data_dir), 2)
+
+        self.assertEqual(
+            builder_pulse.read_json(self.data_dir / "contexts.json", {}), contexts
+        )
+
+    def test_work_views_do_not_call_malformed_contexts_enrolled(self) -> None:
+        project_root = self.workspace / "malformed-context"
+        project_root.mkdir()
+        builder_pulse.atomic_write_json(
+            self.data_dir / "contexts.json",
+            {
+                builder_pulse.repository_key(project_root): {
+                    "project_id": "invalid id with spaces",
+                    "project_label": "Looks enrolled",
+                }
+            },
+        )
+
+        list_output = io.StringIO()
+        with contextlib.redirect_stdout(list_output):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(work_command="list", root=None), self.data_dir
+                ),
+                0,
+            )
+        self.assertEqual(json.loads(list_output.getvalue())["projects"], [])
+
+        show_output = io.StringIO()
+        with contextlib.redirect_stdout(show_output):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(work_command="show", root=str(project_root)),
+                    self.data_dir,
+                ),
+                0,
+            )
+        self.assertFalse(json.loads(show_output.getvalue())["enrolled"])
+
+    def test_reenrollment_renames_project_without_splitting_its_stable_id(self) -> None:
+        project_root = self.workspace / "renamed-product"
+        project_root.mkdir()
+        self.enroll_project(
+            project_root,
+            project_id="stable-product-id",
+            project_label="Old Product Name",
+        )
+        args = argparse.Namespace(
+            work_command="enroll",
+            project="New Product Name",
+            project_id=None,
+            root=str(project_root),
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
+
+        context = builder_pulse.load_work_contexts(self.data_dir)[
+            builder_pulse.repository_key(project_root)
+        ]
+        self.assertEqual(context["project_id"], "stable-product-id")
+        self.assertEqual(context["project_label"], "New Product Name")
+
+    def test_non_latin_project_name_gets_a_stable_distinct_identifier(self) -> None:
+        first_root = self.workspace / "first-unicode-product"
+        second_root = self.workspace / "second-unicode-product"
+        first_root.mkdir()
+        second_root.mkdir()
+
+        for root, label in ((first_root, "नमस्ते"), (second_root, "こんにちは")):
+            args = argparse.Namespace(
+                work_command="enroll",
+                project=label,
+                project_id=None,
+                root=str(root),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
+
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        first = contexts[builder_pulse.repository_key(first_root)]
+        second = contexts[builder_pulse.repository_key(second_root)]
+        self.assertEqual(first["project_label"], "नमस्ते")
+        self.assertEqual(second["project_label"], "こんにちは")
+        self.assertRegex(first["project_id"], r"^project-[a-f0-9]{12}$")
+        self.assertRegex(second["project_id"], r"^project-[a-f0-9]{12}$")
+        self.assertNotEqual(first["project_id"], second["project_id"])
+
+    def test_non_git_enrollment_covers_descendants_without_storing_its_path(self) -> None:
+        project_root = self.workspace / "non-git-product"
+        nested = project_root / "src" / "feature"
+        nested.mkdir(parents=True)
+        self.enroll_project(
+            project_root,
+            project_id="non-git-product",
+            project_label="Non Git Product",
+        )
+
+        enrolled = builder_pulse.enrolled_work_context(self.data_dir, nested)
+
+        assert enrolled is not None
+        key, context, matched_root = enrolled
+        self.assertEqual(key, builder_pulse.repository_key(project_root))
+        self.assertEqual(context["project_label"], "Non Git Product")
+        self.assertEqual(matched_root, project_root.resolve())
+        self.assertNotIn(
+            str(project_root),
+            (self.data_dir / "contexts.json").read_text(encoding="utf-8"),
+        )
+
+    def test_monorepo_subfolder_enrollment_does_not_cover_siblings(self) -> None:
+        monorepo = self.workspace / "monorepo"
+        enrolled_app = monorepo / "apps" / "enrolled"
+        sibling_app = monorepo / "apps" / "private"
+        (monorepo / ".git").mkdir(parents=True)
+        enrolled_app.mkdir(parents=True)
+        sibling_app.mkdir(parents=True)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project="Enrolled App",
+                    project_id=None,
+                    root=str(enrolled_app),
+                ),
+                self.data_dir,
+            )
+
+        self.assertEqual(result, 0)
+        enrolled = builder_pulse.enrolled_work_context(
+            self.data_dir, enrolled_app / "src"
+        )
+        sibling = builder_pulse.enrolled_work_context(self.data_dir, sibling_app)
+        assert enrolled is not None
+        self.assertEqual(enrolled[2], enrolled_app.resolve())
+        self.assertEqual(enrolled[1]["project_label"], "Enrolled App")
+        self.assertIsNone(sibling)
+        persisted = (self.data_dir / "contexts.json").read_text(encoding="utf-8")
+        self.assertNotIn(str(monorepo), persisted)
+        self.assertNotIn(str(enrolled_app), persisted)
+
+    def test_first_explicit_enrollment_does_not_revive_legacy_feature_context(self) -> None:
+        project_root = self.workspace / "legacy-project"
+        project_root.mkdir()
+        key = builder_pulse.repository_key(project_root)
+        builder_pulse.atomic_write_json(
+            self.data_dir / "contexts.json",
+            {
+                key: {
+                    "project_id": "legacy-cohort-label",
+                    "feature_id": "old-inferred-feature",
+                    "feature_label": "Old inferred feature",
+                }
+            },
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project="Confirmed Product",
+                    project_id=None,
+                    root=str(project_root),
+                ),
+                self.data_dir,
+            )
+
+        self.assertEqual(result, 0)
+        context = builder_pulse.load_work_contexts(self.data_dir)[key]
+        self.assertEqual(context["project_id"], "confirmed-product")
+        self.assertEqual(context["project_label"], "Confirmed Product")
+        self.assertNotIn("feature_id", context)
+        self.assertNotIn("feature_label", context)
+
+    def test_project_enrollment_rejects_home_and_filesystem_roots(self) -> None:
+        for root in (Path.home(), Path(Path.home().anchor)):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                result = builder_pulse.command_work(
+                    argparse.Namespace(
+                        work_command="enroll",
+                        project="Too broad",
+                        project_id=None,
+                        root=str(root),
+                    ),
+                    self.data_dir,
+                )
+            self.assertEqual(result, 2)
+            self.assertIn("not the home", output.getvalue())
+
+    def test_project_enrollment_rejects_a_parent_of_the_home_directory(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            result = builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project="Too broad",
+                    project_id=None,
+                    root=str(Path.home().parent),
+                ),
+                self.data_dir,
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("one of its parents", output.getvalue())
+
+    def test_same_session_keeps_independent_state_for_each_enrolled_project(self) -> None:
+        self.claim_locally()
+        first_root = self.workspace / "first-product"
+        second_root = self.workspace / "second-product"
+        (first_root / ".git").mkdir(parents=True)
+        (second_root / ".git").mkdir(parents=True)
+        self.enroll_project(
+            first_root, project_id="first-product", project_label="First Product"
+        )
+        self.enroll_project(
+            second_root, project_id="second-product", project_label="Second Product"
+        )
+
+        with mock.patch.object(
+            builder_pulse, "utc_now_ms", return_value=1_787_721_000_000
+        ):
+            first = builder_pulse.record_hook_event(
+                self.data_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "shared-session",
+                    "cwd": str(first_root),
+                },
+                self.config,
+            )
+        with mock.patch.object(
+            builder_pulse, "utc_now_ms", return_value=1_787_721_000_001
+        ):
+            second = builder_pulse.record_hook_event(
+                self.data_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "shared-session",
+                    "cwd": str(second_root),
+                },
+                self.config,
+            )
+
+        assert first is not None and second is not None
+        self.assertEqual(first["projectLabel"], "First Product")
+        self.assertEqual(second["projectLabel"], "Second Product")
+        self.assertEqual(len(list((self.data_dir / "states").glob("*.json"))), 2)
+
+    def test_work_enroll_list_and_unenroll_manage_only_explicit_projects(self) -> None:
+        first_root = self.workspace / "first-product"
+        second_root = self.workspace / "second-product"
+        (first_root / ".git").mkdir(parents=True)
+        (second_root / ".git").mkdir(parents=True)
+
+        for root, label in (
+            (first_root, "First Product"),
+            (second_root, "Second Product"),
+        ):
+            output = io.StringIO()
+            args = argparse.Namespace(
+                work_command="enroll",
+                project=label,
+                project_id=None,
+                root=str(root),
+            )
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
+            shown = json.loads(output.getvalue())
+            self.assertTrue(shown["enrolled"])
+            self.assertEqual(shown["projectLabel"], label)
+            self.assertEqual(shown["capture"], "enrolled-projects-only")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(work_command="list", root=None), self.data_dir
+                ),
+                0,
+            )
+        listed = json.loads(output.getvalue())
+        self.assertEqual(listed["scope"], "explicit-project-allowlist")
+        self.assertEqual(
+            {project["projectLabel"] for project in listed["projects"]},
+            {"First Product", "Second Product"},
+        )
+        self.assertNotIn(str(first_root), output.getvalue())
+        self.assertNotIn(str(second_root), output.getvalue())
+
+        first_key = builder_pulse.repository_key(first_root)
+        second_key = builder_pulse.repository_key(second_root)
+        first_scope = {
+            "projectId": "first-product",
+            "projectLabel": "First Product",
+            "projectScope": "explicit",
+        }
+        second_scope = {
+            "projectId": "second-product",
+            "projectLabel": "Second Product",
+            "projectScope": "explicit",
+        }
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "outbox.jsonl",
+            [
+                {"eventId": "first", **first_scope},
+                {"eventId": "second", **second_scope},
+            ],
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "prompt-outbox.jsonl",
+            [
+                {"promptId": "first", **first_scope},
+                {"promptId": "second", **second_scope},
+            ],
+        )
+        states_dir = self.data_dir / "states"
+        states_dir.mkdir(exist_ok=True)
+        builder_pulse.atomic_write_json(
+            states_dir / "first.json", {"contextKey": first_key, **first_scope}
+        )
+        builder_pulse.atomic_write_json(
+            states_dir / "second.json", {"contextKey": second_key, **second_scope}
+        )
+
+        unenroll_output = io.StringIO()
+        with contextlib.redirect_stdout(unenroll_output):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(
+                        work_command="unenroll", root=str(first_root)
+                    ),
+                    self.data_dir,
+                ),
+                0,
+            )
+        self.assertEqual(
+            json.loads(unenroll_output.getvalue())["discardedPending"],
+            {"lifecycle": 1, "prompts": 1, "states": 1},
+        )
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        self.assertNotIn(first_key, contexts)
+        self.assertIn(second_key, contexts)
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
+            [{"eventId": "second", **second_scope}],
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"),
+            [{"promptId": "second", **second_scope}],
+        )
+        self.assertFalse((states_dir / "first.json").exists())
+        self.assertTrue((states_dir / "second.json").exists())
+
+        second_unenroll = io.StringIO()
+        with contextlib.redirect_stdout(second_unenroll):
+            self.assertEqual(
+                builder_pulse.command_work(
+                    argparse.Namespace(work_command="unenroll", root=str(first_root)),
+                    self.data_dir,
+                ),
+                0,
+            )
+        self.assertFalse(json.loads(second_unenroll.getvalue())["removed"])
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
+            [{"eventId": "second", **second_scope}],
+        )
+        self.assertIsNone(
+            builder_pulse.record_hook_event(
+                self.data_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "unenrolled",
+                    "cwd": str(first_root),
+                },
+                self.config,
+            )
+        )
+
+    def test_scope_migration_discards_only_legacy_records_and_preserves_identity(self) -> None:
+        self.claim_locally()
+        identity_before = builder_pulse.identity_path(self.data_dir).read_bytes()
+        contexts_before = (self.data_dir / "contexts.json").read_bytes()
+        explicit = {
+            "projectId": "product-alpha",
+            "projectLabel": "Product Alpha",
+            "projectScope": "explicit",
+        }
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "outbox.jsonl",
+            [{"eventId": "legacy"}, {"eventId": "explicit", **explicit}],
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "prompt-outbox.jsonl",
+            [{"promptId": "legacy"}, {"promptId": "explicit", **explicit}],
+        )
+        states_dir = self.data_dir / "states"
+        states_dir.mkdir()
+        builder_pulse.atomic_write_json(states_dir / "legacy.json", {"state": "building"})
+        builder_pulse.atomic_write_json(
+            states_dir / "explicit.json", {"state": "building", **explicit}
+        )
+
+        marker = builder_pulse.ensure_project_scope_migration(self.data_dir)
+
+        self.assertEqual(
+            marker["discardedUnscoped"],
+            {"lifecycle": 1, "prompts": 1, "states": 1},
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
+            [{"eventId": "explicit", **explicit}],
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"),
+            [{"promptId": "explicit", **explicit}],
+        )
+        self.assertFalse((states_dir / "legacy.json").exists())
+        self.assertTrue((states_dir / "explicit.json").exists())
+        self.assertEqual(builder_pulse.identity_path(self.data_dir).read_bytes(), identity_before)
+        self.assertEqual((self.data_dir / "contexts.json").read_bytes(), contexts_before)
+
     def test_permanent_client_error_is_quarantined_without_starving_queue(self) -> None:
         self.claim_locally()
         event = self.record(
@@ -1997,7 +2819,10 @@ class BuilderPulseTests(unittest.TestCase):
             builder_pulse, "deliver_event", return_value=(False, "http_422")
         ):
             result = builder_pulse.flush_outbox(self.data_dir, self.config)
-        self.assertEqual(result, {"delivered": 0, "quarantined": 1, "remaining": 0})
+        self.assertEqual(
+            result,
+            {"delivered": 0, "discarded": 0, "quarantined": 1, "remaining": 0},
+        )
         self.assertEqual(
             builder_pulse.read_jsonl(self.data_dir / "quarantine.jsonl")[0]["eventId"],
             event["eventId"],
@@ -2074,18 +2899,27 @@ class HookManifestTests(unittest.TestCase):
         ]
         self.assertTrue(commands)
         for hook in commands:
-            self.assertIn("CLAUDE_PLUGIN_ROOT", hook["command"])
-            self.assertIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
+            self.assertIn("${PLUGIN_ROOT}", hook["command"])
+            self.assertEqual(
+                hook["commandWindows"],
+                'cd /d "%PLUGIN_ROOT%"&&scripts\\builder_pulse.cmd',
+            )
+            self.assertNotIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
+
+    def test_windows_hook_wrapper_quotes_the_python_script_path(self) -> None:
+        wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
+        contents = wrapper.read_text(encoding="utf-8")
+        self.assertIn('py -3 "%~dp0builder_pulse.py" hook', contents)
 
     def test_session_end_is_synchronous_for_codex(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
         hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
         self.assertNotIn("async", hook)
 
-    def test_user_prompt_submit_is_synchronous_for_reliable_delivery(self) -> None:
+    def test_user_prompt_submit_is_async_so_telemetry_cannot_block_a_prompt(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
         hook = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]
-        self.assertNotIn("async", hook)
+        self.assertIs(hook.get("async"), True)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,6 @@
 {
   "enabled": true,
   "endpoint": "https://precious-ant-429.convex.site",
-  "project_id": "",
-  "feature_id": "",
-  "feature_label": "",
   "delivery_timeout_seconds": 1.0,
   "claim_timeout_seconds": 10.0,
   "max_flush_events": 3,

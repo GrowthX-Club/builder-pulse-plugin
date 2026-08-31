@@ -9,23 +9,23 @@ Windows.
 
 ## Stable setup and update
 
-The permanent setup entrypoint is [SETUP.md](SETUP.md). Builder-facing handbook
-prompts link to that file instead of embedding a release number or duplicating
-installation steps. The repository-owned installer selects the current stable
-release, so future releases require no handbook-prompt change.
+The permanent setup entrypoint is [SETUP.md](SETUP.md). Builder-facing prompts
+pin an immutable release and link to that release's guide instead of duplicating
+installation logic.
 
 ## Consent and data boundary
 
-Installing and claiming Builder Pulse enables the data collection described
-below. The claim command displays this exact disclosure before making the
-request:
+The plugin is installed machine-wide, but capture is fail-closed outside the
+project folders a member explicitly enrolls. Installing and claiming Builder
+Pulse enables the data collection described below only for those folders. The
+claim command displays this exact disclosure before making the request:
 
-> Builder Pulse connects you with GrowthX so that we can track your progress and provide you learning feedback.
+> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX member record. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view this data for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables.
 
 Builder Pulse sends only:
 
 - a random installation ID and hashed Codex session key;
-- the configured product/project ID (or a sanitized folder basename fallback);
+- a stable sanitized project ID and the member-confirmed project display name;
 - an optional feature ID and feature label explicitly set by the builder;
 - `building`, `testing`, `blocked`, `ready`, or `idle`;
 - event time, an optional active interval capped at 15 minutes, and plugin version.
@@ -40,6 +40,15 @@ blocks, Authorization/Bearer values, and common API-token formats. It is a
 high-confidence safety layer, not a guarantee that every possible secret will
 be recognized. The bounded redacted prompt is temporarily persisted in a
 separate local prompt outbox and forwarded to GrowthX.
+
+Folder paths are used locally only to match a hook's working directory to
+the one-way keyed enrollment record; folder paths are never persisted in
+that record or transmitted. An enrollment covers the confirmed folder and its
+descendants, including one package inside a monorepo and projects without Git.
+The home directory, its parent directories, and filesystem root cannot be
+enrolled. A hook without a working directory, or
+from a folder outside every explicit enrollment, sends and queues nothing and
+is rejected before prompt text or transcript metadata is inspected.
 
 Separate command, path, source, patch, tool input/output, transcript, assistant
 response, environment, invite-code, and endpoint-response fields from hooks are
@@ -94,44 +103,59 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.4.3"
+  "pluginVersion": "0.4.6"
 }
 ```
 
 The response supplies the internal `builderId`, the stable GrowthX `memberId`,
 `name`, `defaultProject`,
 `heartbeatMinutes: 15`, and `promptCapture: "on"`; it does not return the
-installation token. A
-non-null default project is used only when the builder has not configured one.
+installation token. `defaultProject` is legacy roster/program metadata and is
+never adopted as telemetry project context. Project identity always comes from
+a member-confirmed local enrollment.
 
-## Product and feature context
+## Project enrollment and feature context
 
-Use a concise, non-sensitive label. Feature labels are limited to 120
-characters and never inferred from prompt text. The configured project and
-feature context is attached to both lifecycle and prompt events.
+Before enrollment, show the disclosure above, identify only the current working
+directory and, if different, its nearest repository root, and ask the member which exact folder or
+folders to monitor and what display name to use for each. Do not scan broadly or
+infer a project name from the folder, prompts, or roster metadata.
+
+Use a concise, non-sensitive member-confirmed project name. Enrollment derives a
+stable sanitized project ID unless `--project-id` is supplied. Feature labels
+are limited to 120 characters and never inferred from prompt text. The project
+and optional feature context is attached to both lifecycle and prompt events.
 
 ```bash
-<python> <plugin-root>/scripts/builder_pulse.py work set --project growthx-community --feature "Member search filters"
+<python> <plugin-root>/scripts/builder_pulse.py work enroll --root /confirmed/project-folder --project "GrowthX Community"
+<python> <plugin-root>/scripts/builder_pulse.py work set --root /confirmed/project-folder --feature "Member search filters"
 
 <python> <plugin-root>/scripts/builder_pulse.py work show
+<python> <plugin-root>/scripts/builder_pulse.py work list
 <python> <plugin-root>/scripts/builder_pulse.py work clear-feature
+<python> <plugin-root>/scripts/builder_pulse.py work unenroll --root /confirmed/project-folder
 ```
 
 An optional `--feature-id member-search-filters` preserves a stable ID when the
 display label changes. Without it, Builder Pulse derives a sanitized ID. Work
-context is scoped to the current repository root, so concurrent repositories do
-not inherit each other's product or feature. Use `--root /path/to/repository`
-with `work set`, `work show`, or `work clear-feature` to target another checkout.
-`config set project_id ...` remains an explicit global fallback only.
+context and lifecycle heartbeat are scoped to the exact enrolled folder, so a
+monorepo package does not implicitly enroll its siblings and concurrent projects
+do not inherit or suppress each other's project or feature state.
+On upgrade, an older context record remains inactive until that exact folder is
+explicitly enrolled with a display name. Its legacy feature label is cleared on
+first enrollment instead of being silently attributed to the confirmed project.
+`work unenroll` removes that mapping and clears only pending local telemetry,
+prompts, and state for the removed project; pending data for other enrolled
+projects remains intact. There is no global project fallback.
 
 ## Delivery behavior
 
-Hooks run asynchronously except `UserPromptSubmit` and `SessionEnd`, which
-Codex runs synchronously. Synchronous prompt capture ensures a short Codex task
-cannot exit before its prompt has been queued and delivery has been attempted.
-The current prompt is attempted first under a 750 ms network timeout; older
-prompt and lifecycle backlog is left for asynchronous hooks so an outage cannot
-stall every submitted prompt behind retries.
+Hooks run asynchronously except `SessionEnd`, which Codex always runs
+synchronously. `UserPromptSubmit` records and attempts the current prompt in a
+background hook so an interpreter, path, or network failure can never block a
+builder's prompt. The current prompt is attempted first under a 750 ms network
+timeout; older prompt and lifecycle backlog is left for later asynchronous
+hooks so an outage cannot stall every submitted prompt behind retries.
 Only essential lifecycle hooks and matched post-tool events launch the runtime.
 A lifecycle telemetry event is created only when
 state changes or a 15-minute heartbeat is due. Observed hook continuity can
@@ -157,16 +181,22 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "installationId": "uuid",
   "sessionKey": "short-hash",
   "projectId": "growthx-community",
+  "projectLabel": "GrowthX Community",
+  "projectScope": "explicit",
   "featureId": "member-search-filters",
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.4.3",
+  "pluginVersion": "0.4.6",
   "redacted": false,
   "truncated": false
 }
 ```
 
+`projectLabel` and `projectScope` are required for every event the service
+accepts. The service rejects unscoped payloads from every plugin version, so
+v0.4.5 and older stop reporting until they update and the member explicitly
+enrolls a project folder.
 `featureId` and `featureLabel` are omitted when unavailable. The prompt outbox
 uses the same file lock, maximum queue length, and flush batch size as the
 lifecycle outbox. Its first creation is `0600` before any prompt bytes are
@@ -186,6 +216,8 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
   "installationId": "uuid",
   "sessionKey": "short-hash",
   "projectId": "growthx-community",
+  "projectLabel": "GrowthX Community",
+  "projectScope": "explicit",
   "featureId": "member-search-filters",
   "featureLabel": "Member search filters",
   "state": "building",
@@ -198,7 +230,7 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.4.2"
+  "pluginVersion": "0.4.6"
 }
 ```
 
@@ -225,16 +257,21 @@ Status reports lifecycle and prompt queue counts separately. `flush` retries
 both queues. `activate` reads the local Codex app-server's official
 `hooks/list` result and exits successfully only when every Builder Pulse hook
 is current, enabled, and trusted or managed and the Builder Pulse service
-accepts the claimed installation. It does not create a lifecycle event or
-change the builder's work state. A claim by itself is not a verified
-connection.
+accepts the claimed installation. That proves activation readiness, not event
+delivery. `telemetryReceived: true` means the server has received something at
+some point; it can be historical. Current repair proof requires
+`telemetryReceivedSincePreviousActivation: true`, a non-null `lastSignalAt`, and
+`lastSignalPluginVersion: "0.4.6"`. That proof uses the server receipt time, not
+the member computer's event clock. Activation does not create a lifecycle event
+or change the builder's work state.
 
 The hook runtime writes to Codex's `PLUGIN_DATA`. Interactive commands launched
 from an installed marketplace cache derive that same directory automatically.
-Set `BUILDER_PULSE_DATA_DIR` or pass `--data-dir` only for explicit local/testing access. Supported
-environment context overrides are `BUILDER_PULSE_ENDPOINT`,
-`BUILDER_PULSE_PROJECT_ID`, `BUILDER_PULSE_FEATURE_ID`, and
-`BUILDER_PULSE_FEATURE_LABEL`.
+Set `BUILDER_PULSE_DATA_DIR` or pass `--data-dir` only for explicit local/testing
+access. Supported environment overrides include `BUILDER_PULSE_ENABLED`,
+`BUILDER_PULSE_ENDPOINT`, and `BUILDER_PULSE_CLAIM_TIMEOUT_SECONDS`. Project and
+feature context has no environment or global fallback; it comes only from the
+per-folder enrollment file.
 
 ## Prepared installation and lifecycle contract
 
@@ -242,18 +279,19 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. For manual
-recovery, install the current immutable v0.4.5 release with:
+recovery, install the current immutable v0.4.6 release with:
 
 ```bash
-codex plugin marketplace add udayanwalvekar/builder-pulse-plugin --ref v0.4.5
+codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.4.6
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 The admin-provided claim command must use the installed plugin root; this build
 defaults to `https://precious-ant-429.convex.site`. To upgrade after an announced
 release, remove the configured marketplace, re-add it with the announced
-immutable tag, then run the same `codex plugin add` command and start a new Codex
-task. To pause
+immutable tag, then run the same `codex plugin add` command. Exit every running
+Codex session before starting a fresh task so no process keeps the previous hook
+manifest or version path in memory. To pause
 without removing local identity, run `config set enabled false`. To uninstall,
 run `codex plugin remove builder-pulse`; uninstalling is not token revocation.
 

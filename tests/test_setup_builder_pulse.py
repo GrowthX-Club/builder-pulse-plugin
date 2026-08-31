@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -15,8 +17,76 @@ assert SPEC is not None and SPEC.loader is not None
 setup_builder_pulse = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(setup_builder_pulse)
 
+BUILDER_SPEC = importlib.util.spec_from_file_location(
+    "builder_pulse_for_setup_test", ROOT / "scripts" / "builder_pulse.py"
+)
+assert BUILDER_SPEC is not None and BUILDER_SPEC.loader is not None
+builder_pulse = importlib.util.module_from_spec(BUILDER_SPEC)
+BUILDER_SPEC.loader.exec_module(builder_pulse)
+
 
 class SetupBuilderPulseTests(unittest.TestCase):
+    def test_standalone_installer_uses_the_canonical_privacy_disclosure(self) -> None:
+        self.assertEqual(
+            setup_builder_pulse.SETUP_DISCLOSURE,
+            builder_pulse.SETUP_DISCLOSURE,
+        )
+
+    def test_setup_cli_help_exposes_confirmed_project_arguments(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "setup_builder_pulse.py"), "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--project-root", completed.stdout)
+        self.assertIn("--project-label", completed.stdout)
+
+    def test_existing_cli_prefers_codex_reported_install_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Builder Pulse 0.4.4"
+            (root / "scripts").mkdir(parents=True)
+            cli = root / "scripts" / "builder_pulse.py"
+            cli.touch()
+            (root / ".codex-plugin").mkdir()
+            (root / ".codex-plugin" / "plugin.json").write_text(
+                '{"version":"0.4.4"}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                setup_builder_pulse.installed_cli(
+                    {"version": "0.4.4", "installedPath": str(root)}
+                ),
+                cli.resolve(),
+            )
+
+    def test_existing_cli_rejects_reported_path_with_wrong_manifest_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "builder-pulse"
+            (root / "scripts").mkdir(parents=True)
+            (root / "scripts" / "builder_pulse.py").touch()
+            (root / ".codex-plugin").mkdir()
+            (root / ".codex-plugin" / "plugin.json").write_text(
+                '{"version":"0.4.3"}',
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.dict(
+                    setup_builder_pulse.os.environ,
+                    {"CODEX_HOME": str(Path(directory) / "missing-codex-home")},
+                ),
+                self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "could not be located safely",
+                ),
+            ):
+                setup_builder_pulse.installed_cli(
+                    {"version": "0.4.4", "installedPath": str(root)}
+                )
+
     def test_setup_reinstalls_current_release_and_keeps_code_out_of_arguments(self) -> None:
         invite_code = "InviteCode_1234567890"
         cli = ROOT / "scripts" / "builder_pulse.py"
@@ -48,19 +118,29 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(setup_builder_pulse, "remove_current") as remove,
+            mock.patch.object(
+                setup_builder_pulse, "pause_existing_capture"
+            ) as pause,
             mock.patch.object(setup_builder_pulse, "install_release", return_value=cli) as install,
             mock.patch.object(
                 setup_builder_pulse,
                 "activate",
                 return_value={
-                    "connected": True,
+                    "connected": False,
+                    "activationReady": True,
                     "hooksTrusted": True,
                     "serverVerified": True,
+                    "telemetryReceived": False,
                 },
             ) as activate,
             mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command) as run,
         ):
-            setup_builder_pulse.setup(invite_code, setup_builder_pulse.DEFAULT_ENDPOINT)
+            setup_builder_pulse.setup(
+                invite_code,
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
 
         verify.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
         remove.assert_called_once_with(
@@ -68,11 +148,52 @@ class SetupBuilderPulseTests(unittest.TestCase):
             marketplace_configured=True,
             rollback_version="0.4.4",
         )
+        pause.assert_called_once_with({"version": "0.4.4"})
         install.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
         activate.assert_called_once_with(cli)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
+        enroll_calls = [arguments for arguments in calls if "enroll" in arguments]
+        self.assertEqual(len(enroll_calls), 1)
+        self.assertEqual(
+            enroll_calls[0][-6:],
+            [
+                "work",
+                "enroll",
+                "--root",
+                str(ROOT.resolve()),
+                "--project",
+                "Builder Pulse",
+            ],
+        )
+        self.assertTrue(
+            any(arguments[-4:] == ["config", "set", "enabled", "true"] for arguments in calls)
+        )
         self.assertTrue(any(arguments[-1] == "flush" for arguments in calls))
+
+    def test_setup_rejects_home_as_an_enrollment_root(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "project folder"),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                Path.home(),
+                "Home",
+            )
+
+    def test_setup_rejects_a_parent_of_home_as_an_enrollment_root(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "project folder"),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                Path.home().parent,
+                "Home parent",
+            )
 
     def test_activation_review_result_is_preserved_even_with_nonzero_exit(self) -> None:
         completed = mock.Mock(
@@ -143,6 +264,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
+                    ROOT,
+                    "Builder Pulse",
                 )
 
         cleanup.assert_called_once_with()
@@ -217,9 +340,9 @@ class SetupBuilderPulseTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 setup_builder_pulse.SetupError,
-                "expected 0.4.5",
+                "expected 0.4.6",
             ):
-                setup_builder_pulse.install_release("v0.4.5")
+                setup_builder_pulse.install_release("v0.4.6")
 
     def test_rejects_marketplace_name_pointing_to_another_repository(self) -> None:
         with (
@@ -240,7 +363,60 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
+                    ROOT,
+                    "Builder Pulse",
                 )
+
+    def test_accepts_only_current_and_historical_official_marketplace_sources(self) -> None:
+        for source in (
+            setup_builder_pulse.REPOSITORY,
+            setup_builder_pulse.REPOSITORY.removesuffix(".git"),
+            "https://github.com/udayanwalvekar/builder-pulse-plugin.git",
+            "https://github.com/udayanwalvekar/builder-pulse-plugin",
+        ):
+            self.assertTrue(setup_builder_pulse.approved_existing_repository(source))
+
+        for source in (
+            "https://github.com/example/builder-pulse-plugin.git",
+            "https://github.com/GrowthX-Club/builder-pulse-plugin-fake.git",
+            "git@github.com:udayanwalvekar/builder-pulse-plugin.git",
+            None,
+        ):
+            self.assertFalse(setup_builder_pulse.approved_existing_repository(source))
+
+    def test_setup_requires_a_confirmed_existing_project_and_name(self) -> None:
+        with self.assertRaisesRegex(
+            setup_builder_pulse.SetupError,
+            "member-confirmed Builder Pulse project folder",
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                "",
+                "Builder Pulse",
+            )
+
+        with self.assertRaisesRegex(
+            setup_builder_pulse.SetupError,
+            "confirmed Builder Pulse project folder does not exist",
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT / "does-not-exist",
+                "Builder Pulse",
+            )
+
+        with self.assertRaisesRegex(
+            setup_builder_pulse.SetupError,
+            "confirmed Builder Pulse project name is invalid",
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "",
+            )
 
 
 if __name__ == "__main__":

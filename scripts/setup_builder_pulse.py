@@ -14,11 +14,33 @@ import sys
 from typing import Any
 
 
-REPOSITORY = "https://github.com/udayanwalvekar/builder-pulse-plugin.git"
+REPOSITORY = "https://github.com/GrowthX-Club/builder-pulse-plugin.git"
+APPROVED_EXISTING_REPOSITORIES = {
+    REPOSITORY,
+    REPOSITORY.removesuffix(".git"),
+    "https://github.com/udayanwalvekar/builder-pulse-plugin.git",
+    "https://github.com/udayanwalvekar/builder-pulse-plugin",
+}
 MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
-TARGET_RELEASE = "v0.4.5"
+TARGET_RELEASE = "v0.4.6"
 DEFAULT_ENDPOINT = "https://precious-ant-429.convex.site"
+SETUP_DISCLOSURE = (
+    "Builder Pulse is installed machine-wide, but it sends data only from project "
+    "folders you explicitly enroll. GrowthX links telemetry to your claimed GrowthX "
+    "member record. For each enrolled project, it receives a stable installation ID, "
+    "a one-way hashed session ID, the display name you confirm and a sanitized project "
+    "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
+    "timestamps, plugin version, optional cumulative token counts, and each primary "
+    "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
+    "Builder Pulse admins can view this data for learning feedback. Raw lifecycle events "
+    "and activity buckets are retained for 30 days; submitted prompts and their feedback "
+    "are retained for 60 days; the installation/member link, latest status, and compacted "
+    "session, daily, and all-time "
+    "token aggregates remain until GrowthX removes them. It does not send "
+    "folder paths, files, patches, commands, tool input or output, assistant replies, "
+    "transcripts, or environment variables."
+)
 
 
 class SetupError(RuntimeError):
@@ -64,6 +86,63 @@ def installed_builder() -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
+def installed_cli(installation: dict[str, Any]) -> Path:
+    version = installation.get("version")
+    if not isinstance(version, str) or not version or any(
+        character not in "0123456789.-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for character in version
+    ):
+        raise SetupError("Codex reported an invalid Builder Pulse version")
+    candidates: list[Path] = []
+    installed_path = installation.get("installedPath")
+    if isinstance(installed_path, str) and installed_path:
+        candidates.append(
+            Path(installed_path).expanduser().resolve(strict=False)
+            / "scripts"
+            / "builder_pulse.py"
+        )
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    candidates.append(
+        codex_home
+        / "plugins"
+        / "cache"
+        / MARKETPLACE
+        / "builder-pulse"
+        / version.removeprefix("v")
+        / "scripts"
+        / "builder_pulse.py"
+    )
+    for cli in candidates:
+        if not cli.is_file():
+            continue
+        manifest = cli.parent.parent / ".codex-plugin" / "plugin.json"
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(manifest_data, dict)
+            and manifest_data.get("version") == version.removeprefix("v")
+        ):
+            return cli
+    raise SetupError("The existing Builder Pulse script could not be located safely")
+
+
+def pause_existing_capture(installation: dict[str, Any] | None) -> None:
+    if installation is None:
+        return
+    run_command(
+        [
+            sys.executable,
+            str(installed_cli(installation)),
+            "config",
+            "set",
+            "enabled",
+            "false",
+        ]
+    )
+
+
 def marketplace_state() -> dict[str, Any] | None:
     response = run_command(
         ["codex", "plugin", "marketplace", "list", "--json"],
@@ -80,6 +159,10 @@ def marketplace_state() -> dict[str, Any] | None:
     if len(matches) > 1:
         raise SetupError("Codex reported more than one GrowthX marketplace")
     return matches[0] if matches else None
+
+
+def approved_existing_repository(value: Any) -> bool:
+    return isinstance(value, str) and value in APPROVED_EXISTING_REPOSITORIES
 
 
 def remove_current(
@@ -145,7 +228,7 @@ def install_release(release: str) -> Path:
             "plugin",
             "marketplace",
             "add",
-            "udayanwalvekar/builder-pulse-plugin",
+            "GrowthX-Club/builder-pulse-plugin",
             "--ref",
             release,
             "--json",
@@ -209,7 +292,12 @@ def activate(cli: Path) -> dict[str, Any]:
     raise SetupError(detail or "Builder Pulse activation failed")
 
 
-def setup(invite_code: str, endpoint: str) -> None:
+def setup(
+    invite_code: str,
+    endpoint: str,
+    project_root: str | Path,
+    project_label: str,
+) -> None:
     if sys.version_info < (3, 11):
         raise SetupError("Builder Pulse requires Python 3.11 or newer")
     if shutil.which("git") is None:
@@ -218,6 +306,22 @@ def setup(invite_code: str, endpoint: str) -> None:
         raise SetupError("Builder Pulse requires Codex")
     if len(invite_code) < 16 or len(invite_code) > 256:
         raise SetupError("The Builder Pulse invite code is invalid")
+    if not str(project_root).strip():
+        raise SetupError("A member-confirmed Builder Pulse project folder is required")
+    enrolled_root = Path(project_root).expanduser().resolve(strict=False)
+    if not enrolled_root.is_dir():
+        raise SetupError("The confirmed Builder Pulse project folder does not exist")
+    confirmed_label = project_label.strip()
+    if not confirmed_label or len(confirmed_label) > 160:
+        raise SetupError("The confirmed Builder Pulse project name is invalid")
+    if any(ord(character) < 32 for character in confirmed_label):
+        raise SetupError("The confirmed Builder Pulse project name is invalid")
+    home = Path.home().resolve(strict=False)
+    if enrolled_root == home or enrolled_root in home.parents:
+        raise SetupError(
+            "The confirmed folder must be a project folder, not the home, one of "
+            "its parents, or the filesystem root"
+        )
 
     verify_release_exists(TARGET_RELEASE)
     previous = installed_builder()
@@ -226,9 +330,12 @@ def setup(invite_code: str, endpoint: str) -> None:
     if previous_marketplace:
         source = previous_marketplace.get("marketplaceSource")
         repository = source.get("source") if isinstance(source, dict) else None
-        if repository not in {REPOSITORY, REPOSITORY.removesuffix(".git")}:
+        if not approved_existing_repository(repository):
             raise SetupError("The GrowthX marketplace name points to a different source")
 
+    # Stop older machine-wide capture before replacing its package. The new
+    # release is enabled again only after an explicit project is enrolled.
+    pause_existing_capture(previous)
     remove_current(
         plugin_installed=previous is not None,
         marketplace_configured=previous_marketplace is not None,
@@ -254,9 +361,24 @@ def setup(invite_code: str, endpoint: str) -> None:
         [sys.executable, str(cli), "claim", "--endpoint", endpoint],
         env=claim_env,
     )
+    run_command(
+        [
+            sys.executable,
+            str(cli),
+            "work",
+            "enroll",
+            "--root",
+            str(enrolled_root),
+            "--project",
+            confirmed_label,
+        ]
+    )
+    run_command(
+        [sys.executable, str(cli), "config", "set", "enabled", "true"]
+    )
     activation = activate(cli)
     if not (
-        activation.get("connected") is True
+        activation.get("activationReady") is True
         and activation.get("hooksTrusted") is True
         and activation.get("serverVerified") is True
     ):
@@ -272,16 +394,31 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--code")
+    parser.add_argument("--project-root")
+    parser.add_argument("--project-label")
     args = parser.parse_args()
+    print(SETUP_DISCLOSURE, file=sys.stderr)
     invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE") or ""
     if not invite_code and sys.stdin.isatty():
         invite_code = getpass.getpass("Builder Pulse invite code: ")
+    project_root = args.project_root or ""
+    project_label = args.project_label or ""
+    if sys.stdin.isatty() and not project_root:
+        entered_root = input(f"Project folder to enroll [{Path.cwd()}]: ").strip()
+        project_root = entered_root or str(Path.cwd())
+    if sys.stdin.isatty() and not project_label:
+        project_label = input("Project name GrowthX should display: ").strip()
     try:
-        setup(invite_code, args.endpoint)
+        setup(invite_code, args.endpoint, project_root, project_label)
     except SetupError as exc:
         print(f"Builder Pulse setup failed safely: {exc}", file=sys.stderr)
         return 1
-    print("Builder Pulse is connected. Send one new normal Codex prompt to verify telemetry.")
+    print(
+        "Builder Pulse is installed and its hooks are trusted. "
+        "Only the confirmed project folder is enrolled. "
+        "Exit all running Codex sessions, start a fresh Codex session, "
+        "then send one normal prompt to verify server receipt."
+    )
     return 0
 
 
