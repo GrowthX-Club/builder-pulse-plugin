@@ -3469,12 +3469,14 @@ class HookManifestTests(unittest.TestCase):
 
     def test_windows_launcher_verification_uses_the_registered_root_command(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "{}\n", "")
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            builder_pulse.os, "name", "nt"
-        ), mock.patch.object(
-            builder_pulse.subprocess, "run", return_value=completed
-        ) as run:
-            result = builder_pulse.verify_hook_launcher(Path(directory))
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            with mock.patch.object(
+                builder_pulse.os, "name", "nt"
+            ), mock.patch.object(
+                builder_pulse.subprocess, "run", return_value=completed
+            ) as run:
+                result = builder_pulse.verify_hook_launcher(data_dir)
 
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
         command = run.call_args.args[0]
@@ -3497,14 +3499,16 @@ class HookManifestTests(unittest.TestCase):
     ) -> None:
         completed = subprocess.CompletedProcess([], 0, "{}\n", "")
         unc_root = Path(r"\\server\share\builder pulse")
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            builder_pulse.os, "name", "nt"
-        ), mock.patch.object(
-            builder_pulse, "PLUGIN_ROOT", unc_root
-        ), mock.patch.object(
-            builder_pulse.subprocess, "run", return_value=completed
-        ) as run:
-            result = builder_pulse.verify_hook_launcher(Path(directory))
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            with mock.patch.object(
+                builder_pulse.os, "name", "nt"
+            ), mock.patch.object(
+                builder_pulse, "PLUGIN_ROOT", unc_root
+            ), mock.patch.object(
+                builder_pulse.subprocess, "run", return_value=completed
+            ) as run:
+                result = builder_pulse.verify_hook_launcher(data_dir)
 
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
         self.assertEqual(
