@@ -2504,6 +2504,52 @@ class BuilderPulseTests(unittest.TestCase):
                 self.assertIn("overlaps", error.getvalue())
                 self.assertEqual(len(builder_pulse.load_work_contexts(self.data_dir)), 1)
 
+    def test_replace_existing_enrollment_leaves_exactly_one_scope(self) -> None:
+        first = self.workspace / "first-project"
+        second = self.workspace / "second-project"
+        confirmed = self.workspace / "confirmed-project"
+        first.mkdir()
+        second.mkdir()
+        confirmed.mkdir()
+        self.enroll_project(first, project_id="first", project_label="First")
+        self.enroll_project(second, project_id="second", project_label="Second")
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "outbox.jsonl", [{"eventId": "legacy"}]
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "prompt-outbox.jsonl", [{"promptId": "legacy"}]
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "quarantine.jsonl", [{"eventId": "legacy"}]
+        )
+        states = self.data_dir / "states"
+        states.mkdir()
+        builder_pulse.atomic_write_json(states / "legacy.json", {"state": "building"})
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project="Confirmed Product",
+                    project_id=None,
+                    root=str(confirmed),
+                    replace_existing=True,
+                ),
+                self.data_dir,
+            )
+
+        self.assertEqual(result, 0)
+        contexts = builder_pulse.load_work_contexts(self.data_dir)
+        self.assertEqual(len(contexts), 1)
+        only_context = next(iter(contexts.values()))
+        self.assertEqual(only_context["project_label"], "Confirmed Product")
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"), []
+        )
+        self.assertFalse((self.data_dir / "quarantine.jsonl").exists())
+        self.assertEqual(list(states.glob("*.json")), [])
+
     def test_unenrolling_a_child_never_removes_its_enrolled_parent(self) -> None:
         parent = self.workspace / "parent-project"
         child = parent / "src"
@@ -3449,10 +3495,11 @@ class HookManifestTests(unittest.TestCase):
             self.assertIn("builder_pulse.sh", hook["command"])
             self.assertEqual(
                 hook["commandWindows"],
-                'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+                '"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
             )
             self.assertNotIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
             self.assertNotIn("cd /d", hook["commandWindows"])
+            self.assertNotIn("call ", hook["commandWindows"].lower())
 
     def test_windows_hook_wrapper_quotes_the_python_script_path(self) -> None:
         wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
@@ -3483,9 +3530,8 @@ class HookManifestTests(unittest.TestCase):
         options = run.call_args.kwargs
         self.assertEqual(
             command,
-            'cmd /d /c call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+            'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
         )
-        self.assertNotIn(" /s ", command)
         self.assertEqual(options["env"]["PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
         self.assertNotIn("cwd", options)
 
@@ -3508,10 +3554,39 @@ class HookManifestTests(unittest.TestCase):
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
         self.assertEqual(
             run.call_args.args[0],
-            'cmd /d /c call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+            'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
         )
         self.assertEqual(run.call_args.kwargs["env"]["PLUGIN_ROOT"], str(unc_root))
         self.assertNotIn("cwd", run.call_args.kwargs)
+
+    def test_windows_launcher_expands_percent_bearing_roots_only_once(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "{}\n", "")
+        roots = (
+            Path(r"C:\\plugins\\%TEAM%\\builder pulse"),
+            Path(r"\\\\server\\share\\%TEAM%\\builder pulse"),
+        )
+        for root in roots:
+            with self.subTest(root=str(root)), tempfile.TemporaryDirectory() as directory:
+                with mock.patch.object(
+                    builder_pulse.os, "name", "nt"
+                ), mock.patch.object(
+                    builder_pulse, "PLUGIN_ROOT", root
+                ), mock.patch.object(
+                    builder_pulse.subprocess, "run", return_value=completed
+                ) as run:
+                    result = builder_pulse.verify_hook_launcher(Path(directory))
+
+                self.assertEqual(
+                    result, {"ready": True, "hookStatus": "launcher_verified"}
+                )
+                self.assertEqual(
+                    run.call_args.args[0],
+                    'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
+                )
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["PLUGIN_ROOT"], str(root)
+                )
+                self.assertNotIn("call ", run.call_args.args[0].lower())
 
     def test_activation_stops_before_the_server_when_launcher_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

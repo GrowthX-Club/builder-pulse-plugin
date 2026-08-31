@@ -144,7 +144,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.os.environ,
                 {"BUILDER_PULSE_ENABLED": "1"},
                 clear=True,
-            ):
+            ), mock.patch.object(
+                setup_builder_pulse,
+                "pause_server_capture",
+                return_value=True,
+            ) as server_pause:
                 paused = setup_builder_pulse.pause_existing_capture(
                     {"version": "0.4.5", "installedPath": str(plugin_root)}
                 )
@@ -179,11 +183,104 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
                 setup_builder_pulse.restore_paused_identity(cli, paused)
 
+            server_pause.assert_called_once_with(identity, "0.4.5")
+
             self.assertEqual(
                 json.loads((data_dir / "identity.json").read_text(encoding="utf-8")),
                 identity,
             )
             self.assertFalse((data_dir / "setup-paused-identity.json").exists())
+
+    def test_server_pause_is_a_barrier_for_a_cached_legacy_token(self) -> None:
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "cached-legacy-token",
+            "claimedEndpoint": "https://pulse.example",
+        }
+        server_state = {"paused": False}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps(
+                    {"paused": True, "installationId": "installation-1"}
+                ).encode("utf-8")
+
+        def urlopen(request, timeout):
+            self.assertEqual(timeout, 10)
+            self.assertEqual(
+                request.full_url,
+                "https://pulse.example/v1/privacy-pause",
+            )
+            self.assertEqual(
+                json.loads(request.data.decode("utf-8")),
+                {"installationId": "installation-1", "pluginVersion": "0.4.5"},
+            )
+            server_state["paused"] = True
+            return Response()
+
+        # A supported v0.4.5 process may already hold the token in memory. The
+        # acknowledged server pause, rather than a local file lock, is what
+        # prevents that process from delivering after quarantine begins.
+        with mock.patch.object(
+            setup_builder_pulse.urlrequest, "urlopen", side_effect=urlopen
+        ):
+            self.assertTrue(
+                setup_builder_pulse.pause_server_capture(identity, "0.4.5")
+            )
+
+        legacy_delivery_accepted = not server_state["paused"]
+        self.assertFalse(legacy_delivery_accepted)
+
+    def test_orphan_data_is_quarantined_without_a_registered_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = (Path(directory) / "builder-pulse-data").resolve()
+            data_dir.mkdir()
+            identity = {
+                "installationId": "installation-1",
+                "scopeSecret": "a" * 64,
+                "installationToken": "delivery-token",
+                "builderId": "builder-1",
+                "memberId": "member-1",
+                "claimedEndpoint": "https://pulse.example",
+                "promptCapture": "on",
+            }
+            (data_dir / "identity.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
+            (data_dir / "config.json").write_text(
+                '{"enabled":true}', encoding="utf-8"
+            )
+
+            with mock.patch.object(
+                setup_builder_pulse,
+                "existing_plugin_data_dir",
+                return_value=data_dir,
+            ), mock.patch.object(
+                setup_builder_pulse,
+                "pause_server_capture",
+                return_value=True,
+            ) as server_pause:
+                paused = setup_builder_pulse.pause_existing_capture(None)
+
+            self.assertEqual(paused.data_dir, data_dir)
+            server_pause.assert_called_once_with(identity, "0.4.6")
+            self.assertFalse(
+                json.loads((data_dir / "config.json").read_text())["enabled"]
+            )
+            self.assertNotIn(
+                "installationToken",
+                json.loads((data_dir / "identity.json").read_text()),
+            )
+            self.assertEqual(
+                json.loads((data_dir / "setup-paused-identity.json").read_text()),
+                identity,
+            )
 
     def test_setup_reinstalls_current_release_and_keeps_code_out_of_arguments(self) -> None:
         invite_code = "InviteCode_1234567890"
@@ -272,7 +369,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         enroll_calls = [arguments for arguments in calls if "enroll" in arguments]
         self.assertEqual(len(enroll_calls), 1)
         self.assertEqual(
-            enroll_calls[0][-6:],
+            enroll_calls[0][-7:],
             [
                 "work",
                 "enroll",
@@ -280,7 +377,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 str(ROOT.resolve()),
                 "--project",
                 "Builder Pulse",
+                "--replace-existing",
             ],
+        )
+        self.assertTrue(
+            any(arguments[-4:] == ["config", "set", "enabled", "false"] for arguments in calls)
         )
         self.assertTrue(
             any(arguments[-4:] == ["config", "set", "enabled", "true"] for arguments in calls)
@@ -385,7 +486,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             any("claim" in arguments for arguments in (call.args[0] for call in run.call_args_list))
         )
 
-    def test_existing_claim_repair_rejects_new_invite_or_missing_install(self) -> None:
+    def test_existing_claim_repair_rejects_new_invite_or_missing_identity(self) -> None:
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
             self.assertRaisesRegex(setup_builder_pulse.SetupError, "must not use"),
@@ -410,7 +511,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
             mock.patch.object(
                 setup_builder_pulse, "verified_rollback_source", return_value=None
             ),
-            self.assertRaisesRegex(setup_builder_pulse.SetupError, "requires an installed"),
+            mock.patch.object(
+                setup_builder_pulse, "existing_plugin_data_dir", return_value=ROOT
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "authoritative_identity", return_value={}
+            ),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "fully claimed"),
         ):
             setup_builder_pulse.setup(
                 "",
@@ -698,6 +805,163 @@ class SetupBuilderPulseTests(unittest.TestCase):
             expected_commit=TARGET_COMMIT,
         )
         restore.assert_called_once_with(rollback)
+
+    def test_retry_recovers_identity_after_target_and_rollback_both_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = (Path(directory) / "builder-pulse-data").resolve()
+            data_dir.mkdir()
+            identity = {
+                "installationId": "installation-1",
+                "scopeSecret": "a" * 64,
+                "installationToken": "delivery-token",
+                "builderId": "builder-1",
+                "memberId": "member-1",
+                "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+                "promptCapture": "on",
+            }
+            (data_dir / "identity.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
+            (data_dir / "config.json").write_text(
+                '{"enabled":true}', encoding="utf-8"
+            )
+            rollback = setup_builder_pulse.RollbackSource(
+                "0.4.5",
+                "b" * 40,
+                setup_builder_pulse.REPOSITORY,
+            )
+            cli = ROOT / "scripts" / "builder_pulse.py"
+            install_attempt = 0
+            commands: list[list[str]] = []
+
+            def install_release(_release, *, expected_commit=None):
+                nonlocal install_attempt
+                self.assertEqual(expected_commit, TARGET_COMMIT)
+                install_attempt += 1
+                if install_attempt == 1:
+                    raise setup_builder_pulse.SetupError("target install failed")
+                return cli
+
+            def run_command(arguments, *, env=None, expect_json=False):
+                del env, expect_json
+                commands.append(arguments)
+                return ""
+
+            with (
+                mock.patch.object(
+                    setup_builder_pulse.shutil, "which", return_value="ok"
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verify_release_exists",
+                    return_value=TARGET_COMMIT,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_builder",
+                    side_effect=[{"version": "0.4.5"}, None],
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "marketplace_state",
+                    side_effect=[
+                        {
+                            "marketplaceSource": {
+                                "source": setup_builder_pulse.REPOSITORY
+                            }
+                        },
+                        None,
+                    ],
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_rollback_source",
+                    side_effect=[rollback, None],
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "existing_plugin_data_dir",
+                    return_value=data_dir,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "pause_server_capture",
+                    return_value=True,
+                ) as server_pause,
+                mock.patch.object(setup_builder_pulse, "remove_current"),
+                mock.patch.object(setup_builder_pulse, "cleanup_partial"),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_release",
+                    side_effect=install_release,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_verified_rollback",
+                    side_effect=setup_builder_pulse.SetupError("rollback failed"),
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "plugin_data_dir",
+                    return_value=data_dir,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "claimed_identity",
+                    return_value={
+                        "installationId": "installation-1",
+                        "builderId": "builder-1",
+                        "memberId": "member-1",
+                    },
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "activate",
+                    return_value={
+                        "activationReady": True,
+                        "hooksTrusted": True,
+                        "serverVerified": True,
+                    },
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "run_command",
+                    side_effect=run_command,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "previous version could not be restored",
+                ):
+                    setup_builder_pulse.setup(
+                        "InviteCode_1234567890",
+                        setup_builder_pulse.DEFAULT_ENDPOINT,
+                        ROOT,
+                        "Builder Pulse",
+                    )
+
+                self.assertTrue((data_dir / "setup-paused-identity.json").exists())
+                self.assertNotIn(
+                    "installationToken",
+                    json.loads((data_dir / "identity.json").read_text()),
+                )
+
+                # This models a fresh process after both package paths vanished.
+                setup_builder_pulse.setup(
+                    "",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                    ROOT,
+                    "Builder Pulse",
+                    reuse_existing_claim=True,
+                )
+
+            self.assertEqual(server_pause.call_count, 2)
+            self.assertFalse((data_dir / "setup-paused-identity.json").exists())
+            self.assertEqual(
+                json.loads((data_dir / "identity.json").read_text()),
+                identity,
+            )
+            self.assertFalse(any("claim" in command for command in commands))
 
     def test_partial_removal_failure_repins_the_exact_previous_commit(self) -> None:
         rollback = setup_builder_pulse.RollbackSource(

@@ -73,7 +73,7 @@ project ID are sent with events.
 The local setup is complete only when the installer prints:
 
 ```text
-Builder Pulse is installed and its hooks are trusted. Only the confirmed project folder is enrolled. Exit all running Codex sessions, start a fresh Codex session, then send one normal prompt to verify server receipt.
+Builder Pulse is installed and its hooks are trusted. The prior project allowlist was replaced; only the confirmed project folder is enrolled. Exit all running Codex sessions, start a fresh Codex session, then send one normal prompt to verify server receipt.
 ```
 
 For every additional folder, run the installed script interactively. It shows

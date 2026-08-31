@@ -224,7 +224,7 @@ def installed_cli(installation: dict[str, Any]) -> Path:
     raise SetupError("The existing Builder Pulse script could not be located safely")
 
 
-def plugin_data_dir(cli: Path) -> Path:
+def configured_plugin_data_dir() -> Path | None:
     explicit = os.environ.get("BUILDER_PULSE_DATA_DIR")
     if explicit:
         return Path(explicit).expanduser().resolve(strict=False)
@@ -233,6 +233,23 @@ def plugin_data_dir(cli: Path) -> Path:
     )
     if plugin_data:
         return Path(plugin_data).expanduser().resolve(strict=False)
+    return None
+
+
+def canonical_plugin_data_dir() -> Path:
+    configured = configured_plugin_data_dir()
+    if configured is not None:
+        return configured
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    return (
+        codex_home / "plugins" / "data" / f"builder-pulse-{MARKETPLACE}"
+    ).expanduser().resolve(strict=False)
+
+
+def plugin_data_dir(cli: Path) -> Path:
+    configured = configured_plugin_data_dir()
+    if configured is not None:
+        return configured
     plugin_root = cli.parent.parent.resolve(strict=False)
     try:
         cache_dir = plugin_root.parent.parent.parent
@@ -247,6 +264,12 @@ def plugin_data_dir(cli: Path) -> Path:
     except (IndexError, OSError):
         pass
     raise SetupError("The existing Builder Pulse data directory could not be derived safely")
+
+
+def existing_plugin_data_dir(installation: dict[str, Any] | None) -> Path:
+    if installation is None:
+        return canonical_plugin_data_dir()
+    return plugin_data_dir(installed_cli(installation))
 
 
 def authoritative_identity(data_dir: Path) -> dict[str, Any]:
@@ -267,25 +290,86 @@ def authoritative_identity(data_dir: Path) -> dict[str, Any]:
     return current
 
 
+def pause_server_capture(identity: dict[str, Any], plugin_version: str) -> bool:
+    """Create a server barrier before legacy processes lose local credentials."""
+    token = identity.get("installationToken")
+    endpoint = identity.get("claimedEndpoint")
+    installation_id = identity.get("installationId")
+    present = [
+        isinstance(token, str) and bool(token),
+        isinstance(endpoint, str) and bool(endpoint),
+        isinstance(installation_id, str) and bool(installation_id),
+    ]
+    if not any(present):
+        return False
+    if not all(present):
+        raise SetupError("The existing Builder Pulse delivery identity is incomplete")
+    payload = json.dumps(
+        {
+            "installationId": installation_id,
+            "pluginVersion": plugin_version,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urlrequest.Request(
+        f"{str(endpoint).rstrip('/')}/v1/privacy-pause",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"builder-pulse-installer/{TARGET_RELEASE.removeprefix('v')}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError(
+            "GrowthX could not pause the existing Builder Pulse installation safely"
+        ) from exc
+    if len(raw) > 65_536:
+        raise SetupError("GrowthX returned an invalid Builder Pulse privacy-pause response")
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError(
+            "GrowthX returned an invalid Builder Pulse privacy-pause response"
+        ) from exc
+    if not (
+        isinstance(result, dict)
+        and result.get("paused") is True
+        and result.get("installationId") == installation_id
+    ):
+        raise SetupError("GrowthX did not confirm the Builder Pulse privacy pause")
+    return True
+
+
 def pause_existing_capture(
     installation: dict[str, Any] | None,
-) -> PausedCapture | None:
-    if installation is None:
-        return None
-    cli = installed_cli(installation)
-    data_dir = plugin_data_dir(cli)
+) -> PausedCapture:
+    data_dir = existing_plugin_data_dir(installation)
     identity_path = data_dir / "identity.json"
     paused_path = data_dir / "setup-paused-identity.json"
     config_path = data_dir / "config.json"
 
-    # Remove the authentication token while the old package is still present.
-    # This stops both network delivery and local prompt queueing even when an
-    # old session inherited BUILDER_PULSE_ENABLED=1. The complete identity is
-    # retained locally and restored only after v0.4.6 is installed.
+    identity = authoritative_identity(data_dir)
+    installed_version = (
+        installation.get("version") if isinstance(installation, dict) else None
+    )
+    pause_server_capture(
+        identity,
+        str(installed_version or TARGET_RELEASE.removeprefix("v")),
+    )
+
+    # The server barrier above rejects an old process that already cached this
+    # token. The local quarantine then stops new delivery and queueing even when
+    # no plugin is currently registered or an old session inherited an enable
+    # environment override. The complete identity is restored only after the
+    # verified replacement is installed disabled.
     with exclusive_file_lock(data_dir / ".delivery.lock"):
         with exclusive_file_lock(data_dir / ".scope-delivery.lock"):
             with exclusive_file_lock(data_dir / ".lock"):
-                identity = authoritative_identity(data_dir)
                 if identity and not paused_path.exists():
                     atomic_write_object(paused_path, identity)
                 paused_identity = dict(identity)
@@ -785,11 +869,8 @@ def setup(
     rollback_source = verified_rollback_source(previous, previous_marketplace)
     preserved_identity: dict[str, str] | None = None
     if reuse_existing_claim:
-        if previous is None:
-            raise SetupError("Existing-claim repair requires an installed Builder Pulse")
-        previous_cli = installed_cli(previous)
         preserved_identity = local_claimed_identity_fields(
-            authoritative_identity(plugin_data_dir(previous_cli))
+            authoritative_identity(existing_plugin_data_dir(previous))
         )
 
     # Stop older machine-wide capture without executing the old checkout. The
@@ -815,6 +896,9 @@ def setup(
                 ) from rollback_error
         raise
 
+    # A bare package is inert. Preserve that state while restoring or claiming
+    # identity and replacing the project allowlist.
+    run_command(cli_command(cli, "config", "set", "enabled", "false"))
     restore_paused_identity(cli, paused)
     if reuse_existing_claim:
         if claimed_identity(cli) != preserved_identity:
@@ -835,6 +919,7 @@ def setup(
             str(enrolled_root),
             "--project",
             confirmed_label,
+            "--replace-existing",
         )
     )
     run_command(cli_command(cli, "config", "set", "enabled", "true"))
@@ -933,7 +1018,8 @@ def main() -> int:
         return 1
     print(
         "Builder Pulse is installed and its hooks are trusted. "
-        "Only the confirmed project folder is enrolled. "
+        "The prior project allowlist was replaced; only the confirmed project "
+        "folder is enrolled. "
         "Exit all running Codex sessions, start a fresh Codex session, "
         "then send one normal prompt to verify server receipt."
     )

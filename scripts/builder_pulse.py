@@ -2494,14 +2494,18 @@ def command_work(args: argparse.Namespace, data_dir: Path) -> int:
             with scope_delivery_lock(data_dir):
                 with data_lock(data_dir):
                     contexts = load_work_contexts(data_dir)
-                    if overlapping_enrollment(contexts, key, ancestor_keys):
+                    replace_existing = bool(
+                        getattr(args, "replace_existing", False)
+                    )
+                    candidate_contexts = {} if replace_existing else contexts
+                    if overlapping_enrollment(candidate_contexts, key, ancestor_keys):
                         print(
                             "Work context error: this folder overlaps an already "
                             "enrolled project; enroll only one project boundary",
                             file=sys.stderr,
                         )
                         return 2
-                    existing = contexts.get(key, {})
+                    existing = {} if replace_existing else contexts.get(key, {})
                     # Contexts written before explicit project enrollment had no
                     # member-confirmed project label. Do not revive a legacy feature
                     # label merely because its old path hash happens to match the
@@ -2525,7 +2529,15 @@ def command_work(args: argparse.Namespace, data_dir: Path) -> int:
                     scoped["project_id"] = project_id
                     scoped["project_label"] = project_label
                     scoped["ancestor_keys"] = ancestor_keys
-                    contexts[key] = scoped
+                    if replace_existing:
+                        discard_all_pending_data_unlocked(data_dir)
+                        try:
+                            (data_dir / "quarantine.jsonl").unlink()
+                        except FileNotFoundError:
+                            pass
+                        contexts = {key: scoped}
+                    else:
+                        contexts[key] = scoped
                     atomic_write_json(path, contexts)
                     if previous_scope_key and not unchanged_scope:
                         discard_project_scope_data_unlocked(
@@ -3044,11 +3056,9 @@ def verify_hook_launcher(data_dir: Path) -> dict[str, Any]:
     environment["BUILDER_PULSE_DATA_DIR"] = str(data_dir)
     if os.name == "nt":
         environment["PLUGIN_ROOT"] = str(PLUGIN_ROOT)
-        # Pass the command line through verbatim on Windows.  A Python argv
-        # sequence escapes the embedded quotes with backslashes; cmd.exe does
-        # not treat those backslashes as quote escapes and tries to execute a
-        # filename that literally contains quote characters.
-        command = 'cmd /d /c call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"'
+        # Expand PLUGIN_ROOT exactly once. CALL reparses the expanded path and
+        # corrupts legal roots containing paired percent tokens such as %TEAM%.
+        command = 'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""'
     else:
         command = ["sh", str(PLUGIN_ROOT / "scripts" / "builder_pulse.sh")]
     try:
@@ -3235,6 +3245,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     work_enroll.add_argument(
         "--project-id", help="Optional stable project identifier"
+    )
+    work_enroll.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="Replace the project allowlist with only this confirmed folder",
     )
     work_unenroll = work_sub.add_parser(
         "unenroll", help="Stop telemetry for one project folder"
