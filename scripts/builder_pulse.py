@@ -3044,12 +3044,11 @@ def verify_hook_launcher(data_dir: Path) -> dict[str, Any]:
     environment["BUILDER_PULSE_DATA_DIR"] = str(data_dir)
     if os.name == "nt":
         environment["PLUGIN_ROOT"] = str(PLUGIN_ROOT)
-        command = [
-            "cmd",
-            "/d",
-            "/c",
-            'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
-        ]
+        # Pass the command line through verbatim on Windows.  A Python argv
+        # sequence escapes the embedded quotes with backslashes; cmd.exe does
+        # not treat those backslashes as quote escapes and tries to execute a
+        # filename that literally contains quote characters.
+        command = 'cmd /d /c call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"'
     else:
         command = ["sh", str(PLUGIN_ROOT / "scripts" / "builder_pulse.sh")]
     try:
