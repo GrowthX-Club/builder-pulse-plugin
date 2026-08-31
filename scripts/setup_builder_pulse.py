@@ -189,38 +189,44 @@ def installed_cli(installation: dict[str, Any]) -> Path:
         for character in version
     ):
         raise SetupError("Codex reported an invalid Builder Pulse version")
-    candidates: list[Path] = []
+    def verified_cli(plugin_root: Path) -> Path | None:
+        cli = plugin_root / "scripts" / "builder_pulse.py"
+        if not cli.is_file():
+            return None
+        manifest = plugin_root / ".codex-plugin" / "plugin.json"
+        try:
+            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            isinstance(manifest_data, dict)
+            and manifest_data.get("version") == version.removeprefix("v")
+        ):
+            return cli
+        return None
+
     installed_path = installation.get("installedPath")
     if isinstance(installed_path, str) and installed_path:
-        candidates.append(
+        reported_cli = verified_cli(
             Path(installed_path).expanduser().resolve(strict=False)
-            / "scripts"
-            / "builder_pulse.py"
         )
+        if reported_cli is not None:
+            return reported_cli
+
+    # Only consult the user-home fallback when Codex did not report a usable
+    # absolute installation path. Some restricted Windows environments omit
+    # HOME and USERPROFILE, but a valid installedPath is still sufficient.
     codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    candidates.append(
+    fallback_cli = verified_cli(
         codex_home
         / "plugins"
         / "cache"
         / MARKETPLACE
         / "builder-pulse"
         / version.removeprefix("v")
-        / "scripts"
-        / "builder_pulse.py"
     )
-    for cli in candidates:
-        if not cli.is_file():
-            continue
-        manifest = cli.parent.parent / ".codex-plugin" / "plugin.json"
-        try:
-            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(manifest_data, dict)
-            and manifest_data.get("version") == version.removeprefix("v")
-        ):
-            return cli
+    if fallback_cli is not None:
+        return fallback_cli
     raise SetupError("The existing Builder Pulse script could not be located safely")
 
 
