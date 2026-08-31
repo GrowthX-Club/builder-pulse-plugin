@@ -3181,8 +3181,9 @@ class HookManifestTests(unittest.TestCase):
         wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
         contents = wrapper.read_text(encoding="utf-8")
         self.assertIn('py -3 "%~dp0builder_pulse.py" hook', contents)
-        self.assertIn('sys.version_info < (3, 11)', contents)
-        self.assertNotIn('sys.version_info ^< (3, 11)', contents)
+        self.assertIn('sys.version_info.minor in range(11, 100)', contents)
+        self.assertNotIn('sys.version_info <', contents)
+        self.assertNotIn('sys.version_info ^<', contents)
 
     def test_platform_hook_launcher_really_starts_and_returns_valid_hook_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

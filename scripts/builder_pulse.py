@@ -229,8 +229,11 @@ def data_lock(data_dir: Path) -> Iterable[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            # Do not read byte zero to initialize the lock file. Another
+            # Windows process may already hold a byte-range lock there, and a
+            # read then fails with PermissionError before LK_LOCK can wait.
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
@@ -261,8 +264,8 @@ def delivery_lease(data_dir: Path) -> Iterable[bool]:
             if os.name == "nt":
                 import msvcrt
 
-                handle.seek(0)
-                if handle.read(1) == b"":
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.seek(0)
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
@@ -298,8 +301,8 @@ def scope_delivery_lock(data_dir: Path) -> Iterable[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
@@ -328,8 +331,8 @@ def claim_lease(data_dir: Path) -> Iterable[None]:
         if os.name == "nt":
             import msvcrt
 
-            handle.seek(0)
-            if handle.read(1) == b"":
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
