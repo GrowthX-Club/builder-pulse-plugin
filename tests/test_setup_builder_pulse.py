@@ -249,6 +249,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     }
                 },
             ),
+            mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
             mock.patch.object(setup_builder_pulse, "remove_current"),
             mock.patch.object(setup_builder_pulse, "cleanup_partial") as cleanup,
             mock.patch.object(
@@ -385,9 +386,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
             self.assertFalse(setup_builder_pulse.approved_existing_repository(source))
 
     def test_setup_requires_a_confirmed_existing_project_and_name(self) -> None:
-        with self.assertRaisesRegex(
-            setup_builder_pulse.SetupError,
-            "member-confirmed Builder Pulse project folder",
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "member-confirmed Builder Pulse project folder",
+            ),
         ):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
@@ -396,9 +400,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "Builder Pulse",
             )
 
-        with self.assertRaisesRegex(
-            setup_builder_pulse.SetupError,
-            "confirmed Builder Pulse project folder does not exist",
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "confirmed Builder Pulse project folder does not exist",
+            ),
         ):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
@@ -407,9 +414,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "Builder Pulse",
             )
 
-        with self.assertRaisesRegex(
-            setup_builder_pulse.SetupError,
-            "confirmed Builder Pulse project name is invalid",
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "confirmed Builder Pulse project name is invalid",
+            ),
         ):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
