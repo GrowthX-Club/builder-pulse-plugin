@@ -9,9 +9,8 @@ Windows.
 
 ## Stable setup and update
 
-The permanent setup entrypoint is [SETUP.md](SETUP.md). Builder-facing prompts
-pin an immutable release and link to that release's guide instead of duplicating
-installation logic.
+Builder-facing prompts pin an immutable release and link to that release's
+copy of [SETUP.md](SETUP.md). Never bootstrap from a default-branch guide.
 
 ## Consent and data boundary
 
@@ -117,10 +116,14 @@ a member-confirmed local enrollment.
 
 ## Project enrollment and feature context
 
-Before enrollment, show the disclosure above, identify only the current working
-directory and, if different, its nearest repository root, and ask the member which exact folder or
-folders to monitor and what display name to use for each. Do not scan broadly or
-infer a project name from the folder, prompts, or roster metadata.
+Before enrollment, show the disclosure above. Do not ask for the folder or
+display name in a primary Codex conversation: an older hook may still capture
+that answer. Run `work enroll` interactively instead. Its local terminal prompt
+shows only the current working directory and, if different, its nearest Git
+repository root, then asks the member to confirm the exact boundary and type
+the display name GrowthX should receive. It never scans the home directory or
+recent projects, and it never infers a project name from a folder, prompt, or
+roster field.
 
 Use a concise, non-sensitive member-confirmed project name. Enrollment derives a
 stable sanitized project ID unless `--project-id` is supplied. Feature labels
@@ -128,7 +131,7 @@ are limited to 120 characters and never inferred from prompt text. The project
 and optional feature context is attached to both lifecycle and prompt events.
 
 ```bash
-<python> <plugin-root>/scripts/builder_pulse.py work enroll --root /confirmed/project-folder --project "GrowthX Community"
+<python> <plugin-root>/scripts/builder_pulse.py work enroll
 <python> <plugin-root>/scripts/builder_pulse.py work set --root /confirmed/project-folder --feature "Member search filters"
 
 <python> <plugin-root>/scripts/builder_pulse.py work show --root /confirmed/project-folder
@@ -142,6 +145,8 @@ display label changes. Without it, Builder Pulse derives a sanitized ID. Work
 context and lifecycle heartbeat are scoped to the exact enrolled folder, so a
 monorepo package does not implicitly enroll its siblings and concurrent projects
 do not inherit or suppress each other's project or feature state.
+Parent and child enrollment boundaries cannot overlap; the member must choose
+one deliberate boundary for a monorepo or package.
 On upgrade, an older context record remains inactive until that exact folder is
 explicitly enrolled with a display name. Its legacy feature label is cleared on
 first enrollment instead of being silently attributed to the confirmed project.
@@ -293,14 +298,16 @@ published GitHub Release. The release API response must report
 itself is not proof of immutability. The prepared installer performs both
 checks and fails closed if either one cannot be verified.
 
-The admin-provided claim command must use the installed plugin root; this build
-defaults to `https://precious-ant-429.convex.site`. To upgrade after an announced
-release, remove the configured marketplace, re-add it with the announced
-immutable tag, then run the same `codex plugin add` command. Exit every running
-Codex session before starting a fresh task so no process keeps the previous hook
-manifest or version path in memory. To pause
-without removing local identity, run `config set enabled false`. To uninstall,
-run `codex plugin remove builder-pulse`; uninstalling is not token revocation.
+The prepared installer defaults to `https://precious-ant-429.convex.site`. It
+records and remotely verifies the existing package's exact full commit before
+changing registration, then uses that commit—not a movable version tag—as the
+only rollback source. Exit every running Codex session before starting a fresh
+task so no process keeps the previous hook manifest or version path in memory.
+To pause without removing local identity or the project allowlist, run
+`config set enabled false`. Disable is serialized with final delivery, purges
+unsent lifecycle and prompt queues plus current local work state, and overrides
+a stale `BUILDER_PULSE_ENABLED=1` environment value. To uninstall, run
+`codex plugin remove builder-pulse`; uninstalling is not token revocation.
 
 For a replacement or second device, issue a new one-time invite for the same
 GrowthX member ID, claim on the new installation, and revoke the old installation

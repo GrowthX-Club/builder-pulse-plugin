@@ -8,10 +8,11 @@ import getpass
 import json
 import os
 from pathlib import Path, PurePath
+import re
 import shutil
 import subprocess
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -30,6 +31,7 @@ DEFAULT_ENDPOINT = "https://precious-ant-429.convex.site"
 RELEASE_API = (
     "https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/"
 )
+COMMITS_API = "https://api.github.com/repos/{repository}/commits/{commit}"
 SETUP_DISCLOSURE = (
     "Builder Pulse is installed machine-wide, but it sends data only from project "
     "folders you explicitly enroll. GrowthX stores the claimed member ID, name, email "
@@ -55,6 +57,12 @@ SETUP_DISCLOSURE = (
 
 class SetupError(RuntimeError):
     pass
+
+
+class RollbackSource(NamedTuple):
+    version: str
+    commit: str
+    repository: str
 
 
 def is_filesystem_root(path: PurePath) -> bool:
@@ -179,11 +187,136 @@ def approved_existing_repository(value: Any) -> bool:
     return isinstance(value, str) and value in APPROVED_EXISTING_REPOSITORIES
 
 
+def normalized_repository(value: str) -> str:
+    return value.removesuffix(".git").rstrip("/")
+
+
+def repository_slug(value: str) -> str:
+    normalized = normalized_repository(value)
+    prefix = "https://github.com/"
+    if not approved_existing_repository(value) or not normalized.startswith(prefix):
+        raise SetupError("The GrowthX marketplace source is not approved")
+    slug = normalized.removeprefix(prefix)
+    if slug not in {
+        "GrowthX-Club/builder-pulse-plugin",
+        "udayanwalvekar/builder-pulse-plugin",
+    }:
+        raise SetupError("The GrowthX marketplace source is not approved")
+    return slug
+
+
+def verified_git_checkout(root: Path) -> tuple[str, str]:
+    try:
+        resolved = root.expanduser().resolve(strict=True)
+        top_level = Path(
+            str(
+                run_command(
+                    ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"]
+                )
+            ).strip()
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise SetupError("The existing Builder Pulse checkout root is invalid") from exc
+    if top_level != resolved:
+        raise SetupError("The existing Builder Pulse checkout root is invalid")
+    repository = str(
+        run_command(["git", "-C", str(resolved), "remote", "get-url", "origin"])
+    ).strip()
+    if not approved_existing_repository(repository):
+        raise SetupError("The existing Builder Pulse checkout has an unapproved origin")
+    tracked_changes = str(
+        run_command(
+            [
+                "git",
+                "-C",
+                str(resolved),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ]
+        )
+    ).strip()
+    if tracked_changes:
+        raise SetupError("The existing Builder Pulse checkout has modified tracked files")
+    commit = str(
+        run_command(["git", "-C", str(resolved), "rev-parse", "HEAD"])
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SetupError("The existing Builder Pulse checkout commit is invalid")
+    return repository, commit
+
+
+def verify_remote_commit(repository: str, commit: str) -> None:
+    request = urlrequest.Request(
+        COMMITS_API.format(repository=repository_slug(repository), commit=commit),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "builder-pulse-installer",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=10) as response:
+            raw = response.read(65_537)
+    except (OSError, ValueError, urlerror.URLError) as exc:
+        raise SetupError("The previous Builder Pulse commit could not be verified") from exc
+    if len(raw) > 65_536:
+        raise SetupError("GitHub returned an invalid Builder Pulse commit response")
+    try:
+        commit_data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SetupError("GitHub returned an invalid Builder Pulse commit response") from exc
+    if not isinstance(commit_data, dict) or commit_data.get("sha") != commit:
+        raise SetupError("The previous Builder Pulse commit could not be verified")
+
+
+def verified_rollback_source(
+    installation: dict[str, Any] | None,
+    marketplace: dict[str, Any] | None,
+) -> RollbackSource | None:
+    if installation is None:
+        return None
+    version = installation.get("version")
+    if not isinstance(version, str) or not version:
+        raise SetupError("Codex reported an invalid previous Builder Pulse version")
+    installed_root = installed_cli(installation).parent.parent
+    repository, commit = verified_git_checkout(installed_root)
+
+    if marketplace is not None:
+        marketplace_root = marketplace.get("root")
+        if not isinstance(marketplace_root, str) or not marketplace_root:
+            raise SetupError("Codex did not report the GrowthX marketplace checkout")
+        marketplace_repository, marketplace_commit = verified_git_checkout(
+            Path(marketplace_root)
+        )
+        source = marketplace.get("marketplaceSource")
+        declared_repository = source.get("source") if isinstance(source, dict) else None
+        if (
+            not approved_existing_repository(declared_repository)
+            or normalized_repository(str(declared_repository))
+            != normalized_repository(marketplace_repository)
+        ):
+            raise SetupError(
+                "The GrowthX marketplace declaration and checkout provenance differ"
+            )
+        if (
+            normalized_repository(marketplace_repository)
+            != normalized_repository(repository)
+            or marketplace_commit != commit
+        ):
+            raise SetupError(
+                "The installed Builder Pulse package and marketplace provenance differ"
+            )
+
+    verify_remote_commit(repository, commit)
+    return RollbackSource(version.removeprefix("v"), commit, repository)
+
+
 def remove_current(
     *,
     plugin_installed: bool,
     marketplace_configured: bool,
-    rollback_version: str | None = None,
+    rollback_source: RollbackSource | None = None,
 ) -> None:
     plugin_removed = False
     if plugin_installed:
@@ -195,17 +328,14 @@ def remove_current(
                 ["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"]
             )
         except SetupError as removal_error:
-            if plugin_removed and rollback_version:
+            if plugin_removed and rollback_source is not None:
                 try:
-                    add_plugin_from_configured_marketplace(rollback_version)
-                except SetupError:
-                    try:
-                        install_release(f"v{rollback_version.removeprefix('v')}")
-                    except SetupError as rollback_error:
-                        raise SetupError(
-                            "Builder Pulse removal failed and the previous version "
-                            f"could not be restored: {rollback_error}"
-                        ) from rollback_error
+                    add_plugin_from_configured_marketplace(rollback_source.version)
+                except SetupError as rollback_error:
+                    raise SetupError(
+                        "Builder Pulse removal failed and the verified previous plugin "
+                        f"could not be restored: {rollback_error}"
+                    ) from rollback_error
             raise removal_error
 
 
@@ -235,21 +365,26 @@ def add_plugin_from_configured_marketplace(expected_version: str) -> Path:
     return cli
 
 
-def install_release(release: str) -> Path:
+def install_release(
+    release: str,
+    *,
+    expected_version: str | None = None,
+    repository: str = REPOSITORY,
+) -> Path:
     run_command(
         [
             "codex",
             "plugin",
             "marketplace",
             "add",
-            "GrowthX-Club/builder-pulse-plugin",
+            repository_slug(repository),
             "--ref",
             release,
             "--json",
         ]
     )
-    expected_version = release.removeprefix("v")
-    return add_plugin_from_configured_marketplace(expected_version)
+    package_version = expected_version or release.removeprefix("v")
+    return add_plugin_from_configured_marketplace(package_version)
 
 
 def cleanup_partial() -> None:
@@ -334,11 +469,33 @@ def activate(cli: Path) -> dict[str, Any]:
     raise SetupError(detail or "Builder Pulse activation failed")
 
 
+def claimed_identity(cli: Path) -> dict[str, str]:
+    status = run_command(
+        [sys.executable, str(cli), "status", "--json"], expect_json=True
+    )
+    identity = status.get("identity") if isinstance(status, dict) else None
+    if not isinstance(identity, dict):
+        raise SetupError("Builder Pulse status returned an invalid identity")
+    fields = {
+        key: identity.get(key)
+        for key in ("installationId", "builderId", "memberId")
+    }
+    if (
+        identity.get("claimed") is not True
+        or identity.get("tokenConfigured") is not True
+        or any(not isinstance(value, str) or not value for value in fields.values())
+    ):
+        raise SetupError("The existing Builder Pulse identity is not fully claimed")
+    return {key: str(value) for key, value in fields.items()}
+
+
 def setup(
     invite_code: str,
     endpoint: str,
     project_root: str | Path,
     project_label: str,
+    *,
+    reuse_existing_claim: bool = False,
 ) -> None:
     if sys.version_info < (3, 11):
         raise SetupError("Builder Pulse requires Python 3.11 or newer")
@@ -346,7 +503,9 @@ def setup(
         raise SetupError("Builder Pulse requires git")
     if shutil.which("codex") is None:
         raise SetupError("Builder Pulse requires Codex")
-    if len(invite_code) < 16 or len(invite_code) > 256:
+    if reuse_existing_claim and invite_code:
+        raise SetupError("Existing-claim repair must not use a new invite code")
+    if not reuse_existing_claim and (len(invite_code) < 16 or len(invite_code) > 256):
         raise SetupError("The Builder Pulse invite code is invalid")
     if not str(project_root).strip():
         raise SetupError("A member-confirmed Builder Pulse project folder is required")
@@ -371,7 +530,6 @@ def setup(
 
     verify_release_exists(TARGET_RELEASE)
     previous = installed_builder()
-    previous_version = previous.get("version") if previous else None
     previous_marketplace = marketplace_state()
     if previous_marketplace:
         source = previous_marketplace.get("marketplaceSource")
@@ -379,21 +537,35 @@ def setup(
         if not approved_existing_repository(repository):
             raise SetupError("The GrowthX marketplace name points to a different source")
 
+    # Resolve and remotely verify the exact currently installed commit before
+    # executing its pause command or changing either Codex registration. A tag
+    # is not rollback provenance because it may move later.
+    rollback_source = verified_rollback_source(previous, previous_marketplace)
+    preserved_identity: dict[str, str] | None = None
+    if reuse_existing_claim:
+        if previous is None:
+            raise SetupError("Existing-claim repair requires an installed Builder Pulse")
+        preserved_identity = claimed_identity(installed_cli(previous))
+
     # Stop older machine-wide capture before replacing its package. The new
     # release is enabled again only after an explicit project is enrolled.
     pause_existing_capture(previous)
     remove_current(
         plugin_installed=previous is not None,
         marketplace_configured=previous_marketplace is not None,
-        rollback_version=previous_version if isinstance(previous_version, str) else None,
+        rollback_source=rollback_source,
     )
     try:
         cli = install_release(TARGET_RELEASE)
     except SetupError:
         cleanup_partial()
-        if isinstance(previous_version, str) and previous_version:
+        if rollback_source is not None:
             try:
-                install_release(f"v{previous_version.removeprefix('v')}")
+                install_release(
+                    rollback_source.commit,
+                    expected_version=rollback_source.version,
+                    repository=rollback_source.repository,
+                )
             except SetupError as rollback_error:
                 raise SetupError(
                     "Builder Pulse update failed and the previous version could not be restored: "
@@ -401,12 +573,16 @@ def setup(
                 ) from rollback_error
         raise
 
-    claim_env = dict(os.environ)
-    claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
-    run_command(
-        [sys.executable, str(cli), "claim", "--endpoint", endpoint],
-        env=claim_env,
-    )
+    if reuse_existing_claim:
+        if claimed_identity(cli) != preserved_identity:
+            raise SetupError("The Builder Pulse identity changed during repair")
+    else:
+        claim_env = dict(os.environ)
+        claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
+        run_command(
+            [sys.executable, str(cli), "claim", "--endpoint", endpoint],
+            env=claim_env,
+        )
     run_command(
         [
             sys.executable,
@@ -454,20 +630,66 @@ def main() -> int:
     parser.add_argument("--code")
     parser.add_argument("--project-root")
     parser.add_argument("--project-label")
+    parser.add_argument(
+        "--reuse-existing-claim",
+        action="store_true",
+        help="Repair an already-claimed installation without a new invite",
+    )
     args = parser.parse_args()
     print(SETUP_DISCLOSURE, file=sys.stderr)
     invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE") or ""
-    if not invite_code and sys.stdin.isatty():
+    if not args.reuse_existing_claim and not invite_code and sys.stdin.isatty():
         invite_code = getpass.getpass("Builder Pulse invite code: ")
     project_root = args.project_root or ""
     project_label = args.project_label or ""
     if sys.stdin.isatty() and not project_root:
-        entered_root = input(f"Project folder to enroll [{Path.cwd()}]: ").strip()
-        project_root = entered_root or str(Path.cwd())
+        current_folder = Path.cwd().resolve(strict=False)
+        repository_root: Path | None = None
+        try:
+            detected = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(current_folder),
+                    "rev-parse",
+                    "--show-toplevel",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if detected.returncode == 0 and detected.stdout.strip():
+                candidate = Path(detected.stdout.strip()).resolve(strict=False)
+                if candidate.is_dir() and candidate != current_folder:
+                    repository_root = candidate
+        except (OSError, subprocess.SubprocessError):
+            repository_root = None
+        print(
+            "Builder Pulse project choices (shown only in this terminal):",
+            file=sys.stderr,
+        )
+        print(f"- Current folder: {current_folder}", file=sys.stderr)
+        if repository_root is not None:
+            print(
+                f"- Nearest Git repository root: {repository_root}",
+                file=sys.stderr,
+            )
+        entered_root = input(
+            "Which exact project folder should Builder Pulse monitor? "
+            f"[{current_folder}]: "
+        ).strip()
+        project_root = entered_root or str(current_folder)
     if sys.stdin.isatty() and not project_label:
         project_label = input("Project name GrowthX should display: ").strip()
     try:
-        setup(invite_code, args.endpoint, project_root, project_label)
+        setup(
+            invite_code,
+            args.endpoint,
+            project_root,
+            project_label,
+            reuse_existing_claim=args.reuse_existing_claim,
+        )
     except SetupError as exc:
         print(f"Builder Pulse setup failed safely: {exc}", file=sys.stderr)
         return 1

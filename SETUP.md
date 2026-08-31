@@ -1,7 +1,7 @@
-# Builder Pulse setup
+# Builder Pulse v0.4.6 setup
 
-This is the stable Builder Pulse install and update entrypoint. The handbook
-links here so it never needs to know a release number.
+This guide belongs to the immutable `v0.4.6` release. Run it only from the
+release-pinned URL. Do not use a guide or installer from a default branch.
 
 The installer targets the current stable release, preserves the existing plugin
 data directory, safely reverifies an existing GrowthX member identity, rolls
@@ -17,37 +17,51 @@ Builder Pulse is installed machine-wide, but it sends data only from project fol
 
 ## Run the installer
 
-Before any install or update, inspect only the current working directory and,
-if different, its nearest repository root. Tell the member both detected folders,
-then ask which exact folder or folders to enroll:
+Do not ask for a project folder or project name in the primary Codex
+conversation. An older machine-wide hook may still capture that answer. The
+installer collects the choice locally in the terminal, after showing only the
+current folder and, when different, its nearest Git repository root. It never
+scans the home directory or recent projects. The member must confirm the exact
+folder and type the display name GrowthX should receive; neither value is
+inferred from folder names, prompt text, or the roster's legacy
+`defaultProject` value.
 
-> Which project folder or folders should Builder Pulse monitor, and what display
-> name should GrowthX use for each? Reply `current project only — <name>` or list
-> each folder with its display name.
+Use Python 3.11+ (`python3` on macOS/Linux or `py -3` on Windows). Before
+executing repository code, verify the external release facts:
 
-Stop and wait for the answer. Do not scan the home directory, infer a name from
-the folder or prompt text, or reuse the roster's cohort/default-project value.
-Proceed only with existing folders and display names the member explicitly
-confirms. Never enroll the member's home directory, a parent of that home
-directory, or a filesystem root.
+1. `git ls-remote --exit-code --refs https://github.com/GrowthX-Club/builder-pulse-plugin.git refs/tags/v0.4.6`
+   must return exactly one tag ref.
+2. An unauthenticated `GET` to
+   `https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/v0.4.6`
+   must return `tag_name: "v0.4.6"`, `draft: false`, and `immutable: true`.
 
-Use Python 3.11+ (`python3` on macOS/Linux or `py -3` on Windows). Clone this
-repository to a temporary directory and run the installer for the first
-confirmed folder:
+Stop safely if either proof is unavailable. Create a fresh temporary directory,
+then clone only the verified tag with `--depth 1 --branch v0.4.6
+--single-branch`. Before running anything from the clone, require
+`git describe --tags --exact-match HEAD` to print `v0.4.6` and require the
+clone's `refs/tags/v0.4.6` object ID to equal the object ID returned by
+`ls-remote`. Run the installer interactively without project arguments:
 
 ```text
-<python> <temporary-repository>/scripts/setup_builder_pulse.py --project-root "<confirmed-folder>" --project-label "<confirmed-display-name>"
+<python> <temporary-v0.4.6-clone>/scripts/setup_builder_pulse.py
 ```
+
+For an already-claimed recovery that deliberately has no new invite, run the
+same command with `--reuse-existing-claim`. It fails closed unless a verified
+installed package reports a complete claimed identity, and it requires the
+same installation, builder, and GrowthX member IDs after replacement.
 
 The installer securely asks for the personalized handbook code without echoing
 it. A Codex agent that already received the code in its setup prompt may instead
 pass it only through the `BUILDER_PULSE_INVITE_CODE` environment variable for
 that process. Never print the code or place it in shell history.
 
-A Codex agent should create the temporary directory, clone
-`https://github.com/GrowthX-Club/builder-pulse-plugin.git` with `--depth 1`,
-run that one installer command, and delete only that temporary clone after it
-finishes. It must never delete Builder Pulse's Codex plugin data directory.
+A Codex agent should run the installer in an interactive local terminal so the
+folder, display name, and invite-code answers do not become primary Codex
+prompts. It may pass a code already present in the setup request only through
+the `BUILDER_PULSE_INVITE_CODE` environment of that one process; it must not
+echo the value. Delete only the temporary clone after setup finishes. Never
+delete Builder Pulse's Codex plugin data directory.
 When upgrading an existing installation, the installer pauses its old capture
 before replacing the package and enables capture again only after the confirmed
 project is enrolled.
@@ -62,15 +76,18 @@ The local setup is complete only when the installer prints:
 Builder Pulse is installed and its hooks are trusted. Only the confirmed project folder is enrolled. Exit all running Codex sessions, start a fresh Codex session, then send one normal prompt to verify server receipt.
 ```
 
-For every additional confirmed folder, use the installed script with:
+For every additional folder, run the installed script interactively. It shows
+the local current-folder/repository choices and asks for the exact folder and
+display name in the terminal:
 
 ```text
-<python> <installed-plugin>/scripts/builder_pulse.py work enroll --root "<confirmed-folder>" --project "<confirmed-display-name>"
+<python> <installed-plugin>/scripts/builder_pulse.py work enroll
 ```
 
-Verify each folder with `work show --root "<confirmed-folder>"` and the final
-count with `work list`. Do not enroll anything else. Updating from an older
-version preserves identity. The service rejects every unscoped payload,
+Run `work show` from each selected folder and verify the final count with
+`work list`. Do not enroll anything else. Parent/child enrollment boundaries
+cannot overlap; choose one deliberate boundary for a monorepo or package.
+Updating from an older version preserves identity. The service rejects every unscoped payload,
 including those from older plugin versions, so an old client stops reporting
 until this update and explicit enrollment are complete. Older context records remain inactive until the
 member explicitly enrolls that folder with a display name; the first explicit
@@ -79,6 +96,11 @@ legacy queued events and local state that lack explicit project scope.
 Each enrollment covers the confirmed folder and its descendants, including
 one package inside a monorepo and projects without a Git repository. It never
 widens a confirmed subfolder to the surrounding repository root.
+
+`config set enabled false` is an explicit global pause. It is serialized with
+delivery, deletes unsent lifecycle and prompt queues plus current local work
+states, and cannot be overridden by a stale `BUILDER_PULSE_ENABLED=1`
+environment variable. It preserves the claimed identity and project allowlist.
 
 Exit every running Codex session so no process keeps the previous hook manifest
 or version path in memory. Start a fresh Codex session, send one ordinary

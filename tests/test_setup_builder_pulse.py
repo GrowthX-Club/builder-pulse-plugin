@@ -43,6 +43,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--project-root", completed.stdout)
         self.assertIn("--project-label", completed.stdout)
+        self.assertIn("--reuse-existing-claim", completed.stdout)
 
     def test_existing_cli_prefers_codex_reported_install_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -91,6 +92,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
     def test_setup_reinstalls_current_release_and_keeps_code_out_of_arguments(self) -> None:
         invite_code = "InviteCode_1234567890"
         cli = ROOT / "scripts" / "builder_pulse.py"
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "a" * 40,
+            setup_builder_pulse.REPOSITORY,
+        )
 
         def run_command(arguments, *, env=None, expect_json=False):
             del expect_json
@@ -118,6 +124,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     }
                 },
             ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_rollback_source",
+                return_value=rollback,
+            ) as verified_rollback,
             mock.patch.object(setup_builder_pulse, "remove_current") as remove,
             mock.patch.object(
                 setup_builder_pulse, "pause_existing_capture"
@@ -147,8 +158,9 @@ class SetupBuilderPulseTests(unittest.TestCase):
         remove.assert_called_once_with(
             plugin_installed=True,
             marketplace_configured=True,
-            rollback_version="0.4.4",
+            rollback_source=rollback,
         )
+        verified_rollback.assert_called_once()
         pause.assert_called_once_with({"version": "0.4.4"})
         install.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
         activate.assert_called_once_with(cli)
@@ -171,6 +183,110 @@ class SetupBuilderPulseTests(unittest.TestCase):
             any(arguments[-4:] == ["config", "set", "enabled", "true"] for arguments in calls)
         )
         self.assertTrue(any(arguments[-1] == "flush" for arguments in calls))
+
+    def test_repair_reuses_and_rechecks_the_exact_existing_identity(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "a" * 40,
+            setup_builder_pulse.REPOSITORY,
+        )
+        identity = {
+            "installationId": "installation-1",
+            "builderId": "builder-1",
+            "memberId": "member-1",
+        }
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            self.assertNotIn("claim", arguments)
+            return ""
+
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_builder",
+                return_value={"version": "0.4.4"},
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "marketplace_state",
+                return_value={
+                    "marketplaceSource": {"source": setup_builder_pulse.REPOSITORY}
+                },
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_rollback_source",
+                return_value=rollback,
+            ),
+            mock.patch.object(setup_builder_pulse, "installed_cli", return_value=cli),
+            mock.patch.object(
+                setup_builder_pulse,
+                "claimed_identity",
+                side_effect=[identity, dict(identity)],
+            ) as claimed,
+            mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+            mock.patch.object(setup_builder_pulse, "remove_current"),
+            mock.patch.object(setup_builder_pulse, "install_release", return_value=cli),
+            mock.patch.object(
+                setup_builder_pulse,
+                "activate",
+                return_value={
+                    "activationReady": True,
+                    "hooksTrusted": True,
+                    "serverVerified": True,
+                },
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "run_command", side_effect=run_command
+            ) as run,
+        ):
+            setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+                reuse_existing_claim=True,
+            )
+
+        self.assertEqual(claimed.call_count, 2)
+        self.assertFalse(
+            any("claim" in arguments for arguments in (call.args[0] for call in run.call_args_list))
+        )
+
+    def test_existing_claim_repair_rejects_new_invite_or_missing_install(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "must not use"),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+                reuse_existing_claim=True,
+            )
+
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(setup_builder_pulse, "installed_builder", return_value=None),
+            mock.patch.object(setup_builder_pulse, "marketplace_state", return_value=None),
+            mock.patch.object(
+                setup_builder_pulse, "verified_rollback_source", return_value=None
+            ),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "requires an installed"),
+        ):
+            setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+                reuse_existing_claim=True,
+            )
 
     def test_setup_rejects_home_as_an_enrollment_root(self) -> None:
         with (
@@ -364,6 +480,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 )
 
     def test_failed_update_restores_previous_immutable_release(self) -> None:
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "b" * 40,
+            setup_builder_pulse.REPOSITORY,
+        )
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
             mock.patch.object(setup_builder_pulse, "verify_release_exists"),
@@ -382,6 +503,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_rollback_source",
+                return_value=rollback,
+            ),
             mock.patch.object(setup_builder_pulse, "remove_current"),
             mock.patch.object(setup_builder_pulse, "cleanup_partial") as cleanup,
             mock.patch.object(
@@ -404,7 +530,14 @@ class SetupBuilderPulseTests(unittest.TestCase):
         cleanup.assert_called_once_with()
         self.assertEqual(
             [call.args[0] for call in install.call_args_list],
-            [setup_builder_pulse.TARGET_RELEASE, "v0.4.4"],
+            [setup_builder_pulse.TARGET_RELEASE, rollback.commit],
+        )
+        self.assertEqual(
+            install.call_args_list[1].kwargs,
+            {
+                "expected_version": rollback.version,
+                "repository": rollback.repository,
+            },
         )
 
     def test_partial_removal_failure_restores_plugin_from_existing_marketplace(self) -> None:
@@ -446,7 +579,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     setup_builder_pulse.remove_current(
                         plugin_installed=True,
                         marketplace_configured=True,
-                        rollback_version="0.4.4",
+                        rollback_source=setup_builder_pulse.RollbackSource(
+                            "0.4.4",
+                            "c" * 40,
+                            setup_builder_pulse.REPOSITORY,
+                        ),
                     )
 
         self.assertTrue(state["plugin"])
@@ -516,6 +653,148 @@ class SetupBuilderPulseTests(unittest.TestCase):
             None,
         ):
             self.assertFalse(setup_builder_pulse.approved_existing_repository(source))
+
+    def test_verified_git_checkout_rejects_wrong_origin_or_tracked_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for outputs, message in (
+                (
+                    [str(root), "https://github.com/example/builder-pulse.git"],
+                    "unapproved origin",
+                ),
+                (
+                    [str(root), setup_builder_pulse.REPOSITORY, " M scripts/setup.py"],
+                    "modified tracked files",
+                ),
+            ):
+                with self.subTest(message=message), mock.patch.object(
+                    setup_builder_pulse,
+                    "run_command",
+                    side_effect=outputs,
+                ), self.assertRaisesRegex(setup_builder_pulse.SetupError, message):
+                    setup_builder_pulse.verified_git_checkout(root)
+
+    def test_verified_rollback_requires_matching_exact_checkouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed_cli = root / "installed" / "scripts" / "builder_pulse.py"
+            marketplace_root = root / "marketplace"
+            marketplace_root.mkdir()
+            installation = {"version": "0.4.4"}
+            marketplace = {
+                "root": str(marketplace_root),
+                "marketplaceSource": {
+                    "source": setup_builder_pulse.REPOSITORY,
+                },
+            }
+            with (
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_cli",
+                    return_value=installed_cli,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_git_checkout",
+                    side_effect=[
+                        (setup_builder_pulse.REPOSITORY, "a" * 40),
+                        (setup_builder_pulse.REPOSITORY, "b" * 40),
+                    ],
+                ),
+                mock.patch.object(
+                    setup_builder_pulse, "verify_remote_commit"
+                ) as remote,
+                self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "provenance differ",
+                ),
+            ):
+                setup_builder_pulse.verified_rollback_source(
+                    installation, marketplace
+                )
+            remote.assert_not_called()
+
+    def test_verified_rollback_pins_and_remotely_checks_full_commit(self) -> None:
+        commit = "d" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installed_cli = root / "installed" / "scripts" / "builder_pulse.py"
+            marketplace_root = root / "marketplace"
+            marketplace_root.mkdir()
+            with (
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_cli",
+                    return_value=installed_cli,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_git_checkout",
+                    side_effect=[
+                        (setup_builder_pulse.REPOSITORY, commit),
+                        (setup_builder_pulse.REPOSITORY, commit),
+                    ],
+                ),
+                mock.patch.object(
+                    setup_builder_pulse, "verify_remote_commit"
+                ) as remote,
+            ):
+                result = setup_builder_pulse.verified_rollback_source(
+                    {"version": "0.4.4"},
+                    {
+                        "root": str(marketplace_root),
+                        "marketplaceSource": {
+                            "source": setup_builder_pulse.REPOSITORY,
+                        },
+                    },
+                )
+
+        self.assertEqual(
+            result,
+            setup_builder_pulse.RollbackSource(
+                "0.4.4", commit, setup_builder_pulse.REPOSITORY
+            ),
+        )
+        remote.assert_called_once_with(setup_builder_pulse.REPOSITORY, commit)
+
+    def test_unverified_previous_package_stops_before_pause_or_removal(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_builder",
+                return_value={"version": "0.4.4"},
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "marketplace_state",
+                return_value={
+                    "root": str(ROOT),
+                    "marketplaceSource": {
+                        "source": setup_builder_pulse.REPOSITORY,
+                    },
+                },
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_rollback_source",
+                side_effect=setup_builder_pulse.SetupError("unverified previous"),
+            ),
+            mock.patch.object(setup_builder_pulse, "pause_existing_capture") as pause,
+            mock.patch.object(setup_builder_pulse, "remove_current") as remove,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError, "unverified previous"
+            ),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+        pause.assert_not_called()
+        remove.assert_not_called()
 
     def test_setup_requires_a_confirmed_existing_project_and_name(self) -> None:
         with (

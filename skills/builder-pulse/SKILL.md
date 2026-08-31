@@ -62,27 +62,33 @@ The claim must return `promptCapture: "on"` before prompt capture starts.
 
 ## Confirm and enroll projects
 
-Before any install, update, or recovery changes, inspect only the current
-working directory and, if different, its nearest repository root. Tell the user
-both detected folders, then ask exactly which folder or folders to enroll:
+Do not ask for the folder or display name in a primary Codex conversation. An
+older machine-wide hook may still capture that answer. Once the user has
+authorized setup or enrollment, run the CLI interactively in a local terminal.
+It displays only the current working folder and, when different, the nearest
+Git repository root, then asks locally:
 
-> Which project folder or folders should Builder Pulse monitor, and what display
-> name should GrowthX use for each? Reply `current project only — <name>` or list
-> each folder with its display name.
+> Which exact project folder should Builder Pulse monitor?
+>
+> What display name should GrowthX use for this project?
 
-Stop and wait. Do not scan the home directory, infer names from folder basenames
-or prompts, or reuse a server `defaultProject`; that field is cohort/roster
-metadata. Enroll only paths and labels the user explicitly confirms:
+Do not scan the home directory or recent projects, infer names from folder
+basenames or prompts, or reuse a server `defaultProject`; that field is
+cohort/roster metadata. The member's local answers are the confirmation.
 
 For an update or recovery install, verify both the exact Git tag and its
 published GitHub Release before replacing anything. Continue only when the
 release API reports the exact target `tag_name`, `draft: false`, and
 `immutable: true`; tag existence alone is not proof of immutability. The
 prepared installer performs both checks and fails closed.
+For recovery of an already-claimed installation, use the pinned installer with
+`--reuse-existing-claim`; never create or substitute an identity or invite. It
+verifies the old package provenance and exact identity before replacement and
+requires those identity fields to remain unchanged afterward.
 
 ```bash
-<python> <resolved-cli-path> work enroll --root <confirmed-folder> --project "<confirmed-name>"
-<python> <resolved-cli-path> work show --root <confirmed-folder>
+<python> <resolved-cli-path> work enroll
+<python> <resolved-cli-path> work show
 <python> <resolved-cli-path> work list
 ```
 
@@ -96,6 +102,9 @@ invalid enrollment targets. An older context without a member-confirmed project
 label stays inactive, and its legacy feature label is cleared on first explicit
 enrollment. To stop capture for a project, run
 `work unenroll --root <confirmed-folder>`.
+Parent and child enrollment boundaries cannot overlap; ask for one deliberate
+boundary by rerunning the same local enrollment command from the intended
+folder.
 
 ## Set feature context
 
@@ -137,6 +146,18 @@ Use an explicit mark only when the state is known:
 
 Allowed states are `building`, `testing`, `blocked`, and `ready`; `SessionEnd`
 sets `idle`. Do not infer that successful tests alone mean `ready`.
+
+## Pause capture
+
+```bash
+<python> <resolved-cli-path> config set enabled false
+```
+
+This is a global fail-closed pause. It is serialized with delivery, deletes
+unsent lifecycle and prompt queues plus current local work states, and cannot
+be overridden by a stale `BUILDER_PULSE_ENABLED=1` environment variable. It
+does not delete the claimed identity or project allowlist. Report the discarded
+counts printed by the command.
 
 ## Delivery
 

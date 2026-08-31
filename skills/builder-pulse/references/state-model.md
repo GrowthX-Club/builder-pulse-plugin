@@ -41,6 +41,21 @@ prompts and their feedback are retained for 60 days. The installation/member
 link, latest state, and compacted per-session, daily, and all-time token
 aggregates remain until GrowthX removes them.
 
+## Data labels
+
+| Data group | GrowthX receives | GrowthX does not receive |
+| --- | --- | --- |
+| Claimed identity | Member ID, name, email, optional roster/program default, installation ID, claim policy. | Local identity-file path or installation token in response bodies. |
+| Project context | Member-confirmed display name, sanitized stable project ID, `projectScope: "explicit"`. | Enrolled folder path or the private HMAC keys used to match it. |
+| Optional feature | Explicit feature display name and sanitized stable feature ID. | A feature inferred from prompts, commands, or folder names. |
+| Lifecycle | Hashed session ID, coarse state, event/activity timestamps, plugin version, optional five cumulative token counters. | Files, patches, commands, tool I/O, transcripts, assistant replies, paths, or environment variables. |
+| Prompt | The primary submitted prompt after local secret redaction and the 64 KiB bound, plus project/feature identifiers and redacted/truncated flags. | Tool-hook text, subagent/fork prompts, assistant replies, or transcript content. |
+
+The roster/program `defaultProject` is identity metadata only. It is never used
+as event project context. Legacy or incomplete events without both a
+member-confirmed `projectLabel` and `projectScope: "explicit"` are rejected,
+not relabeled.
+
 ## Exact telemetry contract
 
 Without a valid Codex token snapshot, `POST /v1/telemetry` preserves the exact
@@ -135,8 +150,9 @@ On a claimed primary `UserPromptSubmit`, `POST /v1/prompts` sends exactly:
 - boolean `redacted` and `truncated` flags.
 
 Before bounding, prompt text is scanned for high-confidence private-key blocks,
-Authorization/Bearer values, and common API-token formats. Recognized values
-are replaced. This is deliberately not described as complete secret detection.
+Authorization/Bearer values, common API-token formats, and labeled Builder
+Pulse invite-code forms used by older setup prompts. Recognized values are
+replaced. This is deliberately not described as complete secret detection.
 The event is stored in a separate bounded `prompt-outbox.jsonl`, created with
 mode `0600` before any prompt bytes are written. Network failures retain the
 same `promptId` for idempotent retry for at most 60 days; older local captures
@@ -184,8 +200,9 @@ confirmed by the member and must not be inferred from a folder basename, prompt
 content, or roster default. Feature labels are explicit and must not be inferred
 from prompt content.
 
-Project and feature overrides are keyed by a one-way hash of the exact enrolled
-folder. Full folder paths are not persisted or sent. There is no global project or
+Project and feature overrides are keyed by private HMACs of the exact enrolled
+folder and its ancestors so descendants can be matched without storing paths.
+Full folder paths are not persisted or sent. There is no global project or
 feature fallback. The v0.4.6 migration deletes ambiguous legacy queued records
 and local state that do not carry both `projectLabel` and
 `projectScope: "explicit"`; it preserves claimed identity and explicit

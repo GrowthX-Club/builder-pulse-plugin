@@ -42,6 +42,11 @@ class FakeResponse:
         return self._body if amount < 0 else self._body[:amount]
 
 
+class InteractiveInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class BuilderPulseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -386,6 +391,40 @@ class BuilderPulseTests(unittest.TestCase):
             response["telemetryReceivedSincePreviousActivation"], False
         )
         self.assertEqual(response["lastSignalPluginVersion"], "0.4.5")
+
+    def test_activate_rejects_boolean_receipt_without_current_version_evidence(
+        self,
+    ) -> None:
+        self.claim_locally()
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "inspect_codex_hooks",
+            return_value={
+                "ready": True,
+                "hookStatus": "trusted",
+                "hookCount": 5,
+            },
+        ), mock.patch.object(
+            builder_pulse,
+            "http_post_json",
+            return_value=(
+                True,
+                "delivered",
+                {
+                    "accepted": True,
+                    "telemetryReceived": True,
+                    "telemetryReceivedSincePreviousActivation": True,
+                    "lastSignalAt": 1_787_721_000_000,
+                    "lastSignalPluginVersion": "0.4.5",
+                },
+            ),
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(builder_pulse.command_activate(self.data_dir), 0)
+
+        response = json.loads(output.getvalue())
+        self.assertFalse(response["connected"])
+        self.assertTrue(response["telemetryReceivedSincePreviousActivation"])
 
     def test_activate_requires_official_codex_hook_review(self) -> None:
         self.claim_locally()
@@ -2380,6 +2419,113 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertNotIn(str(first_root), persisted)
         self.assertNotIn(str(second_root), persisted)
 
+    def test_work_enroll_prompts_locally_for_folder_and_display_name(self) -> None:
+        project_root = self.workspace / "prompted-project"
+        project_root.mkdir()
+        args = argparse.Namespace(
+            work_command="enroll",
+            project=None,
+            project_id=None,
+            root=None,
+        )
+        output = io.StringIO()
+        local_choices = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "stdin",
+            InteractiveInput(f"{project_root}\nConfirmed Product\n"),
+        ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(
+            local_choices
+        ):
+            self.assertEqual(builder_pulse.command_work(args, self.data_dir), 0)
+
+        key = builder_pulse.repository_key(self.data_dir, project_root)
+        context = builder_pulse.load_work_contexts(self.data_dir)[key]
+        self.assertEqual(context["project_label"], "Confirmed Product")
+        self.assertNotIn(
+            str(project_root),
+            (self.data_dir / "contexts.json").read_text(encoding="utf-8"),
+        )
+        self.assertIn("shown only in this terminal", local_choices.getvalue())
+        self.assertIn("Current folder", local_choices.getvalue())
+
+    def test_noninteractive_enrollment_requires_an_explicit_display_name(self) -> None:
+        project_root = self.workspace / "missing-label"
+        project_root.mkdir()
+        error = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO()), contextlib.redirect_stderr(
+            error
+        ):
+            result = builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project=None,
+                    project_id=None,
+                    root=str(project_root),
+                ),
+                self.data_dir,
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("project name is required", error.getvalue())
+
+    def test_nested_project_enrollments_are_rejected_in_both_directions(self) -> None:
+        parent = self.workspace / "nested-project"
+        child = parent / "package"
+        child.mkdir(parents=True)
+
+        for first, second in ((parent, child), (child, parent)):
+            with self.subTest(first=first.name):
+                builder_pulse.atomic_write_json(self.data_dir / "contexts.json", {})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        builder_pulse.command_work(
+                            argparse.Namespace(
+                                work_command="enroll",
+                                project="First boundary",
+                                project_id=None,
+                                root=str(first),
+                            ),
+                            self.data_dir,
+                        ),
+                        0,
+                    )
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error):
+                    result = builder_pulse.command_work(
+                        argparse.Namespace(
+                            work_command="enroll",
+                            project="Overlapping boundary",
+                            project_id=None,
+                            root=str(second),
+                        ),
+                        self.data_dir,
+                    )
+                self.assertEqual(result, 2)
+                self.assertIn("overlaps", error.getvalue())
+                self.assertEqual(len(builder_pulse.load_work_contexts(self.data_dir)), 1)
+
+    def test_unenrolling_a_child_never_removes_its_enrolled_parent(self) -> None:
+        parent = self.workspace / "parent-project"
+        child = parent / "src"
+        child.mkdir(parents=True)
+        self.enroll_project(parent)
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            result = builder_pulse.command_work(
+                argparse.Namespace(work_command="unenroll", root=str(child)),
+                self.data_dir,
+            )
+
+        self.assertEqual(result, 0)
+        response = json.loads(output.getvalue())
+        self.assertFalse(response["removed"])
+        self.assertTrue(response["enrolled"])
+        self.assertIn(
+            builder_pulse.repository_key(self.data_dir, parent),
+            builder_pulse.load_work_contexts(self.data_dir),
+        )
+
     def test_work_set_cannot_bypass_explicit_project_enrollment(self) -> None:
         project_root = self.workspace / "not-enrolled"
         project_root.mkdir()
@@ -3002,6 +3148,136 @@ class BuilderPulseTests(unittest.TestCase):
             )
         delivered.assert_not_called()
 
+    def test_disable_purges_pending_data_and_beats_a_stale_enable_environment(
+        self,
+    ) -> None:
+        self.claim_locally()
+        self.record(
+            {"hook_event_name": "SessionStart", "session_id": "disable-purge"},
+            1_787_721_000_000,
+        )
+        self.record_prompt(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "disable-prompt",
+                "prompt": "private pending prompt",
+            },
+            1_787_721_000_001,
+        )
+        output = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {"BUILDER_PULSE_ENABLED": "1"},
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(
+                builder_pulse.command_config(
+                    argparse.Namespace(
+                        config_command="set", key="enabled", value="false"
+                    ),
+                    self.data_dir,
+                ),
+                0,
+            )
+            self.assertFalse(builder_pulse.load_config(self.data_dir)["enabled"])
+
+        response = json.loads(output.getvalue())
+        self.assertGreaterEqual(response["discardedPendingOnDisable"]["lifecycle"], 1)
+        self.assertEqual(response["discardedPendingOnDisable"]["prompts"], 1)
+        self.assertEqual(builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"), [])
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"), []
+        )
+        self.assertEqual(list((self.data_dir / "states").glob("*.json")), [])
+
+    def test_disabled_flushes_and_final_delivery_never_call_the_network(self) -> None:
+        self.claim_locally()
+        event = self.record(
+            {"hook_event_name": "SessionStart", "session_id": "disabled-send"},
+            1_787_721_000_000,
+        )
+        assert event is not None
+        with contextlib.redirect_stdout(io.StringIO()):
+            builder_pulse.command_config(
+                argparse.Namespace(
+                    config_command="set", key="enabled", value="false"
+                ),
+                self.data_dir,
+            )
+        builder_pulse.atomic_write_jsonl(self.data_dir / "outbox.jsonl", [event])
+
+        with mock.patch.object(builder_pulse, "deliver_event") as delivered:
+            flush = builder_pulse.flush_outbox(self.data_dir, self.config)
+            direct = builder_pulse.deliver_scoped_record(
+                self.data_dir,
+                event,
+                self.config,
+                "a" * 64,
+                "https://pulse.example",
+                prompt=False,
+            )
+
+        self.assertEqual(flush["delivered"], 0)
+        self.assertEqual(flush["remaining"], 1)
+        self.assertEqual(direct, (False, "disabled"))
+        delivered.assert_not_called()
+
+    def test_disable_waits_for_an_in_flight_send_and_blocks_later_sends(self) -> None:
+        self.claim_locally()
+        event = self.record(
+            {"hook_event_name": "SessionStart", "session_id": "disable-race"},
+            1_787_721_000_000,
+        )
+        assert event is not None
+        send_started = threading.Event()
+        release_send = threading.Event()
+        disable_done = threading.Event()
+
+        def blocked_delivery(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+            send_started.set()
+            self.assertTrue(release_send.wait(timeout=2))
+            return True, "delivered"
+
+        def run_flush() -> None:
+            builder_pulse.flush_outbox(self.data_dir, self.config)
+
+        def run_disable() -> None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                builder_pulse.command_config(
+                    argparse.Namespace(
+                        config_command="set", key="enabled", value="false"
+                    ),
+                    self.data_dir,
+                )
+            disable_done.set()
+
+        with mock.patch.object(
+            builder_pulse, "deliver_event", side_effect=blocked_delivery
+        ):
+            flush_thread = threading.Thread(target=run_flush)
+            flush_thread.start()
+            self.assertTrue(send_started.wait(timeout=2))
+            disable_thread = threading.Thread(target=run_disable)
+            disable_thread.start()
+            self.assertFalse(disable_done.wait(timeout=0.1))
+            release_send.set()
+            flush_thread.join(timeout=10)
+            disable_thread.join(timeout=10)
+
+        self.assertTrue(disable_done.is_set())
+        with mock.patch.object(builder_pulse, "deliver_event") as delivered:
+            self.assertEqual(
+                builder_pulse.deliver_scoped_record(
+                    self.data_dir,
+                    event,
+                    self.config,
+                    "a" * 64,
+                    "https://pulse.example",
+                    prompt=False,
+                ),
+                (False, "disabled"),
+            )
+        delivered.assert_not_called()
+
     def test_scope_migration_discards_only_legacy_records_and_preserves_identity(self) -> None:
         self.claim_locally()
         identity_before = builder_pulse.identity_path(self.data_dir).read_bytes()
@@ -3173,9 +3449,10 @@ class HookManifestTests(unittest.TestCase):
             self.assertIn("builder_pulse.sh", hook["command"])
             self.assertEqual(
                 hook["commandWindows"],
-                'cd /d "%PLUGIN_ROOT%"&&scripts\\builder_pulse.cmd',
+                'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
             )
             self.assertNotIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
+            self.assertNotIn("cd /d", hook["commandWindows"])
 
     def test_windows_hook_wrapper_quotes_the_python_script_path(self) -> None:
         wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
@@ -3189,6 +3466,53 @@ class HookManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = builder_pulse.verify_hook_launcher(Path(directory))
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+
+    def test_windows_launcher_verification_uses_the_registered_root_command(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "{}\n", "")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            builder_pulse.os, "name", "nt"
+        ), mock.patch.object(
+            builder_pulse.subprocess, "run", return_value=completed
+        ) as run:
+            result = builder_pulse.verify_hook_launcher(Path(directory))
+
+        self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+        command = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertEqual(
+            command,
+            [
+                "cmd",
+                "/d",
+                "/c",
+                'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+            ],
+        )
+        self.assertNotIn("/s", command)
+        self.assertEqual(options["env"]["PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
+        self.assertNotIn("cwd", options)
+
+    def test_windows_launcher_supports_a_unc_plugin_root_without_changing_cwd(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess([], 0, "{}\n", "")
+        unc_root = Path(r"\\server\share\builder pulse")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            builder_pulse.os, "name", "nt"
+        ), mock.patch.object(
+            builder_pulse, "PLUGIN_ROOT", unc_root
+        ), mock.patch.object(
+            builder_pulse.subprocess, "run", return_value=completed
+        ) as run:
+            result = builder_pulse.verify_hook_launcher(Path(directory))
+
+        self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+        self.assertEqual(
+            run.call_args.args[0][-1],
+            'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+        )
+        self.assertEqual(run.call_args.kwargs["env"]["PLUGIN_ROOT"], str(unc_root))
+        self.assertNotIn("cwd", run.call_args.kwargs)
 
     def test_activation_stops_before_the_server_when_launcher_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
