@@ -3465,6 +3465,45 @@ class HookManifestTests(unittest.TestCase):
     def test_platform_hook_launcher_really_starts_and_returns_valid_hook_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = builder_pulse.verify_hook_launcher(Path(directory))
+            if result != {"ready": True, "hookStatus": "launcher_verified"} and os.name == "nt":
+                environment = dict(os.environ)
+                environment["BUILDER_PULSE_DATA_DIR"] = directory
+                environment["PLUGIN_ROOT"] = str(builder_pulse.PLUGIN_ROOT)
+                completed = subprocess.run(
+                    [
+                        "cmd",
+                        "/d",
+                        "/c",
+                        'call "%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+                    ],
+                    input="{}\n",
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    timeout=5,
+                    check=False,
+                )
+                probes = []
+                for command in (["py", "-3", "--version"], ["python", "--version"], ["python3", "--version"]):
+                    try:
+                        probe = subprocess.run(
+                            command,
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                            check=False,
+                        )
+                        probes.append(
+                            (command, probe.returncode, probe.stdout, probe.stderr)
+                        )
+                    except OSError as error:
+                        probes.append((command, None, "", type(error).__name__))
+                self.fail(
+                    "Windows hook launcher diagnostic: "
+                    f"result={result!r}; returncode={completed.returncode}; "
+                    f"stdout={completed.stdout!r}; stderr={completed.stderr!r}; "
+                    f"sys.executable={sys.executable!r}; probes={probes!r}"
+                )
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
 
     def test_windows_launcher_verification_uses_the_registered_root_command(self) -> None:
