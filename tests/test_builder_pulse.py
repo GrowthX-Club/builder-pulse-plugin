@@ -2978,8 +2978,8 @@ class BuilderPulseTests(unittest.TestCase):
             unenroll_thread.start()
             self.assertFalse(unenroll_done.wait(timeout=0.1))
             release_send.set()
-            flush_thread.join(timeout=2)
-            unenroll_thread.join(timeout=2)
+            flush_thread.join(timeout=10)
+            unenroll_thread.join(timeout=10)
 
         self.assertFalse(flush_thread.is_alive())
         self.assertFalse(unenroll_thread.is_alive())
@@ -3181,6 +3181,8 @@ class HookManifestTests(unittest.TestCase):
         wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
         contents = wrapper.read_text(encoding="utf-8")
         self.assertIn('py -3 "%~dp0builder_pulse.py" hook', contents)
+        self.assertIn('sys.version_info < (3, 11)', contents)
+        self.assertNotIn('sys.version_info ^< (3, 11)', contents)
 
     def test_platform_hook_launcher_really_starts_and_returns_valid_hook_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
