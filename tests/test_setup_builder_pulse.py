@@ -25,6 +25,8 @@ assert BUILDER_SPEC is not None and BUILDER_SPEC.loader is not None
 builder_pulse = importlib.util.module_from_spec(BUILDER_SPEC)
 BUILDER_SPEC.loader.exec_module(builder_pulse)
 
+TARGET_COMMIT = "e" * 40
+
 
 class SetupBuilderPulseTests(unittest.TestCase):
     def test_standalone_installer_uses_the_canonical_privacy_disclosure(self) -> None:
@@ -44,6 +46,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
         self.assertIn("--project-root", completed.stdout)
         self.assertIn("--project-label", completed.stdout)
         self.assertIn("--reuse-existing-claim", completed.stdout)
+
+    def test_plugin_cli_runs_without_local_or_site_import_shadowing(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        self.assertEqual(
+            setup_builder_pulse.cli_command(cli, "status", "--json"),
+            [sys.executable, "-I", "-S", str(cli), "status", "--json"],
+        )
 
     def test_existing_cli_prefers_codex_reported_install_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +98,93 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     {"version": "0.4.4", "installedPath": str(root)}
                 )
 
+    def test_pause_quarantines_credentials_even_when_legacy_env_enables_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_root = Path(directory) / "plugins"
+            plugin_root = (
+                codex_root
+                / "cache"
+                / setup_builder_pulse.MARKETPLACE
+                / "builder-pulse"
+                / "0.4.5"
+            )
+            (plugin_root / "scripts").mkdir(parents=True)
+            cli = plugin_root / "scripts" / "builder_pulse.py"
+            cli.touch()
+            (plugin_root / ".codex-plugin").mkdir()
+            (plugin_root / ".codex-plugin" / "plugin.json").write_text(
+                '{"version":"0.4.5"}', encoding="utf-8"
+            )
+            data_dir = (
+                codex_root
+                / "data"
+                / f"builder-pulse-{setup_builder_pulse.MARKETPLACE}"
+            )
+            data_dir.mkdir(parents=True)
+            identity = {
+                "installationId": "installation-1",
+                "scopeSecret": "scope-secret",
+                "installationToken": "delivery-token",
+                "pendingInstallationToken": "pending-token",
+                "builderId": "builder-1",
+                "memberId": "member-1",
+                "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+                "promptCapture": "on",
+            }
+            (data_dir / "identity.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
+            (data_dir / "config.json").write_text(
+                '{"enabled":true}', encoding="utf-8"
+            )
+            for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
+                (data_dir / filename).write_text("{}\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                setup_builder_pulse.os.environ,
+                {"BUILDER_PULSE_ENABLED": "1"},
+                clear=True,
+            ):
+                paused = setup_builder_pulse.pause_existing_capture(
+                    {"version": "0.4.5", "installedPath": str(plugin_root)}
+                )
+
+                self.assertIsNotNone(paused)
+                assert paused is not None
+                self.assertEqual(paused.identity, identity)
+                active_identity = json.loads(
+                    (data_dir / "identity.json").read_text(encoding="utf-8")
+                )
+                self.assertNotIn("installationToken", active_identity)
+                self.assertNotIn("pendingInstallationToken", active_identity)
+                self.assertEqual(active_identity["promptCapture"], "off")
+                self.assertFalse(
+                    builder_pulse.load_config(data_dir)["enabled"],
+                    "a legacy enable environment must not defeat the persisted pause",
+                )
+                self.assertEqual(
+                    json.loads(
+                        (data_dir / "setup-paused-identity.json").read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                    identity,
+                )
+                for filename in (
+                    "outbox.jsonl",
+                    "prompt-outbox.jsonl",
+                    "quarantine.jsonl",
+                ):
+                    self.assertFalse((data_dir / filename).exists())
+
+                setup_builder_pulse.restore_paused_identity(cli, paused)
+
+            self.assertEqual(
+                json.loads((data_dir / "identity.json").read_text(encoding="utf-8")),
+                identity,
+            )
+            self.assertFalse((data_dir / "setup-paused-identity.json").exists())
+
     def test_setup_reinstalls_current_release_and_keeps_code_out_of_arguments(self) -> None:
         invite_code = "InviteCode_1234567890"
         cli = ROOT / "scripts" / "builder_pulse.py"
@@ -109,7 +205,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
-            mock.patch.object(setup_builder_pulse, "verify_release_exists") as verify,
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ) as verify,
             mock.patch.object(
                 setup_builder_pulse,
                 "installed_builder",
@@ -131,7 +231,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             ) as verified_rollback,
             mock.patch.object(setup_builder_pulse, "remove_current") as remove,
             mock.patch.object(
-                setup_builder_pulse, "pause_existing_capture"
+                setup_builder_pulse, "pause_existing_capture", return_value=None
             ) as pause,
             mock.patch.object(setup_builder_pulse, "install_release", return_value=cli) as install,
             mock.patch.object(
@@ -162,7 +262,10 @@ class SetupBuilderPulseTests(unittest.TestCase):
         )
         verified_rollback.assert_called_once()
         pause.assert_called_once_with({"version": "0.4.4"})
-        install.assert_called_once_with(setup_builder_pulse.TARGET_RELEASE)
+        install.assert_called_once_with(
+            setup_builder_pulse.TARGET_RELEASE,
+            expected_commit=TARGET_COMMIT,
+        )
         activate.assert_called_once_with(cli)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
@@ -195,6 +298,15 @@ class SetupBuilderPulseTests(unittest.TestCase):
             "installationId": "installation-1",
             "builderId": "builder-1",
             "memberId": "member-1",
+            "installationToken": "token-1",
+            "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+        }
+        status_identity = {
+            "claimed": True,
+            "tokenConfigured": True,
+            "installationId": "installation-1",
+            "builderId": "builder-1",
+            "memberId": "member-1",
         }
 
         def run_command(arguments, *, env=None, expect_json=False):
@@ -204,7 +316,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
-            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
             mock.patch.object(
                 setup_builder_pulse,
                 "installed_builder",
@@ -225,10 +341,22 @@ class SetupBuilderPulseTests(unittest.TestCase):
             mock.patch.object(setup_builder_pulse, "installed_cli", return_value=cli),
             mock.patch.object(
                 setup_builder_pulse,
+                "plugin_data_dir",
+                return_value=ROOT,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "authoritative_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
                 "claimed_identity",
-                side_effect=[identity, dict(identity)],
+                return_value=setup_builder_pulse.claimed_identity_fields(status_identity),
             ) as claimed,
-            mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+            mock.patch.object(
+                setup_builder_pulse, "pause_existing_capture", return_value=None
+            ),
             mock.patch.object(setup_builder_pulse, "remove_current"),
             mock.patch.object(setup_builder_pulse, "install_release", return_value=cli),
             mock.patch.object(
@@ -252,7 +380,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 reuse_existing_claim=True,
             )
 
-        self.assertEqual(claimed.call_count, 2)
+        self.assertEqual(claimed.call_count, 1)
         self.assertFalse(
             any("claim" in arguments for arguments in (call.args[0] for call in run.call_args_list))
         )
@@ -272,7 +400,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
-            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
             mock.patch.object(setup_builder_pulse, "installed_builder", return_value=None),
             mock.patch.object(setup_builder_pulse, "marketplace_state", return_value=None),
             mock.patch.object(
@@ -336,15 +468,26 @@ class SetupBuilderPulseTests(unittest.TestCase):
             }
         ).encode("utf-8")
 
-        with mock.patch.object(setup_builder_pulse, "run_command") as run, \
+        with mock.patch.object(
+            setup_builder_pulse,
+            "run_command",
+            return_value=(
+                f"{'a' * 40}\trefs/tags/v0.4.6\n"
+                f"{TARGET_COMMIT}\trefs/tags/v0.4.6^{{}}\n"
+            ),
+        ) as run, \
             mock.patch.object(
                 setup_builder_pulse.urlrequest,
                 "urlopen",
                 return_value=response,
             ) as opened:
-            setup_builder_pulse.verify_release_exists("v0.4.6")
+            result = setup_builder_pulse.verify_release_exists("v0.4.6")
 
-        self.assertEqual(run.call_args.args[0][-1], "refs/tags/v0.4.6")
+        self.assertEqual(result, TARGET_COMMIT)
+        self.assertEqual(run.call_args.args[0][-2:], [
+            "refs/tags/v0.4.6",
+            "refs/tags/v0.4.6^{}",
+        ])
         request = opened.call_args.args[0]
         self.assertEqual(
             request.full_url,
@@ -362,7 +505,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
             }
         ).encode("utf-8")
 
-        with mock.patch.object(setup_builder_pulse, "run_command"), \
+        with mock.patch.object(
+            setup_builder_pulse,
+            "run_command",
+            return_value=f"{TARGET_COMMIT}\trefs/tags/v0.4.6\n",
+        ), \
             mock.patch.object(
                 setup_builder_pulse.urlrequest,
                 "urlopen",
@@ -400,14 +547,22 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     mock.patch.object(
                         setup_builder_pulse.shutil, "which", return_value="ok"
                     ),
-                    mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+                    mock.patch.object(
+                        setup_builder_pulse,
+                        "verify_release_exists",
+                        return_value=TARGET_COMMIT,
+                    ),
                     mock.patch.object(
                         setup_builder_pulse, "installed_builder", return_value=None
                     ),
                     mock.patch.object(
                         setup_builder_pulse, "marketplace_state", return_value=None
                     ),
-                    mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+                    mock.patch.object(
+                        setup_builder_pulse,
+                        "pause_existing_capture",
+                        return_value=None,
+                    ),
                     mock.patch.object(setup_builder_pulse, "remove_current"),
                     mock.patch.object(
                         setup_builder_pulse, "install_release", return_value=cli
@@ -434,6 +589,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 self.assertIn(
                     [
                         sys.executable,
+                        "-I",
+                        "-S",
                         str(cli),
                         "config",
                         "set",
@@ -487,7 +644,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
         )
         with (
             mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
-            mock.patch.object(setup_builder_pulse, "verify_release_exists"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
             mock.patch.object(
                 setup_builder_pulse,
                 "installed_builder",
@@ -502,7 +663,9 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     }
                 },
             ),
-            mock.patch.object(setup_builder_pulse, "pause_existing_capture"),
+            mock.patch.object(
+                setup_builder_pulse, "pause_existing_capture", return_value=None
+            ),
             mock.patch.object(
                 setup_builder_pulse,
                 "verified_rollback_source",
@@ -513,11 +676,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
             mock.patch.object(
                 setup_builder_pulse,
                 "install_release",
-                side_effect=[
-                    setup_builder_pulse.SetupError("update failed"),
-                    ROOT / "scripts" / "builder_pulse.py",
-                ],
+                side_effect=setup_builder_pulse.SetupError("update failed"),
             ) as install,
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_verified_rollback",
+                return_value=ROOT / "scripts" / "builder_pulse.py",
+            ) as restore,
         ):
             with self.assertRaisesRegex(setup_builder_pulse.SetupError, "update failed"):
                 setup_builder_pulse.setup(
@@ -528,66 +693,55 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 )
 
         cleanup.assert_called_once_with()
-        self.assertEqual(
-            [call.args[0] for call in install.call_args_list],
-            [setup_builder_pulse.TARGET_RELEASE, rollback.commit],
+        install.assert_called_once_with(
+            setup_builder_pulse.TARGET_RELEASE,
+            expected_commit=TARGET_COMMIT,
         )
-        self.assertEqual(
-            install.call_args_list[1].kwargs,
-            {
-                "expected_version": rollback.version,
-                "repository": rollback.repository,
-            },
+        restore.assert_called_once_with(rollback)
+
+    def test_partial_removal_failure_repins_the_exact_previous_commit(self) -> None:
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "c" * 40,
+            setup_builder_pulse.REPOSITORY,
         )
+        marketplace_removals = 0
 
-    def test_partial_removal_failure_restores_plugin_from_existing_marketplace(self) -> None:
-        state = {"plugin": True, "marketplace": True}
-        with tempfile.TemporaryDirectory() as directory:
-            plugin_root = Path(directory)
-            (plugin_root / "scripts").mkdir()
-            (plugin_root / "scripts" / "builder_pulse.py").touch()
-            (plugin_root / ".codex-plugin").mkdir()
-            (plugin_root / ".codex-plugin" / "plugin.json").write_text(
-                '{"version":"0.4.4"}',
-                encoding="utf-8",
-            )
-
-            def run_command(arguments, *, env=None, expect_json=False):
-                del env
-                if arguments[:3] == ["codex", "plugin", "remove"]:
-                    state["plugin"] = False
-                    return ""
-                if arguments[:4] == ["codex", "plugin", "marketplace", "remove"]:
-                    self.assertTrue(state["marketplace"])
+        def run_command(arguments, *, env=None, expect_json=False):
+            nonlocal marketplace_removals
+            del env, expect_json
+            if arguments[:3] == ["codex", "plugin", "remove"]:
+                return ""
+            if arguments[:4] == ["codex", "plugin", "marketplace", "remove"]:
+                marketplace_removals += 1
+                if marketplace_removals == 1:
                     raise setup_builder_pulse.SetupError("marketplace removal failed")
-                if arguments[:3] == ["codex", "plugin", "add"]:
-                    self.assertTrue(expect_json)
-                    self.assertTrue(state["marketplace"])
-                    state["plugin"] = True
-                    return {"installedPath": str(plugin_root)}
-                self.fail(f"Unexpected command: {arguments}")
+                return ""
+            self.fail(f"Unexpected command: {arguments}")
 
-            with mock.patch.object(
+        with (
+            mock.patch.object(
                 setup_builder_pulse,
                 "run_command",
                 side_effect=run_command,
-            ):
-                with self.assertRaisesRegex(
-                    setup_builder_pulse.SetupError,
-                    "marketplace removal failed",
-                ):
-                    setup_builder_pulse.remove_current(
-                        plugin_installed=True,
-                        marketplace_configured=True,
-                        rollback_source=setup_builder_pulse.RollbackSource(
-                            "0.4.4",
-                            "c" * 40,
-                            setup_builder_pulse.REPOSITORY,
-                        ),
-                    )
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_verified_rollback",
+            ) as restore,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "marketplace removal failed",
+            ),
+        ):
+            setup_builder_pulse.remove_current(
+                plugin_installed=True,
+                marketplace_configured=True,
+                rollback_source=rollback,
+            )
 
-        self.assertTrue(state["plugin"])
-        self.assertTrue(state["marketplace"])
+        self.assertEqual(marketplace_removals, 2)
+        restore.assert_called_once_with(rollback)
 
     def test_install_rejects_stale_package_version(self) -> None:
         add_response = {"installedPath": str(ROOT)}
@@ -613,6 +767,31 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "expected 0.4.6",
             ):
                 setup_builder_pulse.install_release("v0.4.6")
+
+    def test_install_rejects_a_checkout_that_is_not_the_verified_commit(self) -> None:
+        expected = "f" * 40
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        with (
+            mock.patch.object(setup_builder_pulse, "run_command", return_value=""),
+            mock.patch.object(
+                setup_builder_pulse,
+                "add_plugin_from_configured_marketplace",
+                return_value=cli,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_git_checkout",
+                return_value=(setup_builder_pulse.REPOSITORY, "a" * 40),
+            ),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "different provenance",
+            ),
+        ):
+            setup_builder_pulse.install_release(
+                "v0.4.6",
+                expected_commit=expected,
+            )
 
     def test_rejects_marketplace_name_pointing_to_another_repository(self) -> None:
         with (
@@ -654,7 +833,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         ):
             self.assertFalse(setup_builder_pulse.approved_existing_repository(source))
 
-    def test_verified_git_checkout_rejects_wrong_origin_or_tracked_changes(self) -> None:
+    def test_verified_git_checkout_rejects_wrong_origin_or_checkout_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             for outputs, message in (
@@ -664,7 +843,15 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 ),
                 (
                     [str(root), setup_builder_pulse.REPOSITORY, " M scripts/setup.py"],
-                    "modified tracked files",
+                    "modified, untracked, or ignored files",
+                ),
+                (
+                    [str(root), setup_builder_pulse.REPOSITORY, "?? urllib/"],
+                    "modified, untracked, or ignored files",
+                ),
+                (
+                    [str(root), setup_builder_pulse.REPOSITORY, "!! json.py"],
+                    "modified, untracked, or ignored files",
                 ),
             ):
                 with self.subTest(message=message), mock.patch.object(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -12,7 +13,8 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Any, NamedTuple
+import tempfile
+from typing import Any, Iterable, NamedTuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -65,6 +67,11 @@ class RollbackSource(NamedTuple):
     repository: str
 
 
+class PausedCapture(NamedTuple):
+    data_dir: Path
+    identity: dict[str, Any]
+
+
 def is_filesystem_root(path: PurePath) -> bool:
     return bool(path.anchor) and path == type(path)(path.anchor)
 
@@ -91,6 +98,73 @@ def run_command(
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise SetupError(f"{arguments[0]} returned invalid JSON") from exc
+
+
+def cli_command(cli: Path, *arguments: str) -> list[str]:
+    """Run a verified single-file CLI without local/site import shadowing."""
+    return [sys.executable, "-I", "-S", str(cli), *arguments]
+
+
+def read_object(path: Path, *, required: bool = False) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if required:
+            raise SetupError(f"Required Builder Pulse data is missing: {path.name}")
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SetupError(f"Builder Pulse data is invalid: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise SetupError(f"Builder Pulse data is invalid: {path.name}")
+    return value
+
+
+def atomic_write_object(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    try:
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(path: Path) -> Iterable[None]:
+    """Use the same one-byte lock protocol as every supported plugin release."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def installed_builder() -> dict[str, Any] | None:
@@ -150,19 +224,112 @@ def installed_cli(installation: dict[str, Any]) -> Path:
     raise SetupError("The existing Builder Pulse script could not be located safely")
 
 
-def pause_existing_capture(installation: dict[str, Any] | None) -> None:
-    if installation is None:
-        return
-    run_command(
-        [
-            sys.executable,
-            str(installed_cli(installation)),
-            "config",
-            "set",
-            "enabled",
-            "false",
-        ]
+def plugin_data_dir(cli: Path) -> Path:
+    explicit = os.environ.get("BUILDER_PULSE_DATA_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve(strict=False)
+    plugin_data = os.environ.get("PLUGIN_DATA") or os.environ.get(
+        "CLAUDE_PLUGIN_DATA"
     )
+    if plugin_data:
+        return Path(plugin_data).expanduser().resolve(strict=False)
+    plugin_root = cli.parent.parent.resolve(strict=False)
+    try:
+        cache_dir = plugin_root.parent.parent.parent
+        if (
+            cache_dir.name == "cache"
+            and plugin_root.parent.name == "builder-pulse"
+            and plugin_root.parent.parent.name == MARKETPLACE
+        ):
+            return (
+                cache_dir.parent / "data" / f"builder-pulse-{MARKETPLACE}"
+            ).resolve(strict=False)
+    except (IndexError, OSError):
+        pass
+    raise SetupError("The existing Builder Pulse data directory could not be derived safely")
+
+
+def authoritative_identity(data_dir: Path) -> dict[str, Any]:
+    paused_path = data_dir / "setup-paused-identity.json"
+    current_path = data_dir / "identity.json"
+    paused = read_object(paused_path) if paused_path.exists() else {}
+    current = read_object(current_path) if current_path.exists() else {}
+    if paused:
+        paused_installation = paused.get("installationId")
+        current_installation = current.get("installationId")
+        if (
+            isinstance(current_installation, str)
+            and current_installation
+            and current_installation != paused_installation
+        ):
+            raise SetupError("The paused Builder Pulse identity does not match local data")
+        return paused
+    return current
+
+
+def pause_existing_capture(
+    installation: dict[str, Any] | None,
+) -> PausedCapture | None:
+    if installation is None:
+        return None
+    cli = installed_cli(installation)
+    data_dir = plugin_data_dir(cli)
+    identity_path = data_dir / "identity.json"
+    paused_path = data_dir / "setup-paused-identity.json"
+    config_path = data_dir / "config.json"
+
+    # Remove the authentication token while the old package is still present.
+    # This stops both network delivery and local prompt queueing even when an
+    # old session inherited BUILDER_PULSE_ENABLED=1. The complete identity is
+    # retained locally and restored only after v0.4.6 is installed.
+    with exclusive_file_lock(data_dir / ".delivery.lock"):
+        with exclusive_file_lock(data_dir / ".scope-delivery.lock"):
+            with exclusive_file_lock(data_dir / ".lock"):
+                identity = authoritative_identity(data_dir)
+                if identity and not paused_path.exists():
+                    atomic_write_object(paused_path, identity)
+                paused_identity = dict(identity)
+                for key in ("installationToken", "pendingInstallationToken"):
+                    paused_identity.pop(key, None)
+                if paused_identity:
+                    paused_identity["promptCapture"] = "off"
+                    atomic_write_object(identity_path, paused_identity)
+
+                config = read_object(config_path) if config_path.exists() else {}
+                config["enabled"] = False
+                atomic_write_object(config_path, config)
+
+                # Queued machine-wide records cannot be safely attributed to the
+                # project the member is about to confirm.
+                for relative in (
+                    "outbox.jsonl",
+                    "prompt-outbox.jsonl",
+                    "quarantine.jsonl",
+                ):
+                    try:
+                        (data_dir / relative).unlink()
+                    except FileNotFoundError:
+                        pass
+    return PausedCapture(data_dir=data_dir, identity=identity)
+
+
+def restore_paused_identity(cli: Path, paused: PausedCapture | None) -> None:
+    if paused is None or not paused.identity:
+        return
+    target_data_dir = plugin_data_dir(cli)
+    if target_data_dir != paused.data_dir.resolve(strict=False):
+        raise SetupError("The replacement plugin resolved a different data directory")
+    paused_path = target_data_dir / "setup-paused-identity.json"
+    with exclusive_file_lock(target_data_dir / ".delivery.lock"):
+        with exclusive_file_lock(target_data_dir / ".scope-delivery.lock"):
+            with exclusive_file_lock(target_data_dir / ".lock"):
+                stored = read_object(paused_path, required=True)
+                if stored != paused.identity:
+                    raise SetupError(
+                        "The preserved Builder Pulse identity changed during repair"
+                    )
+                atomic_write_object(target_data_dir / "identity.json", stored)
+                paused_path.unlink()
 
 
 def marketplace_state() -> dict[str, Any] | None:
@@ -224,7 +391,7 @@ def verified_git_checkout(root: Path) -> tuple[str, str]:
     ).strip()
     if not approved_existing_repository(repository):
         raise SetupError("The existing Builder Pulse checkout has an unapproved origin")
-    tracked_changes = str(
+    checkout_changes = str(
         run_command(
             [
                 "git",
@@ -232,12 +399,15 @@ def verified_git_checkout(root: Path) -> tuple[str, str]:
                 str(resolved),
                 "status",
                 "--porcelain",
-                "--untracked-files=no",
+                "--ignored=matching",
+                "--untracked-files=all",
             ]
         )
     ).strip()
-    if tracked_changes:
-        raise SetupError("The existing Builder Pulse checkout has modified tracked files")
+    if checkout_changes:
+        raise SetupError(
+            "The existing Builder Pulse checkout has modified, untracked, or ignored files"
+        )
     commit = str(
         run_command(["git", "-C", str(resolved), "rev-parse", "HEAD"])
     ).strip().lower()
@@ -330,7 +500,20 @@ def remove_current(
         except SetupError as removal_error:
             if plugin_removed and rollback_source is not None:
                 try:
-                    add_plugin_from_configured_marketplace(rollback_source.version)
+                    # Do not trust a marketplace merely because it was exact
+                    # earlier. Remove it on a second attempt, then pin and
+                    # verify the full approved commit during restoration.
+                    run_command(
+                        [
+                            "codex",
+                            "plugin",
+                            "marketplace",
+                            "remove",
+                            MARKETPLACE,
+                            "--json",
+                        ]
+                    )
+                    install_verified_rollback(rollback_source)
                 except SetupError as rollback_error:
                     raise SetupError(
                         "Builder Pulse removal failed and the verified previous plugin "
@@ -370,6 +553,7 @@ def install_release(
     *,
     expected_version: str | None = None,
     repository: str = REPOSITORY,
+    expected_commit: str | None = None,
 ) -> Path:
     run_command(
         [
@@ -384,7 +568,25 @@ def install_release(
         ]
     )
     package_version = expected_version or release.removeprefix("v")
-    return add_plugin_from_configured_marketplace(package_version)
+    cli = add_plugin_from_configured_marketplace(package_version)
+    if expected_commit is not None:
+        installed_repository, installed_commit = verified_git_checkout(cli.parent.parent)
+        if (
+            normalized_repository(installed_repository)
+            != normalized_repository(repository)
+            or installed_commit != expected_commit
+        ):
+            raise SetupError("The installed Builder Pulse package has different provenance")
+    return cli
+
+
+def install_verified_rollback(source: RollbackSource) -> Path:
+    return install_release(
+        source.commit,
+        expected_version=source.version,
+        repository=source.repository,
+        expected_commit=source.commit,
+    )
 
 
 def cleanup_partial() -> None:
@@ -397,17 +599,36 @@ def cleanup_partial() -> None:
         pass
 
 
-def verify_release_exists(release: str) -> None:
-    run_command(
-        [
-            "git",
-            "ls-remote",
-            "--exit-code",
-            "--refs",
-            REPOSITORY,
-            f"refs/tags/{release}",
-        ]
+def verified_remote_tag_commit(release: str) -> str:
+    direct_ref = f"refs/tags/{release}"
+    peeled_ref = f"{direct_ref}^{{}}"
+    output = str(
+        run_command(
+            [
+                "git",
+                "ls-remote",
+                "--exit-code",
+                REPOSITORY,
+                direct_ref,
+                peeled_ref,
+            ]
+        )
     )
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-fA-F]{40}", fields[0]):
+            raise SetupError("GitHub returned an invalid Builder Pulse release tag")
+        if fields[1] in {direct_ref, peeled_ref}:
+            refs[fields[1]] = fields[0].lower()
+    commit = refs.get(peeled_ref) or refs.get(direct_ref)
+    if commit is None:
+        raise SetupError("The immutable Builder Pulse release tag could not be verified")
+    return commit
+
+
+def verify_release_exists(release: str) -> str:
+    commit = verified_remote_tag_commit(release)
     request = urlrequest.Request(
         f"{RELEASE_API}{release}",
         headers={
@@ -436,6 +657,7 @@ def verify_release_exists(release: str) -> None:
         raise SetupError(
             "Builder Pulse setup requires a published immutable GitHub release"
         )
+    return commit
 
 
 def parse_activation(output: str) -> dict[str, Any]:
@@ -450,7 +672,7 @@ def parse_activation(output: str) -> dict[str, Any]:
 
 def activate(cli: Path) -> dict[str, Any]:
     completed = subprocess.run(
-        [sys.executable, str(cli), "activate"],
+        cli_command(cli, "activate"),
         check=False,
         capture_output=True,
         text=True,
@@ -469,11 +691,7 @@ def activate(cli: Path) -> dict[str, Any]:
     raise SetupError(detail or "Builder Pulse activation failed")
 
 
-def claimed_identity(cli: Path) -> dict[str, str]:
-    status = run_command(
-        [sys.executable, str(cli), "status", "--json"], expect_json=True
-    )
-    identity = status.get("identity") if isinstance(status, dict) else None
+def claimed_identity_fields(identity: Any) -> dict[str, str]:
     if not isinstance(identity, dict):
         raise SetupError("Builder Pulse status returned an invalid identity")
     fields = {
@@ -487,6 +705,30 @@ def claimed_identity(cli: Path) -> dict[str, str]:
     ):
         raise SetupError("The existing Builder Pulse identity is not fully claimed")
     return {key: str(value) for key, value in fields.items()}
+
+
+def local_claimed_identity_fields(identity: Any) -> dict[str, str]:
+    if not isinstance(identity, dict):
+        raise SetupError("The existing Builder Pulse identity is invalid")
+    fields = {
+        key: identity.get(key)
+        for key in ("installationId", "builderId", "memberId")
+    }
+    if (
+        not isinstance(identity.get("installationToken"), str)
+        or not identity.get("installationToken")
+        or not isinstance(identity.get("claimedEndpoint"), str)
+        or not identity.get("claimedEndpoint")
+        or any(not isinstance(value, str) or not value for value in fields.values())
+    ):
+        raise SetupError("The existing Builder Pulse identity is not fully claimed")
+    return {key: str(value) for key, value in fields.items()}
+
+
+def claimed_identity(cli: Path) -> dict[str, str]:
+    status = run_command(cli_command(cli, "status", "--json"), expect_json=True)
+    identity = status.get("identity") if isinstance(status, dict) else None
+    return claimed_identity_fields(identity)
 
 
 def setup(
@@ -528,7 +770,7 @@ def setup(
             "its parents, or the filesystem root"
         )
 
-    verify_release_exists(TARGET_RELEASE)
+    target_commit = verify_release_exists(TARGET_RELEASE)
     previous = installed_builder()
     previous_marketplace = marketplace_state()
     if previous_marketplace:
@@ -538,34 +780,34 @@ def setup(
             raise SetupError("The GrowthX marketplace name points to a different source")
 
     # Resolve and remotely verify the exact currently installed commit before
-    # executing its pause command or changing either Codex registration. A tag
-    # is not rollback provenance because it may move later.
+    # reading its data or changing either Codex registration. A tag is not
+    # rollback provenance because it may move later.
     rollback_source = verified_rollback_source(previous, previous_marketplace)
     preserved_identity: dict[str, str] | None = None
     if reuse_existing_claim:
         if previous is None:
             raise SetupError("Existing-claim repair requires an installed Builder Pulse")
-        preserved_identity = claimed_identity(installed_cli(previous))
+        previous_cli = installed_cli(previous)
+        preserved_identity = local_claimed_identity_fields(
+            authoritative_identity(plugin_data_dir(previous_cli))
+        )
 
-    # Stop older machine-wide capture before replacing its package. The new
-    # release is enabled again only after an explicit project is enrolled.
-    pause_existing_capture(previous)
+    # Stop older machine-wide capture without executing the old checkout. The
+    # authentication token remains quarantined on any failed replacement, so
+    # an inherited legacy BUILDER_PULSE_ENABLED=1 cannot resume capture.
+    paused = pause_existing_capture(previous)
     remove_current(
         plugin_installed=previous is not None,
         marketplace_configured=previous_marketplace is not None,
         rollback_source=rollback_source,
     )
     try:
-        cli = install_release(TARGET_RELEASE)
+        cli = install_release(TARGET_RELEASE, expected_commit=target_commit)
     except SetupError:
         cleanup_partial()
         if rollback_source is not None:
             try:
-                install_release(
-                    rollback_source.commit,
-                    expected_version=rollback_source.version,
-                    repository=rollback_source.repository,
-                )
+                install_verified_rollback(rollback_source)
             except SetupError as rollback_error:
                 raise SetupError(
                     "Builder Pulse update failed and the previous version could not be restored: "
@@ -573,6 +815,7 @@ def setup(
                 ) from rollback_error
         raise
 
+    restore_paused_identity(cli, paused)
     if reuse_existing_claim:
         if claimed_identity(cli) != preserved_identity:
             raise SetupError("The Builder Pulse identity changed during repair")
@@ -580,24 +823,21 @@ def setup(
         claim_env = dict(os.environ)
         claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
         run_command(
-            [sys.executable, str(cli), "claim", "--endpoint", endpoint],
+            cli_command(cli, "claim", "--endpoint", endpoint),
             env=claim_env,
         )
     run_command(
-        [
-            sys.executable,
-            str(cli),
+        cli_command(
+            cli,
             "work",
             "enroll",
             "--root",
             str(enrolled_root),
             "--project",
             confirmed_label,
-        ]
+        )
     )
-    run_command(
-        [sys.executable, str(cli), "config", "set", "enabled", "true"]
-    )
+    run_command(cli_command(cli, "config", "set", "enabled", "true"))
     try:
         activation = activate(cli)
         if not (
@@ -610,12 +850,10 @@ def setup(
                     "Codex requires its official one-time Builder Pulse hook review"
                 )
             raise SetupError("Builder Pulse activation was not server-verified")
-        run_command([sys.executable, str(cli), "flush"])
+        run_command(cli_command(cli, "flush"))
     except SetupError as setup_error:
         try:
-            run_command(
-                [sys.executable, str(cli), "config", "set", "enabled", "false"]
-            )
+            run_command(cli_command(cli, "config", "set", "enabled", "false"))
         except SetupError as disable_error:
             raise SetupError(
                 f"{setup_error}; capture could not be disabled after failure: "
