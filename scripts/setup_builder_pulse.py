@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
+import http.client
 import json
 import os
 from pathlib import Path, PurePath
@@ -82,13 +83,16 @@ def run_command(
     env: dict[str, str] | None = None,
     expect_json: bool = False,
 ) -> Any:
-    completed = subprocess.run(
-        arguments,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        completed = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupError(f"Command could not start: {arguments[0]}") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise SetupError(detail or f"Command failed: {arguments[0]}")
@@ -301,14 +305,24 @@ def pause_server_capture(identity: dict[str, Any], plugin_version: str) -> bool:
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
     installation_id = identity.get("installationId")
-    present = [
-        isinstance(token, str) and bool(token),
-        isinstance(endpoint, str) and bool(endpoint),
-        isinstance(installation_id, str) and bool(installation_id),
-    ]
-    if not any(present):
+    token_present = token is not None
+    endpoint_present = endpoint is not None
+    if token_present != endpoint_present:
+        raise SetupError("The existing Builder Pulse delivery identity is incomplete")
+    if not token_present:
+        # A first claim whose response was lost has an installation ID and a
+        # pending token, but no finalized delivery credential pair. Preserve it
+        # for an idempotent retry; there is no authenticated server capture to
+        # pause yet.
         return False
-    if not all(present):
+    if not (
+        isinstance(token, str)
+        and token
+        and isinstance(endpoint, str)
+        and endpoint
+        and isinstance(installation_id, str)
+        and installation_id
+    ):
         raise SetupError("The existing Builder Pulse delivery identity is incomplete")
     payload = json.dumps(
         {
@@ -330,7 +344,12 @@ def pause_server_capture(identity: dict[str, Any], plugin_version: str) -> bool:
     try:
         with urlrequest.urlopen(request, timeout=10) as response:
             raw = response.read(65_537)
-    except (OSError, ValueError, urlerror.URLError) as exc:
+    except (
+        OSError,
+        ValueError,
+        urlerror.URLError,
+        http.client.HTTPException,
+    ) as exc:
         raise SetupError(
             "GrowthX could not pause the existing Builder Pulse installation safely"
         ) from exc
@@ -385,7 +404,12 @@ def resume_server_capture(identity: dict[str, Any], plugin_version: str) -> None
     try:
         with urlrequest.urlopen(request, timeout=10) as response:
             raw = response.read(65_537)
-    except (OSError, ValueError, urlerror.URLError) as exc:
+    except (
+        OSError,
+        ValueError,
+        urlerror.URLError,
+        http.client.HTTPException,
+    ) as exc:
         raise SetupError(
             "GrowthX could not resume the enrolled Builder Pulse installation safely"
         ) from exc
@@ -405,28 +429,11 @@ def resume_server_capture(identity: dict[str, Any], plugin_version: str) -> None
         raise SetupError("GrowthX did not confirm the Builder Pulse privacy resume")
 
 
-def pause_existing_capture(
-    installation: dict[str, Any] | None,
-) -> PausedCapture:
-    data_dir = existing_plugin_data_dir(installation)
+def quarantine_local_capture(data_dir: Path, identity: dict[str, Any]) -> None:
+    """Disable local capture and preserve any retryable identity atomically."""
     identity_path = data_dir / "identity.json"
     paused_path = data_dir / "setup-paused-identity.json"
     config_path = data_dir / "config.json"
-
-    identity = authoritative_identity(data_dir)
-    installed_version = (
-        installation.get("version") if isinstance(installation, dict) else None
-    )
-    pause_server_capture(
-        identity,
-        str(installed_version or TARGET_RELEASE.removeprefix("v")),
-    )
-
-    # The server barrier above rejects an old process that already cached this
-    # token. The local quarantine then stops new delivery and queueing even when
-    # no plugin is currently registered or an old session inherited an enable
-    # environment override. The complete identity is restored only after the
-    # verified replacement is installed disabled.
     with exclusive_file_lock(data_dir / ".delivery.lock"):
         with exclusive_file_lock(data_dir / ".scope-delivery.lock"):
             with exclusive_file_lock(data_dir / ".lock"):
@@ -454,6 +461,53 @@ def pause_existing_capture(
                         (data_dir / relative).unlink()
                     except FileNotFoundError:
                         pass
+
+
+def pause_existing_capture(
+    installation: dict[str, Any] | None,
+) -> PausedCapture:
+    data_dir = existing_plugin_data_dir(installation)
+    identity = authoritative_identity(data_dir)
+    installed_version = (
+        installation.get("version") if isinstance(installation, dict) else None
+    )
+    server_pause_error: BaseException | None = None
+    try:
+        pause_server_capture(
+            identity,
+            str(installed_version or TARGET_RELEASE.removeprefix("v")),
+        )
+    except BaseException as exc:
+        server_pause_error = exc
+
+    # Quarantine locally even when the server cannot acknowledge the barrier.
+    # This stops every new process and preserves pending first-claim tokens for
+    # an idempotent retry. A running legacy process may have cached a token, so
+    # the caller must stop until the server pause is known and old sessions exit.
+    try:
+        quarantine_local_capture(data_dir, identity)
+    except (OSError, SetupError) as exc:
+        detail = (
+            " GrowthX server privacy-pause status is also unknown."
+            if server_pause_error is not None
+            else ""
+        )
+        raise SetupError(
+            "Builder Pulse could not be disabled locally."
+            f"{detail} Exit all running Codex sessions now and do not continue "
+            "until setup is repaired."
+        ) from exc
+
+    if server_pause_error is not None:
+        detail = (
+            "GrowthX server privacy-pause status is unknown. Builder Pulse was "
+            "disabled locally and its pending queues were removed. Exit all "
+            "running Codex sessions now, then retry setup when the server is reachable."
+        )
+        if isinstance(server_pause_error, (KeyboardInterrupt, SystemExit)):
+            print(detail, file=sys.stderr)
+            raise server_pause_error
+        raise SetupError(detail) from server_pause_error
     return PausedCapture(data_dir=data_dir, identity=identity)
 
 
@@ -815,12 +869,15 @@ def parse_activation(output: str) -> dict[str, Any]:
 
 
 def activate(cli: Path) -> dict[str, Any]:
-    completed = subprocess.run(
-        cli_command(cli, "activate"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            cli_command(cli, "activate"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SetupError("Builder Pulse activation could not start") from exc
     output = completed.stdout.strip()
     if output:
         try:
@@ -984,7 +1041,10 @@ def setup(
     )
     target_plugin_version = TARGET_RELEASE.removeprefix("v")
     resume_attempted = False
-    delivery_identity = authoritative_identity(plugin_data_dir(cli))
+    delivery_data_dir = plugin_data_dir(cli)
+    delivery_identity = authoritative_identity(delivery_data_dir)
+    setup_succeeded = False
+    setup_failure: BaseException | None = None
     try:
         # A network failure can happen after the service commits the resume but
         # before this process receives the acknowledgement. Treat every attempt
@@ -1005,31 +1065,40 @@ def setup(
                 )
             raise SetupError("Builder Pulse activation was not server-verified")
         run_command(cli_command(cli, "flush"))
-    except SetupError as setup_error:
-        pause_error: SetupError | None = None
-        if resume_attempted:
+        setup_succeeded = True
+    except BaseException as exc:
+        setup_failure = exc
+        raise
+    finally:
+        cleanup_errors: list[str] = []
+        if not setup_succeeded and resume_attempted:
             try:
                 pause_server_capture(delivery_identity, target_plugin_version)
-            except SetupError as exc:
-                pause_error = exc
-        try:
-            run_command(cli_command(cli, "config", "set", "enabled", "false"))
-        except SetupError as disable_error:
-            pause_detail = (
-                f"; server capture could not be paused after failure: {pause_error}"
-                if pause_error is not None
-                else ""
+            except BaseException:
+                cleanup_errors.append("server privacy-pause status is unknown")
+        if not setup_succeeded:
+            try:
+                quarantine_local_capture(delivery_data_dir, delivery_identity)
+            except BaseException:
+                cleanup_errors.append("local capture could not be disabled")
+        if not setup_succeeded and cleanup_errors and not isinstance(
+            setup_failure, (KeyboardInterrupt, SystemExit)
+        ):
+            original = (
+                str(setup_failure)
+                if setup_failure is not None and str(setup_failure)
+                else "Builder Pulse setup did not complete"
             )
             raise SetupError(
-                f"{setup_error}{pause_detail}; capture could not be disabled after failure: "
-                f"{disable_error}"
-            ) from disable_error
-        if pause_error is not None:
-            raise SetupError(
-                f"{setup_error}; server capture could not be paused after failure: "
-                f"{pause_error}"
-            ) from pause_error
-        raise
+                f"{original}; " + "; ".join(cleanup_errors)
+            ) from setup_failure
+        if not setup_succeeded and cleanup_errors:
+            print(
+                "Builder Pulse emergency shutdown was incomplete: "
+                + "; ".join(cleanup_errors)
+                + ". Exit all running Codex sessions now.",
+                file=sys.stderr,
+            )
 
 
 def main() -> int:
@@ -1099,7 +1168,7 @@ def main() -> int:
             reuse_existing_claim=args.reuse_existing_claim,
         )
     except SetupError as exc:
-        print(f"Builder Pulse setup failed safely: {exc}", file=sys.stderr)
+        print(f"Builder Pulse setup stopped: {exc}", file=sys.stderr)
         return 1
     print(
         "Builder Pulse is installed and its hooks are trusted. "

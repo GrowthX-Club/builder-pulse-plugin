@@ -2558,6 +2558,102 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertFalse((self.data_dir / "quarantine.jsonl").exists())
         self.assertEqual(list(states.glob("*.json")), [])
 
+    def test_replace_existing_write_failure_preserves_old_scope_and_data(self) -> None:
+        first = self.workspace / "first-project"
+        confirmed = self.workspace / "confirmed-project"
+        first.mkdir()
+        confirmed.mkdir()
+        self.enroll_project(first, project_id="first", project_label="First")
+        original_contexts = builder_pulse.load_work_contexts(self.data_dir)
+        context_key, original_context = next(iter(original_contexts.items()))
+        scoped_record = {
+            "_contextKey": context_key,
+            "_scopeKey": original_context["scope_key"],
+            "projectId": original_context["project_id"],
+            "projectLabel": original_context["project_label"],
+            "projectScope": builder_pulse.PROJECT_SCOPE_POLICY,
+            "featureId": original_context["feature_id"],
+            "featureLabel": original_context["feature_label"],
+        }
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "outbox.jsonl",
+            [{**scoped_record, "eventId": "legacy"}],
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "prompt-outbox.jsonl",
+            [{**scoped_record, "promptId": "legacy"}],
+        )
+        builder_pulse.atomic_write_jsonl(
+            self.data_dir / "quarantine.jsonl", [{"eventId": "legacy"}]
+        )
+        states = self.data_dir / "states"
+        states.mkdir()
+        state_path = states / "legacy.json"
+        builder_pulse.atomic_write_json(
+            state_path,
+            {
+                "contextKey": context_key,
+                "scopeKey": original_context["scope_key"],
+                "projectId": original_context["project_id"],
+                "projectLabel": original_context["project_label"],
+                "projectScope": builder_pulse.PROJECT_SCOPE_POLICY,
+                "state": "building",
+            },
+        )
+        contexts_path = self.data_dir / "contexts.json"
+        real_atomic_write = builder_pulse.atomic_write_json
+
+        def fail_context_write(path: Path, value: object, mode: int = 0o600) -> None:
+            if path == contexts_path:
+                raise OSError("injected contexts write failure")
+            real_atomic_write(path, value, mode)
+
+        with (
+            mock.patch.object(
+                builder_pulse,
+                "atomic_write_json",
+                side_effect=fail_context_write,
+            ),
+            self.assertRaisesRegex(OSError, "injected contexts write failure"),
+        ):
+            builder_pulse.command_work(
+                argparse.Namespace(
+                    work_command="enroll",
+                    project="Confirmed Product",
+                    project_id=None,
+                    root=str(confirmed),
+                    replace_existing=True,
+                ),
+                self.data_dir,
+            )
+
+        self.assertEqual(
+            builder_pulse.load_work_contexts(self.data_dir), original_contexts
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "outbox.jsonl"),
+            [{**scoped_record, "eventId": "legacy"}],
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "prompt-outbox.jsonl"),
+            [{**scoped_record, "promptId": "legacy"}],
+        )
+        self.assertEqual(
+            builder_pulse.read_jsonl(self.data_dir / "quarantine.jsonl"),
+            [{"eventId": "legacy"}],
+        )
+        self.assertEqual(
+            builder_pulse.read_json(state_path, {}),
+            {
+                "contextKey": context_key,
+                "scopeKey": original_context["scope_key"],
+                "projectId": original_context["project_id"],
+                "projectLabel": original_context["project_label"],
+                "projectScope": builder_pulse.PROJECT_SCOPE_POLICY,
+                "state": "building",
+            },
+        )
+
     def test_unenrolling_a_child_never_removes_its_enrolled_parent(self) -> None:
         parent = self.workspace / "parent-project"
         child = parent / "src"

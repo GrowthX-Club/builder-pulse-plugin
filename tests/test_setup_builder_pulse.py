@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import http.client
 import importlib.util
+import io
 import json
 from pathlib import Path, PureWindowsPath
 import subprocess
@@ -237,6 +239,112 @@ class SetupBuilderPulseTests(unittest.TestCase):
         legacy_delivery_accepted = not server_state["paused"]
         self.assertFalse(legacy_delivery_accepted)
 
+    def test_pending_and_unclaimed_identities_survive_pause_for_claim_retry(self) -> None:
+        identities = (
+            {
+                "installationId": "installation-pending",
+                "scopeSecret": "a" * 64,
+                "pendingInstallationToken": "b" * 64,
+                "pendingEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+            },
+            {
+                "installationId": "installation-unclaimed",
+                "scopeSecret": "c" * 64,
+            },
+        )
+        for identity in identities:
+            with self.subTest(installation_id=identity["installationId"]):
+                with tempfile.TemporaryDirectory() as directory:
+                    data_dir = Path(directory).resolve()
+                    (data_dir / "identity.json").write_text(
+                        json.dumps(identity), encoding="utf-8"
+                    )
+                    (data_dir / "config.json").write_text(
+                        '{"enabled":true}', encoding="utf-8"
+                    )
+                    with mock.patch.object(
+                        setup_builder_pulse,
+                        "existing_plugin_data_dir",
+                        return_value=data_dir,
+                    ):
+                        paused = setup_builder_pulse.pause_existing_capture(None)
+
+                    self.assertEqual(paused.identity, identity)
+                    self.assertEqual(
+                        json.loads(
+                            (data_dir / "setup-paused-identity.json").read_text()
+                        ),
+                        identity,
+                    )
+                    active = json.loads((data_dir / "identity.json").read_text())
+                    self.assertNotIn("pendingInstallationToken", active)
+                    self.assertFalse(
+                        json.loads((data_dir / "config.json").read_text())["enabled"]
+                    )
+
+                    with mock.patch.object(
+                        setup_builder_pulse,
+                        "plugin_data_dir",
+                        return_value=data_dir,
+                    ):
+                        setup_builder_pulse.restore_paused_identity(
+                            ROOT / "scripts" / "builder_pulse.py", paused
+                        )
+                    self.assertEqual(
+                        json.loads((data_dir / "identity.json").read_text()),
+                        identity,
+                    )
+
+    def test_pause_network_failure_still_quarantines_locally_and_reports_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory).resolve()
+            identity = {
+                "installationId": "installation-1",
+                "scopeSecret": "a" * 64,
+                "installationToken": "delivery-token",
+                "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+                "promptCapture": "on",
+            }
+            (data_dir / "identity.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
+            (data_dir / "config.json").write_text(
+                '{"enabled":true}', encoding="utf-8"
+            )
+            for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
+                (data_dir / filename).write_text("{}\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "existing_plugin_data_dir",
+                    return_value=data_dir,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "pause_server_capture",
+                    side_effect=setup_builder_pulse.SetupError("network unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "status is unknown.*Exit all running Codex sessions",
+                ),
+            ):
+                setup_builder_pulse.pause_existing_capture(None)
+
+            active = json.loads((data_dir / "identity.json").read_text())
+            self.assertNotIn("installationToken", active)
+            self.assertEqual(active["promptCapture"], "off")
+            self.assertFalse(
+                json.loads((data_dir / "config.json").read_text())["enabled"]
+            )
+            self.assertEqual(
+                json.loads((data_dir / "setup-paused-identity.json").read_text()),
+                identity,
+            )
+            for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
+                self.assertFalse((data_dir / filename).exists())
+
     def test_server_resume_requires_the_exact_acknowledged_installation(self) -> None:
         identity = {
             "installationId": "installation-1",
@@ -273,6 +381,34 @@ class SetupBuilderPulseTests(unittest.TestCase):
         ):
             setup_builder_pulse.resume_server_capture(identity, "0.4.6")
 
+    def test_server_resume_normalizes_an_incomplete_http_response(self) -> None:
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "enrolled-token",
+            "claimedEndpoint": "https://pulse.example",
+        }
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = http.client.IncompleteRead(b"partial")
+        with (
+            mock.patch.object(
+                setup_builder_pulse.urlrequest,
+                "urlopen",
+                return_value=response,
+            ),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "could not resume",
+            ),
+        ):
+            setup_builder_pulse.resume_server_capture(identity, "0.4.6")
+
+    def test_server_resume_rejects_the_wrong_acknowledged_installation(self) -> None:
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "enrolled-token",
+            "claimedEndpoint": "https://pulse.example",
+        }
         response = mock.MagicMock()
         response.__enter__.return_value = response
         response.read.return_value = json.dumps(
@@ -772,6 +908,10 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         return_value=True,
                     ) as server_pause,
                     mock.patch.object(
+                        setup_builder_pulse,
+                        "quarantine_local_capture",
+                    ) as local_quarantine,
+                    mock.patch.object(
                         setup_builder_pulse, "activate", side_effect=activate
                     ),
                     mock.patch.object(
@@ -812,6 +952,14 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     },
                     "0.4.6",
                 )
+                local_quarantine.assert_called_once_with(
+                    ROOT,
+                    {
+                        "installationId": "installation-1",
+                        "installationToken": "token-1",
+                        "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+                    },
+                )
 
     def test_resume_and_repause_fail_closed(self) -> None:
         cli = ROOT / "scripts" / "builder_pulse.py"
@@ -843,7 +991,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 expected_error = (
                     "resume rejected"
                     if failure == "resume"
-                    else "server capture could not be paused"
+                    else "server privacy-pause status is unknown"
                 )
 
                 with (
@@ -892,6 +1040,10 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     ) as repause,
                     mock.patch.object(
                         setup_builder_pulse,
+                        "quarantine_local_capture",
+                    ) as local_quarantine,
+                    mock.patch.object(
+                        setup_builder_pulse,
                         "activate",
                         side_effect=setup_builder_pulse.SetupError(
                             "activation failed"
@@ -916,19 +1068,115 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
                 resume.assert_called_once_with(identity, "0.4.6")
                 repause.assert_called_once_with(identity, "0.4.6")
-                self.assertIn(
-                    [
-                        sys.executable,
-                        "-I",
-                        "-S",
-                        str(cli),
-                        "config",
-                        "set",
-                        "enabled",
-                        "false",
-                    ],
-                    calls,
-                )
+                local_quarantine.assert_called_once_with(ROOT, identity)
+
+    def test_keyboard_interrupt_after_resume_still_repauses_and_quarantines(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "token-1",
+            "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+        }
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "installed_builder", return_value=None
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "marketplace_state", return_value=None
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "pause_existing_capture", return_value=None
+            ),
+            mock.patch.object(setup_builder_pulse, "remove_current"),
+            mock.patch.object(
+                setup_builder_pulse, "install_release", return_value=cli
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "plugin_data_dir", return_value=ROOT
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "authoritative_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                setup_builder_pulse, "resume_server_capture"
+            ) as resume,
+            mock.patch.object(
+                setup_builder_pulse, "pause_server_capture", return_value=True
+            ) as repause,
+            mock.patch.object(
+                setup_builder_pulse,
+                "quarantine_local_capture",
+            ) as local_quarantine,
+            mock.patch.object(
+                setup_builder_pulse,
+                "activate",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch.object(setup_builder_pulse, "run_command", return_value=""),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        resume.assert_called_once_with(identity, "0.4.6")
+        repause.assert_called_once_with(identity, "0.4.6")
+        local_quarantine.assert_called_once_with(ROOT, identity)
+
+    def test_activation_normalizes_a_process_start_failure(self) -> None:
+        with (
+            mock.patch.object(
+                setup_builder_pulse.subprocess,
+                "run",
+                side_effect=OSError("process unavailable"),
+            ),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "activation could not start",
+            ),
+        ):
+            setup_builder_pulse.activate(ROOT / "scripts" / "builder_pulse.py")
+
+    def test_main_does_not_claim_complete_safety_for_a_stopped_setup(self) -> None:
+        error = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "setup_builder_pulse.py",
+                    "--code",
+                    "InviteCode_1234567890",
+                    "--project-root",
+                    str(ROOT),
+                    "--project-label",
+                    "Builder Pulse",
+                ],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "setup",
+                side_effect=setup_builder_pulse.SetupError(
+                    "server privacy-pause status is unknown"
+                ),
+            ),
+            mock.patch("sys.stderr", error),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 1)
+
+        self.assertIn("Builder Pulse setup stopped", error.getvalue())
+        self.assertNotIn("failed safely", error.getvalue())
 
     def test_activation_review_result_is_preserved_even_with_nonzero_exit(self) -> None:
         completed = mock.Mock(

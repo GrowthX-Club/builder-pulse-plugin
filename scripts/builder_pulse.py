@@ -2536,15 +2536,19 @@ def command_work(args: argparse.Namespace, data_dir: Path) -> int:
                     scoped["project_label"] = project_label
                     scoped["ancestor_keys"] = ancestor_keys
                     if replace_existing:
+                        # Commit the new fail-closed allowlist before deleting
+                        # anything. If this atomic write fails, the old scope and
+                        # all of its pending local data remain untouched.
+                        contexts = {key: scoped}
+                        atomic_write_json(path, contexts)
                         discard_all_pending_data_unlocked(data_dir)
                         try:
                             (data_dir / "quarantine.jsonl").unlink()
                         except FileNotFoundError:
                             pass
-                        contexts = {key: scoped}
                     else:
                         contexts[key] = scoped
-                    atomic_write_json(path, contexts)
+                        atomic_write_json(path, contexts)
                     if previous_scope_key and not unchanged_scope:
                         discard_project_scope_data_unlocked(
                             data_dir, previous_scope_key
