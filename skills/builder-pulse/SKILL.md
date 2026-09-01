@@ -26,7 +26,7 @@ cannot report telemetry without this standard-library-only runtime.
 
 Before claiming or enrolling an installation, show this exact disclosure:
 
-> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
+> Builder Pulse installs hooks for Codex and Claude Code when those agents are available on this computer, but it sends data only from project folders you explicitly enroll. One shared identity and project allowlist apply to both agents. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, agent name, plugin version, optional cumulative Codex token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
 
 Explain the exact fields in
 [references/state-model.md](references/state-model.md). Primary submitted prompt
@@ -62,7 +62,7 @@ The claim must return `promptCapture: "on"` before prompt capture starts.
 
 ## Confirm and enroll projects
 
-Do not ask for the folder or display name in a primary Codex conversation. An
+Do not ask for the folder or display name in a primary agent conversation. An
 older machine-wide hook may still capture that answer. Once the user has
 authorized setup or enrollment, run the CLI interactively in a local terminal.
 It displays only the current working folder and, when different, the nearest
@@ -131,7 +131,7 @@ or feature fallback.
 Summarize claimed identity, prompt-capture policy and scope, enrollment count,
 current-project enrollment, project, feature, state, last event time, staleness,
 lifecycle queue count, and prompt queue count. Active time means approximate
-Codex activity, not total working hours. Session overlap is deduplicated
+Codex or Claude Code activity, not total working hours. Session overlap is deduplicated
 server-side. Empty queues prove only that nothing is waiting locally; they do
 not prove server receipt.
 
@@ -186,7 +186,7 @@ Manual retry handles both queues:
 <python> <resolved-cli-path> flush
 ```
 
-Delivery is best effort and must never interrupt Codex. Hook trust proves only
+Delivery is best effort and must never interrupt Codex or Claude Code. Hook readiness proves only
 activation readiness; only a server receipt timestamp proves telemetry reached
 GrowthX. Read the reference when changing state semantics, claim behavior,
 privacy guarantees, or the wire contract.

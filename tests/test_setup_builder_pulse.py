@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path, PureWindowsPath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,9 +29,49 @@ builder_pulse = importlib.util.module_from_spec(BUILDER_SPEC)
 BUILDER_SPEC.loader.exec_module(builder_pulse)
 
 TARGET_COMMIT = "e" * 40
+INSTALL_SHARED_RUNTIME = setup_builder_pulse.install_shared_runtime
+VERIFIED_INSTALLER_CHECKOUT = setup_builder_pulse.verified_installer_checkout
+RUN_COMMAND = setup_builder_pulse.run_command
+
+
+def codex_only_which(command: str) -> str | None:
+    return f"/usr/bin/{command}" if command in {"git", "codex"} else None
+
+
+def claude_only_which(command: str) -> str | None:
+    return f"/usr/bin/{command}" if command in {"git", "claude"} else None
 
 
 class SetupBuilderPulseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.test_home = tempfile.TemporaryDirectory()
+        root = Path(self.test_home.name)
+        self.environment = mock.patch.dict(
+            setup_builder_pulse.os.environ,
+            {
+                "BUILDER_PULSE_DATA_DIR": str(root / ".builder-pulse"),
+                "CODEX_HOME": str(root / ".codex"),
+            },
+            clear=False,
+        )
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.installer_checkout = mock.patch.object(
+            setup_builder_pulse,
+            "verified_installer_checkout",
+            return_value=ROOT,
+        )
+        self.installer_checkout.start()
+        self.addCleanup(self.installer_checkout.stop)
+        self.shared_runtime = mock.patch.object(
+            setup_builder_pulse,
+            "install_shared_runtime",
+            return_value=ROOT / "scripts" / "builder_pulse.py",
+        )
+        self.shared_runtime.start()
+        self.addCleanup(self.shared_runtime.stop)
+        self.addCleanup(self.test_home.cleanup)
+
     def test_standalone_installer_uses_the_canonical_privacy_disclosure(self) -> None:
         self.assertEqual(
             setup_builder_pulse.SETUP_DISCLOSURE,
@@ -144,7 +185,10 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
             with mock.patch.dict(
                 setup_builder_pulse.os.environ,
-                {"BUILDER_PULSE_ENABLED": "1"},
+                {
+                    "BUILDER_PULSE_ENABLED": "1",
+                    "BUILDER_PULSE_DATA_DIR": str(data_dir),
+                },
                 clear=True,
             ), mock.patch.object(
                 setup_builder_pulse,
@@ -327,7 +371,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     setup_builder_pulse.SetupError,
-                    "status is unknown.*Exit all running Codex sessions",
+                    "status is unknown.*Exit all running Claude Code and Codex sessions",
                 ),
             ):
                 setup_builder_pulse.pause_existing_capture(None)
@@ -459,7 +503,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 paused = setup_builder_pulse.pause_existing_capture(None)
 
             self.assertEqual(paused.data_dir, data_dir)
-            server_pause.assert_called_once_with(identity, "0.4.6")
+            server_pause.assert_called_once_with(identity, "0.5.0")
             self.assertFalse(
                 json.loads((data_dir / "config.json").read_text())["enabled"]
             )
@@ -491,7 +535,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             return ""
 
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(
                 setup_builder_pulse,
                 "verify_release_exists",
@@ -564,14 +608,14 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.TARGET_RELEASE,
             expected_commit=TARGET_COMMIT,
         )
-        activate.assert_called_once_with(cli)
+        activate.assert_called_once_with(cli, "codex")
         resume.assert_called_once_with(
             {
                 "installationId": "installation-1",
                 "installationToken": "token-1",
                 "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
             },
-            "0.4.6",
+            "0.5.0",
         )
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
@@ -625,7 +669,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             return ""
 
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(
                 setup_builder_pulse,
                 "verify_release_exists",
@@ -698,7 +742,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
     def test_existing_claim_repair_rejects_new_invite_or_missing_identity(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(setup_builder_pulse.SetupError, "must not use"),
         ):
             setup_builder_pulse.setup(
@@ -710,7 +754,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(
                 setup_builder_pulse,
                 "verify_release_exists",
@@ -739,7 +783,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
     def test_setup_rejects_home_as_an_enrollment_root(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(setup_builder_pulse.SetupError, "project folder"),
         ):
             setup_builder_pulse.setup(
@@ -751,7 +795,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
     def test_setup_rejects_a_parent_of_home_as_an_enrollment_root(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(setup_builder_pulse.SetupError, "project folder"),
         ):
             setup_builder_pulse.setup(
@@ -851,7 +895,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         raise setup_builder_pulse.SetupError("flush failed")
                     return ""
 
-                def activate(_cli: Path):
+                def activate(_cli: Path, agent_platform: str):
+                    self.assertEqual(agent_platform, "codex")
                     if failure == "activation":
                         raise setup_builder_pulse.SetupError("activation failed")
                     return {
@@ -862,7 +907,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(
-                        setup_builder_pulse.shutil, "which", return_value="ok"
+                        setup_builder_pulse.shutil, "which", side_effect=codex_only_which
                     ),
                     mock.patch.object(
                         setup_builder_pulse,
@@ -950,7 +995,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         "installationToken": "token-1",
                         "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
                     },
-                    "0.4.6",
+                    "0.5.0",
                 )
                 local_quarantine.assert_called_once_with(
                     ROOT,
@@ -996,7 +1041,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(
-                        setup_builder_pulse.shutil, "which", return_value="ok"
+                        setup_builder_pulse.shutil, "which", side_effect=codex_only_which
                     ),
                     mock.patch.object(
                         setup_builder_pulse,
@@ -1066,8 +1111,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         "Builder Pulse",
                     )
 
-                resume.assert_called_once_with(identity, "0.4.6")
-                repause.assert_called_once_with(identity, "0.4.6")
+                resume.assert_called_once_with(identity, "0.5.0")
+                repause.assert_called_once_with(identity, "0.5.0")
                 local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_keyboard_interrupt_after_resume_still_repauses_and_quarantines(self) -> None:
@@ -1078,7 +1123,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
         }
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(
                 setup_builder_pulse,
                 "verify_release_exists",
@@ -1130,8 +1175,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "Builder Pulse",
             )
 
-        resume.assert_called_once_with(identity, "0.4.6")
-        repause.assert_called_once_with(identity, "0.4.6")
+        resume.assert_called_once_with(identity, "0.5.0")
+        repause.assert_called_once_with(identity, "0.5.0")
         local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_activation_normalizes_a_process_start_failure(self) -> None:
@@ -1221,7 +1266,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.REPOSITORY,
         )
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(
                 setup_builder_pulse,
                 "verify_release_exists",
@@ -1320,7 +1365,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    setup_builder_pulse.shutil, "which", return_value="ok"
+                    setup_builder_pulse.shutil, "which", side_effect=codex_only_which
                 ),
                 mock.patch.object(
                     setup_builder_pulse,
@@ -1431,7 +1476,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 )
 
             self.assertEqual(server_pause.call_count, 2)
-            server_resume.assert_called_once_with(identity, "0.4.6")
+            server_resume.assert_called_once_with(identity, "0.5.0")
             self.assertFalse((data_dir / "setup-paused-identity.json").exists())
             self.assertEqual(
                 json.loads((data_dir / "identity.json").read_text()),
@@ -1508,6 +1553,294 @@ class SetupBuilderPulseTests(unittest.TestCase):
             ):
                 setup_builder_pulse.install_release("v0.4.6")
 
+    def test_claude_install_tree_must_match_the_immutable_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installed = Path(directory) / "installed"
+            shutil.copytree(
+                setup_builder_pulse.expected_claude_package_root(),
+                installed,
+            )
+            setup_builder_pulse.verify_claude_install_tree(installed)
+
+            (installed / "hooks" / "hooks.json").write_text(
+                '{"hooks":{}}', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "differs from the immutable release",
+            ):
+                setup_builder_pulse.verify_claude_install_tree(installed)
+
+    def test_claude_marketplace_name_collision_is_rejected_before_mutation(
+        self,
+    ) -> None:
+        commands: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            commands.append(arguments)
+            if arguments == ["claude", "plugin", "list", "--json"]:
+                return []
+            if arguments == [
+                "claude",
+                "plugin",
+                "marketplace",
+                "list",
+                "--json",
+            ]:
+                return [
+                    {
+                        "name": setup_builder_pulse.CLAUDE_MARKETPLACE,
+                        "source": "github",
+                        "repo": "attacker/builder-pulse-plugin",
+                        "installLocation": "/tmp/not-growthx",
+                    }
+                ]
+            self.fail(f"unexpected mutating command: {arguments}")
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse,
+                "run_command",
+                side_effect=run_command,
+            ),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "points to a different source",
+            ),
+        ):
+            setup_builder_pulse.install_claude_release("f" * 40)
+
+        self.assertEqual(
+            commands,
+            [
+                ["claude", "plugin", "list", "--json"],
+                ["claude", "plugin", "marketplace", "list", "--json"],
+            ],
+        )
+
+    def test_claude_marketplace_must_match_commit_and_release_files(self) -> None:
+        expected_commit = "f" * 40
+        source_root = ROOT
+
+        with tempfile.TemporaryDirectory() as directory:
+            installed = Path(directory) / "marketplace"
+            (installed / ".claude-plugin").mkdir(parents=True)
+            shutil.copy2(
+                source_root / ".claude-plugin" / "marketplace.json",
+                installed / ".claude-plugin" / "marketplace.json",
+            )
+            shutil.copytree(
+                source_root / "claude-plugins",
+                installed / "claude-plugins",
+            )
+            (installed / ".gcs-sha").write_text(expected_commit, encoding="utf-8")
+            marketplace = {
+                "name": setup_builder_pulse.CLAUDE_MARKETPLACE,
+                "source": "github",
+                "repo": "GrowthX-Club/builder-pulse-plugin",
+                "installLocation": str(installed),
+            }
+
+            setup_builder_pulse.verify_claude_marketplace(
+                marketplace,
+                expected_commit,
+            )
+
+            (installed / ".gcs-sha").write_text("a" * 40, encoding="utf-8")
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "does not match the immutable release",
+            ):
+                setup_builder_pulse.verify_claude_marketplace(
+                    marketplace,
+                    expected_commit,
+                )
+
+            (installed / ".gcs-sha").write_text(expected_commit, encoding="utf-8")
+            (installed / ".claude-plugin" / "marketplace.json").write_text(
+                '{"plugins": [{"name": "attacker", "source": "./run"}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "differs from the immutable release",
+            ):
+                setup_builder_pulse.verify_claude_marketplace(
+                    marketplace,
+                    expected_commit,
+                )
+
+    def test_claude_update_keeps_current_plugin_until_replacement_is_verified(
+        self,
+    ) -> None:
+        target = (
+            setup_builder_pulse.CLAUDE_WINDOWS_PLUGIN
+            if setup_builder_pulse.os.name == "nt"
+            else setup_builder_pulse.CLAUDE_POSIX_PLUGIN
+        )
+        old_marketplace = "growthx-builder-tools-v0-4-6"
+        old_platform = (
+            "builder-pulse-claude-windows"
+            if setup_builder_pulse.os.name == "nt"
+            else "builder-pulse-claude-posix"
+        )
+        old_other_platform = (
+            "builder-pulse-claude-posix"
+            if setup_builder_pulse.os.name == "nt"
+            else "builder-pulse-claude-windows"
+        )
+        old_target = f"{old_platform}@{old_marketplace}"
+        old_other = f"{old_other_platform}@{old_marketplace}"
+        installed_root = setup_builder_pulse.expected_claude_package_root()
+        before = [
+            {"id": old_target, "version": "0.4.6", "enabled": True},
+            {"id": old_other, "version": "0.4.6", "enabled": True},
+        ]
+        after = [
+            {
+                "id": target,
+                "version": "0.5.0",
+                "enabled": True,
+                "scope": "user",
+                "installPath": str(installed_root),
+            },
+            *before,
+        ]
+        commands: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            commands.append(arguments)
+            return ""
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_claude_builders",
+                side_effect=[before, after],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "ensure_claude_marketplace",
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "run_command",
+                side_effect=run_command,
+            ),
+            mock.patch.object(setup_builder_pulse, "verify_claude_install_tree"),
+        ):
+            self.assertEqual(
+                setup_builder_pulse.install_claude_release("f" * 40),
+                installed_root.resolve(strict=False),
+            )
+
+        self.assertIn(
+            ["claude", "plugin", "install", target, "--scope", "user", "--yes"],
+            commands,
+        )
+        uninstall_commands = [
+            command for command in commands if command[:3] == ["claude", "plugin", "uninstall"]
+        ]
+        self.assertEqual(
+            uninstall_commands,
+            [
+                [
+                    "claude",
+                    "plugin",
+                    "uninstall",
+                    old_target,
+                    "--scope",
+                    "user",
+                    "--keep-data",
+                    "--yes",
+                ],
+                [
+                    "claude",
+                    "plugin",
+                    "uninstall",
+                    old_other,
+                    "--scope",
+                    "user",
+                    "--keep-data",
+                    "--yes",
+                ]
+            ],
+        )
+
+    def test_claude_failed_replacement_never_uninstalls_existing_plugins(self) -> None:
+        target = (
+            setup_builder_pulse.CLAUDE_WINDOWS_PLUGIN
+            if setup_builder_pulse.os.name == "nt"
+            else setup_builder_pulse.CLAUDE_POSIX_PLUGIN
+        )
+        old_marketplace = "growthx-builder-tools-v0-4-6"
+        old_platform = (
+            "builder-pulse-claude-windows"
+            if setup_builder_pulse.os.name == "nt"
+            else "builder-pulse-claude-posix"
+        )
+        old_other_platform = (
+            "builder-pulse-claude-posix"
+            if setup_builder_pulse.os.name == "nt"
+            else "builder-pulse-claude-windows"
+        )
+        before = [
+            {
+                "id": f"{old_platform}@{old_marketplace}",
+                "version": "0.4.6",
+                "enabled": True,
+            },
+            {
+                "id": f"{old_other_platform}@{old_marketplace}",
+                "version": "0.4.6",
+                "enabled": True,
+            },
+        ]
+        after = [
+            {
+                "id": target,
+                "version": "0.4.6",
+                "enabled": True,
+                "scope": "user",
+                "installPath": str(setup_builder_pulse.expected_claude_package_root()),
+            },
+            *before,
+        ]
+        commands: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            commands.append(arguments)
+            return ""
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_claude_builders",
+                side_effect=[before, after],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "ensure_claude_marketplace",
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "run_command",
+                side_effect=run_command,
+            ),
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "unexpected Builder Pulse version",
+            ),
+        ):
+            setup_builder_pulse.install_claude_release("f" * 40)
+
+        self.assertFalse(
+            any(command[:3] == ["claude", "plugin", "uninstall"] for command in commands)
+        )
+
     def test_install_rejects_a_checkout_that_is_not_the_verified_commit(self) -> None:
         expected = "f" * 40
         cli = ROOT / "scripts" / "builder_pulse.py"
@@ -1533,9 +1866,467 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 expected_commit=expected,
             )
 
+    def test_shared_runtime_requires_the_clean_exact_current_release_checkout(self) -> None:
+        expected = "f" * 40
+        for checkout, message in (
+            (
+                ("https://github.com/udayanwalvekar/builder-pulse-plugin.git", expected),
+                "does not match the immutable release",
+            ),
+            (
+                (setup_builder_pulse.REPOSITORY, "a" * 40),
+                "does not match the immutable release",
+            ),
+        ):
+            with self.subTest(checkout=checkout), mock.patch.object(
+                setup_builder_pulse,
+                "verified_installer_checkout",
+                side_effect=VERIFIED_INSTALLER_CHECKOUT,
+            ), mock.patch.object(
+                setup_builder_pulse,
+                "verified_git_checkout",
+                return_value=checkout,
+            ), self.assertRaisesRegex(setup_builder_pulse.SetupError, message):
+                INSTALL_SHARED_RUNTIME(expected)
+
+        with mock.patch.object(
+            setup_builder_pulse,
+            "verified_installer_checkout",
+            side_effect=VERIFIED_INSTALLER_CHECKOUT,
+        ), mock.patch.object(
+            setup_builder_pulse,
+            "verified_git_checkout",
+            side_effect=setup_builder_pulse.SetupError(
+                "The existing Builder Pulse checkout has modified, untracked, or ignored files"
+            ),
+        ), self.assertRaisesRegex(
+            setup_builder_pulse.SetupError,
+            "modified, untracked, or ignored files",
+        ):
+            INSTALL_SHARED_RUNTIME(expected)
+
+    def test_shared_runtime_has_a_real_plugin_root_layout_for_claude_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_root = Path(directory).resolve()
+            (source_root / "scripts").mkdir()
+            (source_root / "config").mkdir()
+            shutil.copy2(
+                ROOT / "scripts" / "builder_pulse.py",
+                source_root / "scripts" / "builder_pulse.py",
+            )
+            (source_root / "scripts" / "setup_builder_pulse.py").write_text(
+                "# installer\n", encoding="utf-8"
+            )
+            shutil.copy2(
+                ROOT / "config" / "defaults.json",
+                source_root / "config" / "defaults.json",
+            )
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "remote", "add", "origin", setup_builder_pulse.REPOSITORY],
+                ["git", "add", "."],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Builder Pulse Test",
+                    "-c",
+                    "user.email=builder-pulse-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "verified release",
+                ],
+            ):
+                subprocess.run(command, cwd=source_root, check=True)
+            expected = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with mock.patch.object(
+                setup_builder_pulse,
+                "__file__",
+                str(source_root / "scripts" / "setup_builder_pulse.py"),
+            ), mock.patch.object(
+                setup_builder_pulse,
+                "verified_installer_checkout",
+                side_effect=VERIFIED_INSTALLER_CHECKOUT,
+            ):
+                installed_cli = INSTALL_SHARED_RUNTIME(expected)
+
+            runtime_root = (
+                setup_builder_pulse.canonical_plugin_data_dir()
+                / "runtime"
+                / "0.5.0"
+            )
+            self.assertEqual(
+                installed_cli,
+                runtime_root / "scripts" / "builder_pulse.py",
+            )
+            runtime_spec = importlib.util.spec_from_file_location(
+                "builder_pulse_shared_runtime_test",
+                installed_cli,
+            )
+            assert runtime_spec is not None and runtime_spec.loader is not None
+            runtime_module = importlib.util.module_from_spec(runtime_spec)
+            runtime_spec.loader.exec_module(runtime_module)
+            self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
+            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.0")
+            self.assertTrue(runtime_module.DEFAULTS_PATH.is_file())
+            self.assertTrue(runtime_module.MANIFEST_PATH.is_file())
+
+    def test_claude_only_setup_claims_and_activates_with_the_real_shared_layout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_root = Path(directory).resolve()
+            (source_root / "scripts").mkdir()
+            (source_root / "config").mkdir()
+            shutil.copy2(
+                ROOT / "scripts" / "builder_pulse.py",
+                source_root / "scripts" / "builder_pulse.py",
+            )
+            (source_root / "scripts" / "setup_builder_pulse.py").write_text(
+                "# installer\n", encoding="utf-8"
+            )
+            shutil.copy2(
+                ROOT / "config" / "defaults.json",
+                source_root / "config" / "defaults.json",
+            )
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "remote", "add", "origin", setup_builder_pulse.REPOSITORY],
+                ["git", "add", "."],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Builder Pulse Test",
+                    "-c",
+                    "user.email=builder-pulse-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "verified release",
+                ],
+            ):
+                subprocess.run(command, cwd=source_root, check=True)
+            expected = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            commands: list[list[str]] = []
+            activated: list[Path] = []
+            identity = {
+                "installationId": "installation-1",
+                "installationToken": "token-1",
+                "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+            }
+
+            def run_command(arguments, *, env=None, expect_json=False):
+                if arguments[0] == "git":
+                    return RUN_COMMAND(arguments, env=env, expect_json=expect_json)
+                commands.append(arguments)
+                if "claim" in arguments:
+                    self.assertEqual(
+                        env["BUILDER_PULSE_INVITE_CODE"],
+                        "InviteCode_1234567890",
+                    )
+                return ""
+
+            def activate(cli: Path, agent_platform: str) -> dict[str, object]:
+                self.assertEqual(agent_platform, "claude_code")
+                runtime_root = (
+                    setup_builder_pulse.canonical_plugin_data_dir()
+                    / "runtime"
+                    / "0.5.0"
+                )
+                self.assertEqual(cli, runtime_root / "scripts" / "builder_pulse.py")
+                runtime_spec = importlib.util.spec_from_file_location(
+                    "builder_pulse_claude_only_setup_test",
+                    cli,
+                )
+                assert runtime_spec is not None and runtime_spec.loader is not None
+                runtime_module = importlib.util.module_from_spec(runtime_spec)
+                runtime_spec.loader.exec_module(runtime_module)
+                self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
+                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.0")
+                activated.append(cli)
+                return {
+                    "activationReady": True,
+                    "hooksVerified": True,
+                    "serverVerified": True,
+                    "agentPlatform": "claude_code",
+                }
+
+            with (
+                mock.patch.object(
+                    setup_builder_pulse.shutil,
+                    "which",
+                    side_effect=claude_only_which,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verify_release_exists",
+                    return_value=expected,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "__file__",
+                    str(source_root / "scripts" / "setup_builder_pulse.py"),
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_installer_checkout",
+                    side_effect=VERIFIED_INSTALLER_CHECKOUT,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_shared_runtime",
+                    side_effect=INSTALL_SHARED_RUNTIME,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "pause_existing_capture",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_claude_release",
+                ) as install_claude,
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "authoritative_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "resume_server_capture",
+                ) as resume,
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "activate",
+                    side_effect=activate,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "run_command",
+                    side_effect=run_command,
+                ),
+            ):
+                setup_builder_pulse.setup(
+                    "InviteCode_1234567890",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                    ROOT,
+                    "Builder Pulse",
+                )
+
+            install_claude.assert_called_once_with(expected)
+            resume.assert_called_once_with(identity, "0.5.0")
+            self.assertEqual(len(activated), 1)
+            self.assertTrue(any("claim" in arguments for arguments in commands))
+            self.assertTrue(any("enroll" in arguments for arguments in commands))
+            self.assertTrue(any(arguments[-1] == "flush" for arguments in commands))
+
+    def test_legacy_identity_migrates_before_shared_runtime_is_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_root = Path(directory).resolve()
+            (source_root / "scripts").mkdir()
+            (source_root / "config").mkdir()
+            shutil.copy2(
+                ROOT / "scripts" / "builder_pulse.py",
+                source_root / "scripts" / "builder_pulse.py",
+            )
+            (source_root / "scripts" / "setup_builder_pulse.py").write_text(
+                "# installer\n", encoding="utf-8"
+            )
+            shutil.copy2(
+                ROOT / "config" / "defaults.json",
+                source_root / "config" / "defaults.json",
+            )
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "remote", "add", "origin", setup_builder_pulse.REPOSITORY],
+                ["git", "add", "."],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Builder Pulse Test",
+                    "-c",
+                    "user.email=builder-pulse-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "verified release",
+                ],
+            ):
+                subprocess.run(command, cwd=source_root, check=True)
+            expected = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+            legacy.mkdir(parents=True)
+            identity = {
+                "installationId": "legacy-installation",
+                "installationToken": "legacy-token",
+            }
+            (legacy / "identity.json").write_text(
+                json.dumps(identity), encoding="utf-8"
+            )
+            shared = setup_builder_pulse.canonical_plugin_data_dir()
+            self.assertFalse(shared.exists())
+
+            installed_runtime: list[Path] = []
+
+            def install_after_migration(commit: str) -> Path:
+                self.assertEqual(
+                    json.loads((shared / "identity.json").read_text(encoding="utf-8")),
+                    identity,
+                )
+                cli = INSTALL_SHARED_RUNTIME(commit)
+                installed_runtime.append(cli)
+                raise setup_builder_pulse.SetupError("stop after shared runtime")
+
+            rollback = setup_builder_pulse.RollbackSource(
+                "0.4.4",
+                "a" * 40,
+                setup_builder_pulse.REPOSITORY,
+            )
+            with (
+                mock.patch.object(
+                    setup_builder_pulse.shutil,
+                    "which",
+                    side_effect=codex_only_which,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verify_release_exists",
+                    return_value=expected,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "__file__",
+                    str(source_root / "scripts" / "setup_builder_pulse.py"),
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_installer_checkout",
+                    side_effect=VERIFIED_INSTALLER_CHECKOUT,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_shared_runtime",
+                    side_effect=install_after_migration,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_builder",
+                    return_value={"version": "0.4.4"},
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "marketplace_state",
+                    return_value={
+                        "marketplaceSource": {
+                            "source": setup_builder_pulse.REPOSITORY,
+                        }
+                    },
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_rollback_source",
+                    return_value=rollback,
+                ),
+                self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "stop after shared runtime",
+                ),
+            ):
+                setup_builder_pulse.setup(
+                    "InviteCode_1234567890",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                    ROOT,
+                    "Builder Pulse",
+                )
+
+            self.assertEqual(
+                installed_runtime,
+                [shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py"],
+            )
+            self.assertEqual(
+                json.loads((shared / "identity.json").read_text(encoding="utf-8")),
+                identity,
+            )
+            self.assertTrue((legacy / "identity.json").is_file())
+
+    def test_shared_runtime_rejects_runtime_tampering_when_claude_wrapper_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "scripts").mkdir()
+            (root / "config").mkdir()
+            wrapper = root / "claude-plugins" / "posix" / "scripts"
+            wrapper.mkdir(parents=True)
+            runtime = root / "scripts" / "builder_pulse.py"
+            runtime.write_text("print('verified runtime')\n", encoding="utf-8")
+            (root / "scripts" / "setup_builder_pulse.py").write_text(
+                "# installer\n", encoding="utf-8"
+            )
+            (root / "config" / "defaults.json").write_text("{}\n", encoding="utf-8")
+            (wrapper / "builder_pulse_claude.sh").write_text(
+                "#!/bin/sh\n", encoding="utf-8"
+            )
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "remote", "add", "origin", setup_builder_pulse.REPOSITORY],
+                ["git", "add", "."],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Builder Pulse Test",
+                    "-c",
+                    "user.email=builder-pulse-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "verified release",
+                ],
+            ):
+                subprocess.run(command, cwd=root, check=True)
+            expected = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            # Only the shared telemetry runtime changes; the validated Claude
+            # wrapper package remains byte-for-byte identical.
+            runtime.write_text("print('tampered runtime')\n", encoding="utf-8")
+            with mock.patch.object(
+                setup_builder_pulse,
+                "__file__",
+                str(root / "scripts" / "setup_builder_pulse.py"),
+            ), mock.patch.object(
+                setup_builder_pulse,
+                "verified_installer_checkout",
+                side_effect=VERIFIED_INSTALLER_CHECKOUT,
+            ), self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "modified, untracked, or ignored files",
+            ):
+                INSTALL_SHARED_RUNTIME(expected)
+
     def test_rejects_marketplace_name_pointing_to_another_repository(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(setup_builder_pulse, "verify_release_exists"),
             mock.patch.object(setup_builder_pulse, "installed_builder", return_value=None),
             mock.patch.object(
@@ -1686,7 +2477,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
     def test_unverified_previous_package_stops_before_pause_or_removal(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             mock.patch.object(setup_builder_pulse, "verify_release_exists"),
             mock.patch.object(
                 setup_builder_pulse,
@@ -1725,7 +2516,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
     def test_setup_requires_a_confirmed_existing_project_and_name(self) -> None:
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(
                 setup_builder_pulse.SetupError,
                 "member-confirmed Builder Pulse project folder",
@@ -1739,7 +2530,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(
                 setup_builder_pulse.SetupError,
                 "confirmed Builder Pulse project folder does not exist",
@@ -1753,7 +2544,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(setup_builder_pulse.shutil, "which", return_value="ok"),
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
             self.assertRaisesRegex(
                 setup_builder_pulse.SetupError,
                 "confirmed Builder Pulse project name is invalid",
