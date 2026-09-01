@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import http.client
 import importlib.util
 import io
@@ -32,14 +33,22 @@ TARGET_COMMIT = "e" * 40
 INSTALL_SHARED_RUNTIME = setup_builder_pulse.install_shared_runtime
 VERIFIED_INSTALLER_CHECKOUT = setup_builder_pulse.verified_installer_checkout
 RUN_COMMAND = setup_builder_pulse.run_command
+PREFLIGHT_AGENT_INSTALLATION_SUPPORT = (
+    setup_builder_pulse.preflight_agent_installation_support
+)
+GIT_EXECUTABLE = shutil.which("git")
 
 
 def codex_only_which(command: str) -> str | None:
-    return f"/usr/bin/{command}" if command in {"git", "codex"} else None
+    if command == "git":
+        return GIT_EXECUTABLE
+    return f"/usr/bin/{command}" if command == "codex" else None
 
 
 def claude_only_which(command: str) -> str | None:
-    return f"/usr/bin/{command}" if command in {"git", "claude"} else None
+    if command == "git":
+        return GIT_EXECUTABLE
+    return f"/usr/bin/{command}" if command == "claude" else None
 
 
 class SetupBuilderPulseTests(unittest.TestCase):
@@ -70,6 +79,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
         )
         self.shared_runtime.start()
         self.addCleanup(self.shared_runtime.stop)
+        self.preflight = mock.patch.object(
+            setup_builder_pulse,
+            "preflight_agent_installation_support",
+        )
+        self.preflight_mock = self.preflight.start()
+        self.addCleanup(self.preflight.stop)
         self.addCleanup(self.test_home.cleanup)
 
     def test_standalone_installer_uses_the_canonical_privacy_disclosure(self) -> None:
@@ -181,7 +196,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 '{"enabled":true}', encoding="utf-8"
             )
             for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
-                (data_dir / filename).write_text("{}\n", encoding="utf-8")
+                (data_dir / filename).write_bytes(b"{}\n")
 
             with mock.patch.dict(
                 setup_builder_pulse.os.environ,
@@ -226,6 +241,14 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     "quarantine.jsonl",
                 ):
                     self.assertFalse((data_dir / filename).exists())
+                self.assertEqual(
+                    dict(paused.locations[0].queues),
+                    {
+                        "outbox.jsonl": b"{}\n",
+                        "prompt-outbox.jsonl": b"{}\n",
+                        "quarantine.jsonl": b"{}\n",
+                    },
+                )
 
                 setup_builder_pulse.restore_paused_identity(cli, paused)
 
@@ -389,6 +412,132 @@ class SetupBuilderPulseTests(unittest.TestCase):
             for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
                 self.assertFalse((data_dir / filename).exists())
 
+    def test_local_pause_failure_restores_prior_files_and_server_policy(self) -> None:
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "delivery-token",
+            "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+        }
+        snapshot = setup_builder_pulse.LocalCaptureSnapshot(
+            shared,
+            identity,
+            None,
+            {"enabled": True},
+            (("prompt-outbox.jsonl", b'{"prompt":"preserve"}\n'),),
+        )
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse,
+                "existing_plugin_data_dir",
+                return_value=shared,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "legacy_codex_plugin_data_dir",
+                return_value=legacy,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "authoritative_identity",
+                side_effect=[identity, identity],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "pause_server_capture",
+                return_value=True,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "pause_local_capture",
+                side_effect=[
+                    snapshot,
+                    setup_builder_pulse.SetupError("legacy pause failed"),
+                ],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "restore_local_capture_snapshot",
+            ) as restore_local,
+            mock.patch.object(
+                setup_builder_pulse,
+                "resume_server_capture",
+            ) as resume,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "could not be disabled locally",
+            ),
+        ):
+            legacy.mkdir(parents=True)
+            setup_builder_pulse.pause_existing_capture({"version": "0.4.4"})
+
+        restore_local.assert_called_once_with(snapshot)
+        resume.assert_called_once_with(identity, "0.4.4")
+
+    def test_restore_previous_capture_restores_exact_local_and_server_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory).resolve()
+            identity = {
+                "installationId": "installation-1",
+                "installationToken": "delivery-token",
+                "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+                "promptCapture": "on",
+            }
+            config = {"enabled": True, "customSetting": "preserve-me"}
+            setup_builder_pulse.atomic_write_object(
+                data_dir / "setup-paused-identity.json",
+                identity,
+            )
+            setup_builder_pulse.atomic_write_object(
+                data_dir / "identity.json",
+                {"installationId": "installation-1", "promptCapture": "off"},
+            )
+            setup_builder_pulse.atomic_write_object(
+                data_dir / "config.json",
+                {"enabled": False, "customSetting": "preserve-me"},
+            )
+            queues = {
+                "outbox.jsonl": b'{"event":"lifecycle"}\n',
+                "prompt-outbox.jsonl": b'{"prompt":"preserve me"}\n',
+                "quarantine.jsonl": b'{"event":"retry"}\n',
+            }
+            paused = setup_builder_pulse.PausedCapture(
+                data_dir,
+                identity,
+                (
+                    setup_builder_pulse.LocalCaptureSnapshot(
+                        data_dir,
+                        identity,
+                        None,
+                        config,
+                        tuple(queues.items()),
+                    ),
+                ),
+                True,
+                "0.4.4",
+            )
+
+            with mock.patch.object(
+                setup_builder_pulse,
+                "resume_server_capture",
+            ) as resume:
+                setup_builder_pulse.restore_previous_capture(paused)
+
+            self.assertEqual(
+                setup_builder_pulse.read_object(data_dir / "identity.json"),
+                identity,
+            )
+            self.assertEqual(
+                setup_builder_pulse.read_object(data_dir / "config.json"),
+                config,
+            )
+            self.assertFalse((data_dir / "setup-paused-identity.json").exists())
+            for filename, contents in queues.items():
+                self.assertEqual((data_dir / filename).read_bytes(), contents)
+            resume.assert_called_once_with(identity, "0.4.4")
+
     def test_server_resume_requires_the_exact_acknowledged_installation(self) -> None:
         identity = {
             "installationId": "installation-1",
@@ -503,7 +652,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 paused = setup_builder_pulse.pause_existing_capture(None)
 
             self.assertEqual(paused.data_dir, data_dir)
-            server_pause.assert_called_once_with(identity, "0.5.0")
+            server_pause.assert_called_once_with(identity, "0.5.1")
             self.assertFalse(
                 json.loads((data_dir / "config.json").read_text())["enabled"]
             )
@@ -615,7 +764,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "installationToken": "token-1",
                 "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
             },
-            "0.5.0",
+            "0.5.1",
         )
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
@@ -994,7 +1143,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         "installationToken": "token-1",
                         "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
                     },
-                    "0.5.0",
+                    "0.5.1",
                 )
                 local_quarantine.assert_called_once_with(
                     ROOT,
@@ -1110,8 +1259,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         "Builder Pulse",
                     )
 
-                resume.assert_called_once_with(identity, "0.5.0")
-                repause.assert_called_once_with(identity, "0.5.0")
+                resume.assert_called_once_with(identity, "0.5.1")
+                repause.assert_called_once_with(identity, "0.5.1")
                 local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_keyboard_interrupt_after_resume_still_repauses_and_quarantines(self) -> None:
@@ -1174,8 +1323,8 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "Builder Pulse",
             )
 
-        resume.assert_called_once_with(identity, "0.5.0")
-        repause.assert_called_once_with(identity, "0.5.0")
+        resume.assert_called_once_with(identity, "0.5.1")
+        repause.assert_called_once_with(identity, "0.5.1")
         local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_activation_normalizes_a_process_start_failure(self) -> None:
@@ -1191,6 +1340,73 @@ class SetupBuilderPulseTests(unittest.TestCase):
             ),
         ):
             setup_builder_pulse.activate(ROOT / "scripts" / "builder_pulse.py")
+
+    def test_run_command_launches_the_resolved_windows_command_wrapper(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+        resolved = r"C:\\Users\\member\\AppData\\Local\\bin\\codex.cmd"
+        with (
+            mock.patch.object(
+                setup_builder_pulse.shutil,
+                "which",
+                return_value=resolved,
+            ),
+            mock.patch.object(
+                setup_builder_pulse.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+        ):
+            self.assertEqual(
+                RUN_COMMAND(["codex", "plugin", "list"]),
+                "ok\n",
+            )
+
+        self.assertEqual(
+            run.call_args.args[0],
+            [resolved, "plugin", "list"],
+        )
+
+    def test_preflight_failure_cannot_pause_or_remove_a_working_install(self) -> None:
+        self.preflight_mock.side_effect = setup_builder_pulse.SetupError(
+            "current marketplace format is incompatible"
+        )
+        with (
+            mock.patch.object(
+                setup_builder_pulse.shutil,
+                "which",
+                side_effect=lambda command: f"/usr/bin/{command}",
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
+            mock.patch.object(setup_builder_pulse, "installed_builder") as installed,
+            mock.patch.object(
+                setup_builder_pulse, "pause_existing_capture"
+            ) as pause,
+            mock.patch.object(setup_builder_pulse, "remove_current") as remove,
+            mock.patch.object(setup_builder_pulse, "install_release") as install,
+            mock.patch.object(
+                setup_builder_pulse, "install_claude_release"
+            ) as install_claude,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "marketplace format is incompatible",
+            ),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        installed.assert_not_called()
+        pause.assert_not_called()
+        remove.assert_not_called()
+        install.assert_not_called()
+        install_claude.assert_not_called()
 
     def test_main_does_not_claim_complete_safety_for_a_stopped_setup(self) -> None:
         error = io.StringIO()
@@ -1320,6 +1536,420 @@ class SetupBuilderPulseTests(unittest.TestCase):
             expected_commit=TARGET_COMMIT,
         )
         restore.assert_called_once_with(rollback)
+
+    def test_failed_codex_replacement_rolls_back_every_mutated_surface(self) -> None:
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "b" * 40,
+            setup_builder_pulse.REPOSITORY,
+        )
+        previous_claude = [
+            {
+                "id": "builder-pulse-claude-posix@growthx-builder-tools-v0-4-6",
+                "version": "0.4.6",
+                "enabled": True,
+            }
+        ]
+        paused = setup_builder_pulse.PausedCapture(ROOT, {})
+        events: list[str] = []
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse.shutil,
+                "which",
+                side_effect=lambda command: f"/usr/bin/{command}",
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_builder",
+                return_value={"version": "0.4.4"},
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "marketplace_state",
+                return_value={
+                    "marketplaceSource": {"source": setup_builder_pulse.REPOSITORY}
+                },
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verified_rollback_source",
+                return_value=rollback,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_claude_builders",
+                side_effect=[
+                    previous_claude,
+                    [
+                        *previous_claude,
+                        {
+                            "id": setup_builder_pulse.target_claude_plugin_id(),
+                            "version": "0.5.1",
+                            "enabled": True,
+                        },
+                    ],
+                ],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_claude_release",
+                side_effect=lambda *args, **kwargs: events.append("install claude"),
+            ) as install_claude,
+            mock.patch.object(
+                setup_builder_pulse,
+                "pause_existing_capture",
+                side_effect=lambda previous: events.append("pause") or paused,
+            ),
+            mock.patch.object(setup_builder_pulse, "remove_current"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_release",
+                side_effect=setup_builder_pulse.SetupError("codex replacement failed"),
+            ),
+            mock.patch.object(setup_builder_pulse, "cleanup_partial"),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_verified_rollback",
+                side_effect=lambda source: events.append("restore codex"),
+            ) as restore_codex,
+            mock.patch.object(
+                setup_builder_pulse,
+                "remove_claude_plugin",
+                side_effect=lambda plugin_id: events.append("remove new claude"),
+            ) as remove_claude,
+            mock.patch.object(
+                setup_builder_pulse,
+                "restore_previous_capture",
+                side_effect=lambda state: events.append("restore capture"),
+            ) as restore_capture,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "codex replacement failed",
+            ),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        install_claude.assert_called_once_with(
+            TARGET_COMMIT,
+            existing_entries=previous_claude,
+            remove_previous=False,
+        )
+        self.assertLess(events.index("install claude"), events.index("pause"))
+        restore_codex.assert_called_once_with(rollback)
+        remove_claude.assert_called_once_with(
+            setup_builder_pulse.target_claude_plugin_id()
+        )
+        restore_capture.assert_called_once_with(paused)
+        self.assertEqual(
+            events[-3:],
+            ["restore codex", "remove new claude", "restore capture"],
+        )
+
+    def test_activation_failure_rolls_back_packages_capture_and_queues(self) -> None:
+        rollback = setup_builder_pulse.RollbackSource(
+            "0.4.4",
+            "b" * 40,
+            setup_builder_pulse.REPOSITORY,
+        )
+        previous_claude = [
+            {
+                "id": "builder-pulse-claude-posix@growthx-builder-tools-v0-4-6",
+                "version": "0.4.6",
+                "enabled": True,
+            }
+        ]
+        target = setup_builder_pulse.target_claude_plugin_id()
+        identity = {
+            "installationId": "installation-1",
+            "installationToken": "token-1",
+            "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+        }
+        snapshot = setup_builder_pulse.LocalCaptureSnapshot(
+            ROOT,
+            identity,
+            None,
+            {"enabled": True},
+            (("prompt-outbox.jsonl", b'{"prompt":"queued"}\n'),),
+        )
+        paused = setup_builder_pulse.PausedCapture(
+            ROOT,
+            identity,
+            (snapshot,),
+            True,
+            "0.4.4",
+        )
+        cli = ROOT / "scripts" / "builder_pulse.py"
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse.shutil,
+                    "which",
+                    side_effect=lambda command: f"/usr/bin/{command}",
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verify_release_exists",
+                    return_value=TARGET_COMMIT,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_builder",
+                    return_value={"version": "0.4.4"},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "marketplace_state",
+                    return_value={
+                        "marketplaceSource": {
+                            "source": setup_builder_pulse.REPOSITORY
+                        }
+                    },
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_rollback_source",
+                    return_value=rollback,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "installed_claude_builders",
+                    side_effect=[
+                        previous_claude,
+                        [
+                            *previous_claude,
+                            {"id": target, "version": "0.5.1", "enabled": True},
+                        ],
+                    ],
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(setup_builder_pulse, "install_claude_release")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "pause_existing_capture",
+                    return_value=paused,
+                )
+            )
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "remove_current"))
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_release",
+                    return_value=cli,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(setup_builder_pulse, "restore_paused_identity")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "plugin_data_dir",
+                    return_value=ROOT,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "authoritative_identity",
+                    return_value=identity,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(setup_builder_pulse, "resume_server_capture")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "activate",
+                    side_effect=setup_builder_pulse.SetupError("activation failed"),
+                )
+            )
+            repause = stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "pause_server_capture",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(setup_builder_pulse, "quarantine_local_capture")
+            )
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "cleanup_partial"))
+            restore_codex = stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "install_verified_rollback",
+                )
+            )
+            remove_claude = stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "remove_claude_plugin",
+                )
+            )
+            restore_capture = stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "restore_previous_capture",
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(setup_builder_pulse, "run_command", return_value="")
+            )
+            stack.enter_context(
+                self.assertRaisesRegex(
+                    setup_builder_pulse.SetupError,
+                    "activation failed",
+                )
+            )
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        repause.assert_called_once_with(identity, "0.5.1")
+        restore_codex.assert_called_once_with(rollback)
+        remove_claude.assert_called_once_with(target)
+        restore_capture.assert_called_once_with(paused)
+
+    def test_partial_unverified_claude_target_is_removed(self) -> None:
+        previous_claude = [
+            {
+                "id": "builder-pulse-claude-posix@growthx-builder-tools-v0-4-6",
+                "version": "0.4.6",
+                "enabled": True,
+            }
+        ]
+        target = setup_builder_pulse.target_claude_plugin_id()
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse.shutil,
+                "which",
+                side_effect=claude_only_which,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_claude_builders",
+                side_effect=[
+                    previous_claude,
+                    [
+                        *previous_claude,
+                        {"id": target, "version": "0.5.1", "enabled": True},
+                    ],
+                ],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_claude_release",
+                side_effect=setup_builder_pulse.SetupError(
+                    "installed tree verification failed"
+                ),
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "remove_claude_plugin",
+            ) as remove_claude,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "installed tree verification failed",
+            ),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        remove_claude.assert_called_once_with(target)
+
+    def test_partial_claude_target_removal_is_attempted_when_lists_fail(self) -> None:
+        previous_claude = [
+            {
+                "id": "builder-pulse-claude-posix@growthx-builder-tools-v0-4-6",
+                "version": "0.4.6",
+                "enabled": True,
+            }
+        ]
+        target = setup_builder_pulse.target_claude_plugin_id()
+        list_failure = setup_builder_pulse.SetupError(
+            "Claude Code returned an invalid plugin list"
+        )
+
+        def fail_after_install_attempt(*args: object, **kwargs: object) -> None:
+            setup_builder_pulse.installed_claude_builders()
+
+        with (
+            mock.patch.object(
+                setup_builder_pulse.shutil,
+                "which",
+                side_effect=claude_only_which,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "verify_release_exists",
+                return_value=TARGET_COMMIT,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "installed_claude_builders",
+                side_effect=[previous_claude, list_failure, list_failure],
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "install_claude_release",
+                side_effect=fail_after_install_attempt,
+            ),
+            mock.patch.object(
+                setup_builder_pulse,
+                "remove_claude_plugin",
+            ) as remove_claude,
+            self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "Claude Code returned an invalid plugin list",
+            ),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+
+        remove_claude.assert_called_once_with(target)
 
     def test_retry_recovers_identity_after_target_and_rollback_both_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1475,7 +2105,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 )
 
             self.assertEqual(server_pause.call_count, 2)
-            server_resume.assert_called_once_with(identity, "0.5.0")
+            server_resume.assert_called_once_with(identity, "0.5.1")
             self.assertFalse((data_dir / "setup-paused-identity.json").exists())
             self.assertEqual(
                 json.loads((data_dir / "identity.json").read_text()),
@@ -1670,6 +2300,82 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     expected_commit,
                 )
 
+    def test_claude_marketplace_accepts_the_current_git_checkout_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            installed = Path(directory) / "marketplace"
+            (installed / ".claude-plugin").mkdir(parents=True)
+            shutil.copy2(
+                ROOT / ".claude-plugin" / "marketplace.json",
+                installed / ".claude-plugin" / "marketplace.json",
+            )
+            shutil.copytree(ROOT / "claude-plugins", installed / "claude-plugins")
+            commands = (
+                ["git", "init", "-q"],
+                ["git", "remote", "add", "origin", setup_builder_pulse.REPOSITORY],
+                ["git", "add", "."],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Builder Pulse Test",
+                    "-c",
+                    "user.email=builder-pulse-test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "current Claude marketplace layout",
+                ],
+            )
+            for command in commands:
+                subprocess.run(command, cwd=installed, check=True)
+            expected_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=installed,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            marketplace = {
+                "name": setup_builder_pulse.CLAUDE_MARKETPLACE,
+                "source": "github",
+                "repo": "GrowthX-Club/builder-pulse-plugin",
+                "installLocation": str(installed),
+            }
+
+            setup_builder_pulse.verify_claude_marketplace(
+                marketplace,
+                expected_commit,
+            )
+
+    def test_agent_preflight_validates_both_package_formats_without_mutation(self) -> None:
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            setup_builder_pulse,
+            "run_command",
+            side_effect=lambda arguments: commands.append(arguments) or "",
+        ):
+            PREFLIGHT_AGENT_INSTALLATION_SUPPORT(
+                codex_available=True,
+                claude_available=True,
+            )
+
+        self.assertEqual(
+            commands,
+            [
+                ["codex", "plugin", "marketplace", "add", "--help"],
+                [
+                    "claude",
+                    "plugin",
+                    "validate",
+                    str(ROOT / ".claude-plugin" / "marketplace.json"),
+                ],
+                [
+                    "claude",
+                    "plugin",
+                    "validate",
+                    str(setup_builder_pulse.expected_claude_package_root()),
+                ],
+            ],
+        )
+
     def test_claude_update_keeps_current_plugin_until_replacement_is_verified(
         self,
     ) -> None:
@@ -1699,7 +2405,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         after = [
             {
                 "id": target,
-                "version": "0.5.0",
+                "version": "0.5.1",
                 "enabled": True,
                 "scope": "user",
                 "installPath": str(installed_root),
@@ -1958,7 +2664,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             runtime_root = (
                 setup_builder_pulse.canonical_plugin_data_dir()
                 / "runtime"
-                / "0.5.0"
+                / "0.5.1"
             )
             self.assertEqual(
                 installed_cli,
@@ -1972,7 +2678,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             runtime_module = importlib.util.module_from_spec(runtime_spec)
             runtime_spec.loader.exec_module(runtime_module)
             self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.0")
+            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.1")
             self.assertTrue(runtime_module.DEFAULTS_PATH.is_file())
             self.assertTrue(runtime_module.MANIFEST_PATH.is_file())
 
@@ -2025,6 +2731,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "installationToken": "token-1",
                 "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
             }
+            previous_claude = [
+                {
+                    "id": "builder-pulse-claude-posix@growthx-builder-tools-v0-5-0",
+                    "version": "0.5.0",
+                    "enabled": True,
+                }
+            ]
 
             def run_command(arguments, *, env=None, expect_json=False):
                 if arguments[0] == "git":
@@ -2042,7 +2755,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 runtime_root = (
                     setup_builder_pulse.canonical_plugin_data_dir()
                     / "runtime"
-                    / "0.5.0"
+                    / "0.5.1"
                 )
                 self.assertEqual(cli, runtime_root / "scripts" / "builder_pulse.py")
                 runtime_spec = importlib.util.spec_from_file_location(
@@ -2053,7 +2766,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 runtime_module = importlib.util.module_from_spec(runtime_spec)
                 runtime_spec.loader.exec_module(runtime_module)
                 self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.0")
+                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.1")
                 activated.append(cli)
                 return {
                     "activationReady": True,
@@ -2095,6 +2808,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     setup_builder_pulse,
+                    "installed_claude_builders",
+                    return_value=previous_claude,
+                ),
+                mock.patch.object(
+                    setup_builder_pulse,
                     "install_claude_release",
                 ) as install_claude,
                 mock.patch.object(
@@ -2113,6 +2831,10 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     setup_builder_pulse,
+                    "remove_previous_claude_builders",
+                ) as remove_previous_claude,
+                mock.patch.object(
+                    setup_builder_pulse,
                     "run_command",
                     side_effect=run_command,
                 ),
@@ -2124,8 +2846,16 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     "Builder Pulse",
                 )
 
-            install_claude.assert_called_once_with(expected)
-            resume.assert_called_once_with(identity, "0.5.0")
+            install_claude.assert_called_once_with(
+                expected,
+                existing_entries=previous_claude,
+                remove_previous=False,
+            )
+            remove_previous_claude.assert_called_once_with(
+                previous_claude,
+                setup_builder_pulse.target_claude_plugin_id(),
+            )
+            resume.assert_called_once_with(identity, "0.5.1")
             self.assertEqual(len(activated), 1)
             self.assertTrue(any("claim" in arguments for arguments in commands))
             self.assertTrue(any("enroll" in arguments for arguments in commands))
@@ -2258,7 +2988,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
 
             self.assertEqual(
                 installed_runtime,
-                [shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py"],
+                [shared / "runtime" / "0.5.1" / "scripts" / "builder_pulse.py"],
             )
             self.assertEqual(
                 json.loads((shared / "identity.json").read_text(encoding="utf-8")),
