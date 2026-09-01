@@ -106,6 +106,16 @@ class BuilderPulseTests(unittest.TestCase):
         )
         return path
 
+    def write_claude_transcript(self, name: str, *records: dict) -> tuple[Path, Path]:
+        claude_home = self.workspace / "claude-home"
+        path = claude_home / "projects" / "product-alpha" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return claude_home, path
+
     def claim_locally(self, endpoint: str = "https://pulse.example") -> dict:
         identity = builder_pulse.ensure_identity(self.data_dir)
         identity.update(
@@ -286,6 +296,7 @@ class BuilderPulseTests(unittest.TestCase):
                     "telemetryReceivedSincePreviousActivation": True,
                     "lastSignalAt": 1_787_721_000_000,
                     "lastSignalPluginVersion": builder_pulse.PLUGIN_VERSION,
+                    "lastSignalAgentPlatform": "codex",
                 },
             ),
         ) as posted, contextlib.redirect_stdout(output):
@@ -310,6 +321,7 @@ class BuilderPulseTests(unittest.TestCase):
         self.assertEqual(
             response["lastSignalPluginVersion"], builder_pulse.PLUGIN_VERSION
         )
+        self.assertEqual(response["lastSignalAgentPlatform"], "codex")
         self.assertEqual(response["hookCount"], 5)
         self.assertNotIn(identity["installationToken"], output.getvalue())
         self.assertEqual(
@@ -563,7 +575,7 @@ class BuilderPulseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     builder_pulse.validate_member_id(invalid)
 
-    def test_installed_cli_derives_the_same_marketplace_data_directory_as_hooks(self) -> None:
+    def test_both_agents_default_to_the_shared_data_directory(self) -> None:
         root = Path("/tmp/codex/plugins/cache/growthx-builder-tools/builder-pulse/0.4.0")
         with mock.patch.object(builder_pulse, "PLUGIN_ROOT", root), mock.patch.dict(
             os.environ,
@@ -572,8 +584,176 @@ class BuilderPulseTests(unittest.TestCase):
         ):
             self.assertEqual(
                 builder_pulse.resolve_data_dir(),
-                Path("/tmp/codex/plugins/data/builder-pulse-growthx-builder-tools"),
+                Path.home() / ".builder-pulse",
             )
+
+    def test_codex_and_claude_namespace_the_same_raw_session_id(self) -> None:
+        self.assertNotEqual(
+            builder_pulse.session_key("shared-session", "codex"),
+            builder_pulse.session_key("shared-session", "claude_code"),
+        )
+
+    def test_claude_primary_prompt_and_lifecycle_are_labelled_without_tokens(
+        self,
+    ) -> None:
+        self.claim_locally()
+        claude_home, transcript = self.write_claude_transcript(
+            "primary.jsonl",
+            {"type": "queue-operation", "operation": "dequeue"},
+            {
+                "type": "user",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "private transcript copy"},
+            },
+        )
+        environment = {
+            "BUILDER_PULSE_AGENT_PLATFORM": "claude_code",
+            "CLAUDE_CONFIG_DIR": str(claude_home),
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            prompt_event = self.record_prompt(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "shared-session",
+                    "transcript_path": str(transcript),
+                    "prompt": "Build the onboarding flow.",
+                },
+                1_787_721_000_000,
+                add_primary_transcript=False,
+            )
+            lifecycle_event = self.record(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "shared-session",
+                    "transcript_path": str(transcript),
+                },
+                1_787_721_000_001,
+            )
+
+        assert prompt_event is not None and lifecycle_event is not None
+        expected_key = builder_pulse.session_key("shared-session", "claude_code")
+        self.assertEqual(prompt_event["agentPlatform"], "claude_code")
+        self.assertEqual(prompt_event["sessionKey"], expected_key)
+        self.assertEqual(lifecycle_event["agentPlatform"], "claude_code")
+        self.assertEqual(lifecycle_event["sessionKey"], expected_key)
+        self.assertNotIn("tokenUsage", lifecycle_event)
+        serialized = json.dumps([prompt_event, lifecycle_event])
+        self.assertNotIn("private transcript copy", serialized)
+        self.assertNotIn(str(transcript), serialized)
+
+    def test_claude_sidechain_and_agent_transcripts_never_capture_prompts(self) -> None:
+        self.claim_locally()
+        cases = (
+            {"type": "user", "isSidechain": True},
+            {"type": "user", "isSidechain": False, "agentId": "child-agent"},
+            {"type": "assistant", "isSidechain": False},
+        )
+        for index, first_record in enumerate(cases):
+            with self.subTest(index=index):
+                claude_home, transcript = self.write_claude_transcript(
+                    f"not-primary-{index}.jsonl", first_record
+                )
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "BUILDER_PULSE_AGENT_PLATFORM": "claude_code",
+                        "CLAUDE_CONFIG_DIR": str(claude_home),
+                    },
+                    clear=False,
+                ):
+                    event = self.record_prompt(
+                        {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": f"child-{index}",
+                            "transcript_path": str(transcript),
+                            "prompt": "Do not capture this.",
+                        },
+                        1_787_721_100_000 + index,
+                        add_primary_transcript=False,
+                    )
+                self.assertIsNone(event)
+
+    def test_claude_main_custom_agent_prompt_is_primary(self) -> None:
+        self.claim_locally()
+        claude_home, transcript = self.write_claude_transcript(
+            "main-custom-agent.jsonl",
+            {
+                "type": "user",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "transcript copy"},
+            },
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUILDER_PULSE_AGENT_PLATFORM": "claude_code",
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+            },
+            clear=False,
+        ):
+            event = self.record_prompt(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "main-custom-agent",
+                    "agent_type": "reviewer",
+                    "transcript_path": str(transcript),
+                    "prompt": "Review the onboarding flow.",
+                },
+                1_787_721_100_100,
+                add_primary_transcript=False,
+            )
+            lifecycle = self.record(
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "main-custom-agent",
+                    "agent_type": "reviewer",
+                    "transcript_path": str(transcript),
+                },
+                1_787_721_100_101,
+            )
+        assert event is not None and lifecycle is not None
+        self.assertEqual(event["agentPlatform"], "claude_code")
+        self.assertEqual(event["promptText"], "Review the onboarding flow.")
+        self.assertEqual(lifecycle["agentPlatform"], "claude_code")
+
+    def test_claude_child_hook_events_create_no_state_or_outbox(self) -> None:
+        self.claim_locally()
+        claude_home, transcript = self.write_claude_transcript(
+            "child-hook.jsonl",
+            {"type": "user", "isSidechain": False, "agentId": "child-agent"},
+        )
+        payloads = (
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "agent_id": "child-agent",
+            },
+            {
+                "hook_event_name": "PermissionRequest",
+                "parent_agent_id": "primary-agent",
+            },
+            {
+                "hook_event_name": "SessionStart",
+                "transcript_path": str(transcript),
+            },
+            {"hook_event_name": "SessionStart", "is_fork": True},
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUILDER_PULSE_AGENT_PLATFORM": "claude_code",
+                "CLAUDE_CONFIG_DIR": str(claude_home),
+            },
+            clear=False,
+        ):
+            for index, payload in enumerate(payloads):
+                with self.subTest(index=index):
+                    self.assertIsNone(
+                        self.record(payload, 1_787_721_100_200 + index)
+                    )
+
+        self.assertFalse((self.data_dir / "states").exists())
+        self.assertFalse((self.data_dir / "outbox.jsonl").exists())
 
     def test_session_end_queues_without_network_flush(self) -> None:
         self.claim_locally()
@@ -997,8 +1177,10 @@ class BuilderPulseTests(unittest.TestCase):
                 "state",
                 "occurredAt",
                 "pluginVersion",
+                "agentPlatform",
             },
         )
+        self.assertEqual(wire_event["agentPlatform"], "codex")
         self.assertIsInstance(event["occurredAt"], int)
         self.assertEqual(event["installationId"], identity["installationId"])
         self.assertEqual(event["projectLabel"], "Product Alpha")
@@ -1057,10 +1239,12 @@ class BuilderPulseTests(unittest.TestCase):
                 "promptText",
                 "occurredAt",
                 "pluginVersion",
+                "agentPlatform",
                 "redacted",
                 "truncated",
             },
         )
+        self.assertEqual(wire_event["agentPlatform"], "codex")
         self.assertEqual(event["schemaVersion"], 1)
         self.assertEqual(event["promptText"], prompt_text)
         self.assertFalse(event["redacted"])
@@ -1157,6 +1341,35 @@ class BuilderPulseTests(unittest.TestCase):
 
         primary.assert_not_called()
         redact.assert_not_called()
+
+    def test_unenrolled_lifecycle_is_rejected_before_transcript_processing(
+        self,
+    ) -> None:
+        self.claim_locally()
+        builder_pulse.atomic_write_json(self.data_dir / "contexts.json", {})
+        payload = {
+            "hook_event_name": "SessionStart",
+            "session_id": "private-session",
+            "cwd": str(self.workspace / "not-enrolled"),
+            "transcript_path": str(self.primary_transcript),
+        }
+
+        with (
+            mock.patch.object(
+                builder_pulse,
+                "validated_transcript_path",
+            ) as validate_transcript,
+            mock.patch.object(
+                builder_pulse,
+                "transcript_marks_subagent_or_fork",
+            ) as inspect_transcript,
+        ):
+            self.assertIsNone(
+                builder_pulse.record_hook_event(self.data_dir, payload, self.config)
+            )
+
+        validate_transcript.assert_not_called()
+        inspect_transcript.assert_not_called()
 
     def test_enrollment_is_rechecked_under_lock_before_any_event_is_queued(self) -> None:
         self.claim_locally()
@@ -1834,6 +2047,7 @@ class BuilderPulseTests(unittest.TestCase):
                 "state",
                 "occurredAt",
                 "pluginVersion",
+                "agentPlatform",
                 "tokenUsage",
             },
         )
@@ -1974,7 +2188,7 @@ class BuilderPulseTests(unittest.TestCase):
                 self.assertEqual(event["schemaVersion"], 1)
                 self.assertNotIn("tokenUsage", event)
 
-    def test_subagent_and_fork_events_never_include_token_snapshots(self) -> None:
+    def test_subagent_and_fork_lifecycle_events_are_never_recorded(self) -> None:
         self.claim_locally()
         private_marker = "private-parent-thread-id"
         metadata_transcript = self.write_transcript(
@@ -2035,9 +2249,7 @@ class BuilderPulseTests(unittest.TestCase):
         for index, payload in enumerate(payloads):
             with self.subTest(index=index):
                 event = self.record(payload, 1_787_721_200_000 + index)
-                assert event is not None
-                self.assertEqual(event["schemaVersion"], 1)
-                self.assertNotIn("tokenUsage", event)
+                self.assertIsNone(event)
 
         persisted = "".join(
             path.read_text(encoding="utf-8", errors="ignore")
@@ -3589,6 +3801,135 @@ class BuilderPulseTests(unittest.TestCase):
 
 
 class HookManifestTests(unittest.TestCase):
+    def test_claude_packages_register_the_exact_native_hook_set(self) -> None:
+        expected_events = builder_pulse.EXPECTED_CLAUDE_HOOK_EVENTS
+        for platform_directory in ("posix", "windows"):
+            with self.subTest(platform=platform_directory):
+                root = builder_pulse.PLUGIN_ROOT / "claude-plugins" / platform_directory
+                manifest = json.loads(
+                    (root / "hooks" / "hooks.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(set(manifest["hooks"]), expected_events)
+                for registrations in manifest["hooks"].values():
+                    self.assertEqual(len(registrations), 1)
+                    self.assertEqual(len(registrations[0]["hooks"]), 1)
+                    command = registrations[0]["hooks"][0]["command"]
+                    if platform_directory == "posix":
+                        self.assertIn("${CLAUDE_PLUGIN_ROOT}", command)
+                    else:
+                        self.assertEqual(
+                            registrations[0]["hooks"][0].get("shell"),
+                            "powershell",
+                        )
+                        self.assertIn("${CLAUDE_PLUGIN_ROOT}", command)
+                        self.assertTrue(command.startswith('& "'))
+                        self.assertIn("builder_pulse_claude.cmd", command)
+                prompt_hook = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+                self.assertIs(prompt_hook.get("async"), True)
+                end_hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
+                self.assertNotIn("async", end_hook)
+
+    def test_claude_plugin_readiness_requires_current_user_scoped_native_hooks(
+        self,
+    ) -> None:
+        platform_directory = "windows" if os.name == "nt" else "posix"
+        plugin_name = f"builder-pulse-claude-{platform_directory}"
+        root = builder_pulse.PLUGIN_ROOT / "claude-plugins" / platform_directory
+        valid = {
+            "id": f"{plugin_name}@growthx-builder-tools-v0-5-0",
+            "version": builder_pulse.PLUGIN_VERSION,
+            "enabled": True,
+            "scope": "user",
+            "installPath": str(root),
+        }
+        self.assertEqual(
+            builder_pulse.evaluate_claude_plugins([valid]),
+            {
+                "ready": True,
+                "hookStatus": "installed",
+                "hookCount": 5,
+                "_pluginRoot": str(root.resolve()),
+            },
+        )
+        for field, value, expected_status in (
+            ("enabled", False, "disabled"),
+            ("scope", "project", "stale_plugin"),
+            ("version", "0.4.6", "stale_plugin"),
+        ):
+            with self.subTest(field=field):
+                invalid = dict(valid)
+                invalid[field] = value
+                result = builder_pulse.evaluate_claude_plugins([invalid])
+                self.assertFalse(result["ready"])
+                self.assertEqual(result["hookStatus"], expected_status)
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher execution test")
+    def test_claude_launcher_really_starts_with_the_shared_runtime(self) -> None:
+        plugin_root = builder_pulse.PLUGIN_ROOT / "claude-plugins" / "posix"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"BUILDER_PULSE_RUNTIME_DIR": str(builder_pulse.PLUGIN_ROOT)},
+            clear=False,
+        ):
+            result = builder_pulse.verify_hook_launcher(
+                Path(directory),
+                agent_platform="claude_code",
+                plugin_root=plugin_root,
+            )
+        self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher execution test")
+    def test_claude_launcher_fails_open_when_the_runtime_crashes(self) -> None:
+        wrapper = (
+            builder_pulse.PLUGIN_ROOT
+            / "claude-plugins"
+            / "posix"
+            / "scripts"
+            / "builder_pulse_claude.sh"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "scripts").mkdir()
+            (runtime / "scripts" / "builder_pulse.py").write_text(
+                "raise SystemExit(9)\n", encoding="utf-8"
+            )
+            environment = dict(os.environ)
+            environment["BUILDER_PULSE_RUNTIME_DIR"] = str(runtime)
+            completed = subprocess.run(
+                ["sh", str(wrapper)],
+                input="{}\n",
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "{}\n")
+        self.assertEqual(completed.stderr, "")
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher execution test")
+    def test_codex_launcher_fails_open_when_the_runtime_crashes(self) -> None:
+        source_wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / "plugin"
+            scripts = plugin_root / "scripts"
+            scripts.mkdir(parents=True)
+            wrapper = scripts / "builder_pulse.sh"
+            wrapper.write_bytes(source_wrapper.read_bytes())
+            (scripts / "builder_pulse.py").write_text(
+                "raise SystemExit(9)\n", encoding="utf-8"
+            )
+            completed = subprocess.run(
+                ["sh", str(wrapper)],
+                input="{}\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "{}\n")
+        self.assertEqual(completed.stderr, "")
+
     def test_codex_hook_commands_use_runtime_plugin_root(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
         commands = [
@@ -3617,6 +3958,18 @@ class HookManifestTests(unittest.TestCase):
         self.assertNotIn('sys.version_info <', contents)
         self.assertNotIn('sys.version_info ^<', contents)
 
+    def test_windows_claude_wrapper_uses_the_versioned_plugin_root_layout(self) -> None:
+        wrapper = (
+            builder_pulse.PLUGIN_ROOT
+            / "claude-plugins"
+            / "windows"
+            / "scripts"
+            / "builder_pulse_claude.cmd"
+        )
+        contents = wrapper.read_text(encoding="utf-8")
+        self.assertIn('%BP_RUNTIME%\\scripts\\builder_pulse.py', contents)
+        self.assertNotIn('%BP_RUNTIME%\\builder_pulse.py', contents)
+
     def test_platform_hook_launcher_really_starts_and_returns_valid_hook_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = builder_pulse.verify_hook_launcher(Path(directory))
@@ -3642,6 +3995,42 @@ class HookManifestTests(unittest.TestCase):
         )
         self.assertEqual(options["env"]["PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
         self.assertNotIn("cwd", options)
+
+    def test_windows_claude_launcher_verification_uses_powershell_hook_semantics(
+        self,
+    ) -> None:
+        completed = subprocess.CompletedProcess([], 0, "{}\n", "")
+        root = Path(r"C:\\Users\\Builder One\\.claude\\plugins\\builder-pulse")
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            with mock.patch.object(
+                builder_pulse.os, "name", "nt"
+            ), mock.patch.object(
+                builder_pulse.shutil, "which", return_value="powershell.exe"
+            ), mock.patch.object(
+                builder_pulse.subprocess, "run", return_value=completed
+            ) as run:
+                result = builder_pulse.verify_hook_launcher(
+                    data_dir,
+                    agent_platform="claude_code",
+                    plugin_root=root,
+                )
+
+        self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f'& "{root}\\scripts\\builder_pulse_claude.cmd"',
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["CLAUDE_PLUGIN_ROOT"], str(root)
+        )
+        self.assertNotIn("cwd", run.call_args.kwargs)
 
     def test_windows_launcher_supports_a_unc_plugin_root_without_changing_cwd(
         self,

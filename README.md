@@ -1,8 +1,8 @@
 # Builder Pulse
 
 Builder Pulse connects a builder's claimed installation to GrowthX, reports
-coarse progress, and sends submitted Codex prompts so GrowthX can provide
-learning feedback.
+coarse progress, and sends submitted primary prompts from Codex and Claude Code
+so GrowthX can provide learning feedback.
 
 In commands below, `<python>` means `python3` on macOS/Linux and `py -3` on
 Windows.
@@ -19,11 +19,11 @@ project folders a member explicitly enrolls. Installing and claiming Builder
 Pulse enables the data collection described below only for those folders. The
 claim command displays this exact disclosure before making the request:
 
-> Builder Pulse is installed machine-wide, but it sends data only from project folders you explicitly enroll. GrowthX stores the claimed member ID, name, email address, and any optional default project or program copied from the member record so telemetry can be linked to the right person. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, plugin version, optional cumulative token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
+> Builder Pulse installs hooks for Codex and Claude Code when those agents are available on this computer, but it sends data only from project folders you explicitly enroll. One shared identity and project allowlist apply to both agents. GrowthX stores the claimed member ID, name, email address, and any optional roster or program label supplied by GrowthX so telemetry can be linked to the right person. A roster or program label is never used as a telemetry project. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, agent name, plugin version, optional cumulative Codex token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
 
 Builder Pulse sends only:
 
-- a random installation ID and hashed Codex session key;
+- a random installation ID, agent name, and agent-namespaced hashed session key;
 - a stable sanitized project ID and the member-confirmed project display name;
 - an optional feature ID and feature label explicitly set by the builder;
 - `building`, `testing`, `blocked`, `ready`, or `idle`;
@@ -56,9 +56,9 @@ never added to prompt or lifecycle events. A submitted prompt may itself mention
 such content; that user-authored message remains part of `promptText`. A shell
 command hook may be inspected in process just long enough to recognize testing
 or a review artifact, then discarded. Subagent and fork prompts are not captured.
-Prompt capture fails closed unless the hook supplies a trusted Codex transcript
-path whose first bounded record is valid `session_meta` with no subagent/fork
-source or parent markers.
+Prompt capture fails closed unless the hook supplies a trusted primary-agent
+transcript path whose first bounded conversation record proves it is not a
+subagent, sidechain, or fork.
 
 For an event that is already due, the plugin may best-effort inspect a bounded
 tail of the local Codex session file for the latest numeric `token_count`
@@ -72,7 +72,7 @@ usage from being counted twice. The plugin recognizes only explicit child-run
 hook fields, exact child transcript path segments, and the structural
 `session_meta.payload.source` marker; none of that metadata is retained.
 
-Builder Pulse reports approximate **Codex-active time**, not working hours.
+Builder Pulse reports approximate **agent-active time**, not working hours.
 Overlapping sessions and devices are deduplicated by the server.
 
 ## One-time claim (no login)
@@ -103,7 +103,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.4.6"
+  "pluginVersion": "0.5.0"
 }
 ```
 
@@ -117,7 +117,7 @@ a member-confirmed local enrollment.
 ## Project enrollment and feature context
 
 Before enrollment, show the disclosure above. Do not ask for the folder or
-display name in a primary Codex conversation: an older hook may still capture
+display name in a primary agent conversation: an older hook may still capture
 that answer. Run `work enroll` interactively instead. Its local terminal prompt
 shows only the current working directory and, if different, its nearest Git
 repository root, then asks the member to confirm the exact boundary and type
@@ -156,9 +156,9 @@ projects remains intact. There is no global project fallback.
 
 ## Delivery behavior
 
-Hooks run asynchronously except `SessionEnd`, which Codex always runs
-synchronously. `UserPromptSubmit` records and attempts the current prompt in a
-background hook so an interpreter, path, or network failure can never block a
+Hooks run asynchronously where the host supports it; `SessionEnd` remains
+synchronous. `UserPromptSubmit` records and attempts the current prompt in a
+nonblocking hook so an interpreter, path, or network failure can never block a
 builder's prompt. The current prompt is attempted first under a 750 ms network
 timeout; older prompt and lifecycle backlog is left for later asynchronous
 hooks so an outage cannot stall every submitted prompt behind retries.
@@ -174,7 +174,7 @@ Claimed installations append the exact minimal event to a bounded local
 installation token as a bearer header. Failed events retain the same `eventId`
 for server-side deduplication and retry on a later state change/heartbeat. Queue
 updates are file-locked and atomic; normal enqueue is append-only, with bounded
-compaction at 500 events. Delivery failure never interrupts Codex.
+compaction at 500 events. Delivery failure never interrupts Codex or Claude Code.
 
 Separately, every eligible primary `UserPromptSubmit` creates the exact bounded
 prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
@@ -193,7 +193,8 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.4.6",
+  "pluginVersion": "0.5.0",
+  "agentPlatform": "claude_code",
   "redacted": false,
   "truncated": false
 }
@@ -201,7 +202,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
 
 `projectLabel` and `projectScope` are required for every event the service
 accepts. The service rejects unscoped payloads from every plugin version, so
-v0.4.5 and older stop reporting until they update and the member explicitly
+v0.4.6 and older stop reporting until they update and the member explicitly
 enrolls a project folder.
 `featureId` and `featureLabel` are omitted when unavailable. The prompt outbox
 uses the same file lock, maximum queue length, and flush batch size as the
@@ -236,7 +237,8 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.4.6"
+  "pluginVersion": "0.5.0",
+  "agentPlatform": "codex"
 }
 ```
 
@@ -260,19 +262,22 @@ existing schema v1 payload is preserved.
 ```
 
 Status reports lifecycle and prompt queue counts separately. `flush` retries
-both queues. `activate` reads the local Codex app-server's official
-`hooks/list` result and exits successfully only when every Builder Pulse hook
-is current, enabled, and trusted or managed and the Builder Pulse service
-accepts the claimed installation. That proves activation readiness, not event
-delivery. `telemetryReceived: true` means the server has received something at
+both queues. `activate --agent codex` reads Codex's official local hook list;
+`activate --agent claude_code` reads Claude Code's official installed-plugin
+list and validates the installed hook manifest. Each exits successfully only
+when that agent's Builder Pulse hooks are current and the service accepts the
+claimed installation. That proves activation readiness, not event delivery.
+`telemetryReceived: true` means the server has received something at
 some point; it can be historical. Current repair proof requires
 `telemetryReceivedSincePreviousActivation: true`, a non-null `lastSignalAt`, and
-`lastSignalPluginVersion: "0.4.6"`. That proof uses the server receipt time, not
-the member computer's event clock. Activation does not create a lifecycle event
+`lastSignalPluginVersion: "0.5.0"` with a matching `lastSignalAgentPlatform`.
+That proof uses the server receipt time, not the member computer's event clock.
+Activation does not create a lifecycle event
 or change the builder's work state.
 
-The hook runtime writes to Codex's `PLUGIN_DATA`. Interactive commands launched
-from an installed marketplace cache derive that same directory automatically.
+Both agents use one agent-neutral data directory at `~/.builder-pulse`. The
+installer copies a legacy Codex-owned identity into it without deleting the old
+directory, then quarantines old capture before resuming the shared identity.
 Set `BUILDER_PULSE_DATA_DIR` or pass `--data-dir` only for explicit local/testing
 access. Supported environment overrides include `BUILDER_PULSE_ENABLED`,
 `BUILDER_PULSE_ENDPOINT`, and `BUILDER_PULSE_CLAIM_TIMEOUT_SECONDS`. Project and
@@ -285,24 +290,27 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. For manual
-recovery, install the current immutable v0.4.6 release with:
+recovery, install the current immutable v0.5.0 release. The prepared installer
+installs every supported agent found on the computer. Codex's manual package
+commands are:
 
 ```bash
-codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.4.6
+codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.0
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 Before installing, verify both the exact Git tag and the corresponding
 published GitHub Release. The release API response must report
-`tag_name: "v0.4.6"`, `draft: false`, and `immutable: true`; a tag existing by
+`tag_name: "v0.5.0"`, `draft: false`, and `immutable: true`; a tag existing by
 itself is not proof of immutability. The prepared installer performs both
 checks and fails closed if either one cannot be verified.
 
 The prepared installer defaults to `https://precious-ant-429.convex.site`. It
 records and remotely verifies the existing package's exact full commit before
 changing registration, then uses that commit—not a movable version tag—as the
-only rollback source. Exit every running Codex session before starting a fresh
-task so no process keeps the previous hook manifest or version path in memory.
+only rollback source. Exit every running Claude Code and Codex session before
+starting fresh sessions so no process keeps the previous hook manifest or
+version path in memory.
 To pause without removing local identity or the project allowlist, run
 `config set enabled false`. Disable is serialized with final delivery, purges
 unsent lifecycle and prompt queues plus current local work state, and overrides

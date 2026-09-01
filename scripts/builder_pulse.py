@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Builder Pulse: privacy-bounded Codex lifecycle and prompt telemetry.
+"""Builder Pulse: privacy-bounded agent lifecycle and prompt telemetry.
 
 Hook payloads can contain prompts, commands, paths, source, and tool I/O. This
 module may inspect a command in memory to classify a state, but it never writes
 or forwards commands, paths, source, tool I/O, transcripts, or assistant
 responses. Primary UserPromptSubmit text is separately redacted, bounded, and
 queued for learning feedback. Only state transitions and a 15-minute heartbeat
-can create a lifecycle event. An already-due primary-session event may include
+can create a lifecycle event. An already-due primary Codex event may include
 exactly five allowlisted cumulative numeric token counters from a local Codex
-token_count record. Subagent and fork snapshots are suppressed; transcript
-paths and all other content are discarded.
+token_count record; Claude Code events never synthesize token counters.
+Subagent and fork snapshots are suppressed; transcript paths and all other
+content are discarded.
 """
 
 from __future__ import annotations
@@ -55,14 +56,18 @@ PROJECT_SCOPE_TRANSPORT = "explicit-v1"
 PROJECT_SCOPE_MIGRATION_VERSION = 2
 CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS = 0.75
 SETUP_DISCLOSURE = (
-    "Builder Pulse is installed machine-wide, but it sends data only from project "
-    "folders you explicitly enroll. GrowthX stores the claimed member ID, name, email "
-    "address, and any optional default project or program copied from the member record "
-    "so telemetry can be linked to the right person. For each enrolled project, it "
+    "Builder Pulse installs hooks for Codex and Claude Code when those agents are "
+    "available on this computer, but it sends data only from project folders you "
+    "explicitly enroll. One shared identity and project allowlist apply to both agents. "
+    "GrowthX stores the claimed member ID, name, email address, and any optional "
+    "roster or program label supplied by GrowthX so telemetry can be linked to the "
+    "right person. A roster or program label is never used as a telemetry project. "
+    "For each enrolled project, it "
     "receives a stable installation ID, "
     "a one-way hashed session ID, the display name you confirm and a sanitized project "
     "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
-    "timestamps, plugin version, optional cumulative token counts, and each primary "
+    "timestamps, agent name, plugin version, optional cumulative Codex token counts, "
+    "and each primary "
     "prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated "
     "Builder Pulse admins can view these identity and telemetry fields for learning "
     "feedback. Raw lifecycle events "
@@ -79,6 +84,8 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS_PATH = PLUGIN_ROOT / "config" / "defaults.json"
 MANIFEST_PATH = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 FALLBACK_ROOT = Path.home() / ".builder-pulse"
+AGENT_PLATFORMS = {"codex", "claude_code"}
+DEFAULT_AGENT_PLATFORM = "codex"
 
 STATES = {"building", "testing", "blocked", "ready", "idle"}
 
@@ -152,10 +159,20 @@ SUBAGENT_PARENT_KEYS = frozenset(
         "parentAgentId",
         "parentSessionId",
         "parentThreadId",
+        "agent_id",
+        "agentId",
     }
 )
 SUBAGENT_FLAG_KEYS = frozenset(
-    {"is_fork", "is_forked", "is_subagent", "isFork", "isForked", "isSubagent"}
+    {
+        "is_fork",
+        "is_forked",
+        "is_subagent",
+        "isFork",
+        "isForked",
+        "isSubagent",
+        "isSidechain",
+    }
 )
 SUBAGENT_PATH_PARTS = frozenset({"fork", "forks", "subagent", "subagents"})
 
@@ -169,12 +186,26 @@ def read_json(path: Path, fallback: Any) -> Any:
 
 
 def plugin_version() -> str:
-    manifest = read_json(MANIFEST_PATH, {})
-    version = manifest.get("version") if isinstance(manifest, dict) else None
-    return str(version) if isinstance(version, str) and version else "0.0.0"
+    configured = os.environ.get("BUILDER_PULSE_PLUGIN_VERSION")
+    if isinstance(configured, str) and re.fullmatch(r"\d+\.\d+\.\d+", configured):
+        return configured
+    for manifest_path in (
+        MANIFEST_PATH,
+        PLUGIN_ROOT / ".claude-plugin" / "plugin.json",
+    ):
+        manifest = read_json(manifest_path, {})
+        version = manifest.get("version") if isinstance(manifest, dict) else None
+        if isinstance(version, str) and version:
+            return version
+    return "0.0.0"
 
 
 PLUGIN_VERSION = plugin_version()
+
+
+def current_agent_platform() -> str:
+    value = os.environ.get("BUILDER_PULSE_AGENT_PLATFORM", DEFAULT_AGENT_PLATFORM)
+    return value if value in AGENT_PLATFORMS else DEFAULT_AGENT_PLATFORM
 
 
 def utc_now_ms() -> int:
@@ -387,28 +418,69 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def legacy_data_dirs() -> tuple[Path, ...]:
+    """Return old agent-owned data roots without treating them as canonical."""
+    candidates: list[Path] = []
+    for variable in ("PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(Path(value).expanduser())
+    candidates.append(
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "data"
+        / "builder-pulse-growthx-builder-tools"
+    )
+    try:
+        cache_dir = PLUGIN_ROOT.parent.parent.parent
+        if cache_dir.name == "cache":
+            marketplace = PLUGIN_ROOT.parent.parent.name
+            plugin_name = PLUGIN_ROOT.parent.name
+            candidates.append(
+                cache_dir.parent / "data" / f"{plugin_name}-{marketplace}"
+            )
+    except (IndexError, OSError):
+        pass
+    unique: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            continue
+        if resolved != FALLBACK_ROOT.resolve(strict=False) and resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
+def migrate_legacy_data_dir(canonical: Path) -> None:
+    """Copy one existing identity to the shared root; never delete the source."""
+    if canonical.exists():
+        return
+    for source in legacy_data_dirs():
+        identity = read_json(source / "identity.json", {})
+        if not isinstance(identity, dict) or not valid_uuid(identity.get("installationId")):
+            continue
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        temporary = canonical.parent / f".{canonical.name}-migration-{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(source, temporary, symlinks=False)
+            try:
+                os.replace(temporary, canonical)
+            except FileExistsError:
+                shutil.rmtree(temporary, ignore_errors=True)
+        except OSError:
+            shutil.rmtree(temporary, ignore_errors=True)
+        return
+
+
 def resolve_data_dir(explicit: str | None = None) -> Path:
     if explicit:
         return Path(explicit).expanduser()
     configured = os.environ.get("BUILDER_PULSE_DATA_DIR")
     if configured:
         return Path(configured).expanduser()
-    plugin_data = os.environ.get("PLUGIN_DATA") or os.environ.get(
-        "CLAUDE_PLUGIN_DATA"
-    )
-    if plugin_data:
-        return Path(plugin_data).expanduser()
-    # An interactive command launched from an installed marketplace cache does
-    # not receive PLUGIN_DATA. Derive the exact directory Codex gives the hooks
-    # so claim/status/work/flush and hooks always share one identity.
-    try:
-        cache_dir = PLUGIN_ROOT.parent.parent.parent
-        if cache_dir.name == "cache":
-            marketplace = PLUGIN_ROOT.parent.parent.name
-            plugin_name = PLUGIN_ROOT.parent.name
-            return cache_dir.parent / "data" / f"{plugin_name}-{marketplace}"
-    except (IndexError, OSError):
-        pass
+    migrate_legacy_data_dir(FALLBACK_ROOT)
     return FALLBACK_ROOT
 
 
@@ -621,9 +693,22 @@ def claimed_identity(data_dir: Path) -> dict[str, Any]:
     return identity
 
 
-def session_key(raw_session_id: str) -> str:
+def session_key(raw_session_id: str, agent_platform: str | None = None) -> str:
     value = raw_session_id or "unknown-session"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    platform = agent_platform or current_agent_platform()
+    return hashlib.sha256(f"{platform}:{value}".encode("utf-8")).hexdigest()[:16]
+
+
+def raw_session_identifier(payload: dict[str, Any]) -> str:
+    platform = current_agent_platform()
+    environment_key = (
+        "CLAUDE_SESSION_ID" if platform == "claude_code" else "CODEX_SESSION_ID"
+    )
+    return str(
+        payload.get("session_id")
+        or os.environ.get(environment_key)
+        or "unknown-session"
+    )
 
 
 def repository_key(data_dir: Path, value: str | Path | None) -> str:
@@ -877,17 +962,30 @@ def capped_active_from(previous: dict[str, Any], now_ms: int) -> int | None:
     return start
 
 
-def allowed_transcript_roots() -> tuple[Path, ...]:
-    configured_home = os.environ.get("CODEX_HOME")
-    if configured_home:
-        candidate = Path(configured_home).expanduser()
+def allowed_transcript_roots(agent_platform: str | None = None) -> tuple[Path, ...]:
+    platform = agent_platform or current_agent_platform()
+    if platform == "claude_code":
+        configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
+        candidate = (
+            Path(configured_home).expanduser()
+            if configured_home
+            else Path.home() / ".claude"
+        )
         homes = [candidate] if candidate.is_absolute() else []
+        directories = ("projects",)
     else:
-        homes = [Path.home() / ".codex"]
+        configured_home = os.environ.get("CODEX_HOME")
+        candidate = (
+            Path(configured_home).expanduser()
+            if configured_home
+            else Path.home() / ".codex"
+        )
+        homes = [candidate] if candidate.is_absolute() else []
+        directories = ("sessions", "archived_sessions")
 
     roots: list[Path] = []
     for home in homes:
-        for directory in ("sessions", "archived_sessions"):
+        for directory in directories:
             try:
                 root = (home / directory).resolve(strict=False)
             except OSError:
@@ -897,7 +995,9 @@ def allowed_transcript_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def validated_transcript_path(payload: dict[str, Any]) -> Path | None:
+def validated_transcript_path(
+    payload: dict[str, Any], agent_platform: str | None = None
+) -> Path | None:
     value = payload.get("transcript_path")
     if (
         not isinstance(value, str)
@@ -919,7 +1019,7 @@ def validated_transcript_path(payload: dict[str, Any]) -> Path | None:
         return None
     if not any(
         resolved == root or root in resolved.parents
-        for root in allowed_transcript_roots()
+        for root in allowed_transcript_roots(agent_platform)
     ):
         return None
     return resolved
@@ -949,10 +1049,14 @@ def payload_marks_subagent_or_fork(payload: dict[str, Any]) -> bool:
     return source_marks_subagent_or_fork(payload.get("source"))
 
 
-def transcript_marks_subagent_or_fork(path: Path) -> bool:
+def transcript_marks_subagent_or_fork(
+    path: Path, agent_platform: str | None = None
+) -> bool:
     """Inspect only bounded structural session metadata and retain nothing."""
     if any(part.lower() in SUBAGENT_PATH_PARTS for part in path.parts):
         return True
+    if (agent_platform or current_agent_platform()) == "claude_code":
+        return not transcript_structurally_marks_primary(path, "claude_code")
     try:
         with path.open("rb") as handle:
             raw_line = handle.readline(TOKEN_USAGE_MAX_RECORD_BYTES + 1)
@@ -969,9 +1073,46 @@ def transcript_marks_subagent_or_fork(path: Path) -> bool:
     )
 
 
-def transcript_structurally_marks_primary(path: Path) -> bool:
+def transcript_structurally_marks_primary(
+    path: Path, agent_platform: str | None = None
+) -> bool:
     """Require trusted, bounded session metadata with no child-run markers."""
     if any(part.lower() in SUBAGENT_PATH_PARTS for part in path.parts):
+        return False
+    platform = agent_platform or current_agent_platform()
+    if platform == "claude_code":
+        # Claude may put bounded queue metadata before the first conversation
+        # record. Require that first conversation record to be the primary user
+        # thread; fail closed for sidechains, agent transcripts, and ambiguity.
+        total_bytes = 0
+        try:
+            with path.open("rb") as handle:
+                for _ in range(64):
+                    raw_line = handle.readline(TOKEN_USAGE_MAX_RECORD_BYTES + 1)
+                    if not raw_line:
+                        break
+                    total_bytes += len(raw_line)
+                    if (
+                        len(raw_line) > TOKEN_USAGE_MAX_RECORD_BYTES
+                        or total_bytes > 256 * 1024
+                    ):
+                        return False
+                    try:
+                        record = json.loads(raw_line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        return False
+                    if not isinstance(record, dict):
+                        return False
+                    if record.get("type") not in {"user", "assistant"}:
+                        continue
+                    return bool(
+                        record.get("type") == "user"
+                        and record.get("isSidechain") is False
+                        and not record.get("agentId")
+                        and not record.get("agent_id")
+                    )
+        except OSError:
+            return False
         return False
     try:
         with path.open("rb") as handle:
@@ -992,8 +1133,9 @@ def is_primary_user_prompt(payload: dict[str, Any]) -> bool:
         return False
     if payload_marks_subagent_or_fork(payload):
         return False
-    path = validated_transcript_path(payload)
-    return path is not None and transcript_structurally_marks_primary(path)
+    platform = current_agent_platform()
+    path = validated_transcript_path(payload, platform)
+    return path is not None and transcript_structurally_marks_primary(path, platform)
 
 
 def truncate_utf8(text: str, max_bytes: int = PROMPT_MAX_BYTES) -> tuple[str, bool]:
@@ -1110,10 +1252,12 @@ def validated_token_usage(value: Any) -> dict[str, int] | None:
 def token_usage_snapshot(payload: dict[str, Any]) -> dict[str, int] | None:
     """Read one cumulative numeric snapshot without retaining path or transcript data."""
     try:
+        if current_agent_platform() != "codex":
+            return None
         if payload_marks_subagent_or_fork(payload):
             return None
-        path = validated_transcript_path(payload)
-        if path is None or transcript_marks_subagent_or_fork(path):
+        path = validated_transcript_path(payload, "codex")
+        if path is None or transcript_marks_subagent_or_fork(path, "codex"):
             return None
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -1175,6 +1319,7 @@ def telemetry_payload(
         "state": state,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
+        "agentPlatform": current_agent_platform(),
     }
     if feature_id and feature_label:
         event["featureId"] = feature_id
@@ -1210,6 +1355,7 @@ def prompt_payload(
         "promptText": prompt_text,
         "occurredAt": occurred_at,
         "pluginVersion": PLUGIN_VERSION,
+        "agentPlatform": current_agent_platform(),
         "redacted": redacted,
         "truncated": truncated,
     }
@@ -1520,12 +1666,7 @@ def record_prompt_event(
     ):
         return None
 
-    raw_session_id = str(
-        payload.get("session_id")
-        or os.environ.get("CODEX_SESSION_ID")
-        or "unknown-session"
-    )
-    key = session_key(raw_session_id)
+    key = session_key(raw_session_identifier(payload))
     project_id = str(scoped["project_id"])
     project_label = str(scoped["project_label"])
     scope_key = str(scoped["scope_key"])
@@ -1577,22 +1718,27 @@ def record_prompt_event(
 def record_hook_event(
     data_dir: Path, payload: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any] | None:
+    agent_platform = current_agent_platform()
+    if payload_marks_subagent_or_fork(payload):
+        return None
+
     cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     enrolled = enrolled_work_context(data_dir, cwd)
     if enrolled is None:
         return None
     context_key, scoped, _ = enrolled
 
+    transcript_path = validated_transcript_path(payload, agent_platform)
+    if transcript_path is not None and transcript_marks_subagent_or_fork(
+        transcript_path, agent_platform
+    ):
+        return None
+
     explicit_key = payload.get("_session_key")
     if isinstance(explicit_key, str) and explicit_key:
         key = validate_identifier(explicit_key, "session_key")
     else:
-        raw_session_id = str(
-            payload.get("session_id")
-            or os.environ.get("CODEX_SESSION_ID")
-            or "unknown-session"
-        )
-        key = session_key(raw_session_id)
+        key = session_key(raw_session_identifier(payload))
     identity = ensure_identity(data_dir)
     installation_id = str(identity["installationId"])
     now_ms = utc_now_ms()
@@ -1661,6 +1807,7 @@ def record_hook_event(
                 "projectId": project_id,
                 "projectLabel": project_label,
                 "projectScope": PROJECT_SCOPE_POLICY,
+                "agentPlatform": current_agent_platform(),
                 "state": next_state,
                 "stateChangedAt": (
                     now_ms if changed else previous.get("stateChangedAt", now_ms)
@@ -3060,17 +3207,154 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 process.kill()
 
 
-def verify_hook_launcher(data_dir: Path) -> dict[str, Any]:
-    """Execute the exact platform launcher Codex will invoke for a hook."""
+EXPECTED_CLAUDE_HOOK_EVENTS = {
+    "PermissionRequest",
+    "PostToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "UserPromptSubmit",
+}
+
+
+def expected_claude_plugin_id() -> str:
+    name = (
+        "builder-pulse-claude-windows"
+        if os.name == "nt"
+        else "builder-pulse-claude-posix"
+    )
+    marketplace = f"growthx-builder-tools-v{PLUGIN_VERSION.replace('.', '-')}"
+    return f"{name}@{marketplace}"
+
+
+def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
+    """Reduce Claude's official plugin list to a bounded hook readiness result."""
+    if not isinstance(response, list):
+        return {"ready": False, "hookStatus": "invalid_response"}
+    expected_id = expected_claude_plugin_id()
+    matches = [
+        entry
+        for entry in response
+        if isinstance(entry, dict) and entry.get("id") == expected_id
+    ]
+    if len(matches) != 1:
+        return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
+    entry = matches[0]
+    if entry.get("enabled") is not True:
+        return {"ready": False, "hookStatus": "disabled", "hookCount": 0}
+    if entry.get("scope") != "user" or entry.get("version") != PLUGIN_VERSION:
+        return {"ready": False, "hookStatus": "stale_plugin", "hookCount": 0}
+    install_path = entry.get("installPath")
+    if not isinstance(install_path, str) or not install_path:
+        return {"ready": False, "hookStatus": "invalid_response", "hookCount": 0}
+    try:
+        plugin_root = Path(install_path).resolve(strict=True)
+        manifest_path = plugin_root / "hooks" / "hooks.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise OSError
+        manifest = read_json(manifest_path, {})
+    except (OSError, ValueError):
+        return {"ready": False, "hookStatus": "stale_plugin", "hookCount": 0}
+    hooks = manifest.get("hooks") if isinstance(manifest, dict) else None
+    if not isinstance(hooks, dict) or set(hooks) != EXPECTED_CLAUDE_HOOK_EVENTS:
+        return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+    launcher_name = (
+        "builder_pulse_claude.cmd"
+        if os.name == "nt"
+        else "builder_pulse_claude.sh"
+    )
+    for event_name in EXPECTED_CLAUDE_HOOK_EVENTS:
+        groups = hooks.get(event_name)
+        if not isinstance(groups, list) or len(groups) != 1:
+            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+        group = groups[0]
+        commands = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(commands, list) or len(commands) != 1:
+            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+        command = commands[0]
+        if (
+            not isinstance(command, dict)
+            or command.get("type") != "command"
+            or launcher_name not in str(command.get("command") or "")
+        ):
+            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+        if os.name == "nt" and command.get("shell") != "powershell":
+            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+    return {
+        "ready": True,
+        "hookStatus": "installed",
+        "hookCount": len(EXPECTED_CLAUDE_HOOK_EVENTS),
+        "_pluginRoot": str(plugin_root),
+    }
+
+
+def inspect_claude_hooks(timeout_seconds: float = 10.0) -> dict[str, Any]:
+    claude = shutil.which("claude")
+    if not claude:
+        return {"ready": False, "hookStatus": "claude_not_found"}
+    try:
+        completed = subprocess.run(
+            [claude, "plugin", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ready": False, "hookStatus": "plugin_list_unavailable"}
+    if completed.returncode != 0:
+        return {"ready": False, "hookStatus": "plugin_list_unavailable"}
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"ready": False, "hookStatus": "invalid_response"}
+    return evaluate_claude_plugins(response)
+
+
+def verify_hook_launcher(
+    data_dir: Path,
+    agent_platform: str = DEFAULT_AGENT_PLATFORM,
+    plugin_root: Path | None = None,
+) -> dict[str, Any]:
+    """Execute the exact platform launcher the selected agent will invoke."""
+    launcher_root = plugin_root or PLUGIN_ROOT
     environment = dict(os.environ)
     environment["BUILDER_PULSE_DATA_DIR"] = str(data_dir)
+    environment["BUILDER_PULSE_AGENT_PLATFORM"] = agent_platform
+    environment["BUILDER_PULSE_PLUGIN_VERSION"] = PLUGIN_VERSION
     if os.name == "nt":
-        environment["PLUGIN_ROOT"] = str(PLUGIN_ROOT)
-        # Expand PLUGIN_ROOT exactly once. CALL reparses the expanded path and
-        # corrupts legal roots containing paired percent tokens such as %TEAM%.
-        command = 'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""'
+        launcher_name = (
+            "builder_pulse_claude.cmd"
+            if agent_platform == "claude_code"
+            else "builder_pulse.cmd"
+        )
+        if agent_platform == "claude_code":
+            environment["CLAUDE_PLUGIN_ROOT"] = str(launcher_root)
+            powershell = (
+                shutil.which("pwsh")
+                or shutil.which("powershell")
+                or shutil.which("powershell.exe")
+            )
+            if not powershell:
+                return {"ready": False, "hookStatus": "launcher_unavailable"}
+            command = [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f'& "{launcher_root}\\scripts\\{launcher_name}"',
+            ]
+        else:
+            environment["PLUGIN_ROOT"] = str(launcher_root)
+            # Expand PLUGIN_ROOT exactly once. CALL reparses the expanded path and
+            # corrupts legal roots containing paired percent tokens such as %TEAM%.
+            command = f'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\{launcher_name}""'
     else:
-        command = ["sh", str(PLUGIN_ROOT / "scripts" / "builder_pulse.sh")]
+        launcher_name = (
+            "builder_pulse_claude.sh"
+            if agent_platform == "claude_code"
+            else "builder_pulse.sh"
+        )
+        command = ["sh", str(launcher_root / "scripts" / launcher_name)]
     try:
         completed = subprocess.run(
             command,
@@ -3094,8 +3378,12 @@ def verify_hook_launcher(data_dir: Path) -> dict[str, Any]:
     return {"ready": True, "hookStatus": "launcher_verified"}
 
 
-def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
-    """Verify Codex hook readiness and the claimed server connection."""
+def command_activate(
+    data_dir: Path,
+    cwd: Path | None = None,
+    agent_platform: str = DEFAULT_AGENT_PLATFORM,
+) -> int:
+    """Verify one agent's hook readiness and the claimed server connection."""
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
@@ -3118,6 +3406,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
                     "ready": False,
                     "reviewRequired": False,
                     "hookStatus": "disabled",
+                    "agentPlatform": agent_platform,
                 },
                 indent=2,
                 sort_keys=True,
@@ -3125,8 +3414,17 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         )
         return 3
 
-    hook_result = inspect_codex_hooks(cwd or Path.cwd())
+    hook_result = (
+        inspect_codex_hooks(cwd or Path.cwd())
+        if agent_platform == "codex"
+        else inspect_claude_hooks()
+    )
     if not hook_result.get("ready"):
+        public_hook_result = {
+            key: value
+            for key, value in hook_result.items()
+            if not key.startswith("_")
+        }
         print(
             json.dumps(
                 {
@@ -3134,7 +3432,8 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
                     "activationReady": False,
                     "reviewRequired": hook_result.get("hookStatus")
                     in {"modified", "review_required"},
-                    **hook_result,
+                    "agentPlatform": agent_platform,
+                    **public_hook_result,
                 },
                 indent=2,
                 sort_keys=True,
@@ -3142,7 +3441,17 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
         )
         return 3
 
-    launcher_result = verify_hook_launcher(data_dir)
+    plugin_root_value = hook_result.get("_pluginRoot")
+    launcher_root = (
+        Path(plugin_root_value)
+        if isinstance(plugin_root_value, str) and plugin_root_value
+        else None
+    )
+    launcher_result = verify_hook_launcher(
+        data_dir,
+        agent_platform,
+        plugin_root=launcher_root,
+    )
     if not launcher_result.get("ready"):
         print(
             json.dumps(
@@ -3150,6 +3459,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
                     "connected": False,
                     "activationReady": False,
                     "reviewRequired": False,
+                    "agentPlatform": agent_platform,
                     **launcher_result,
                 },
                 indent=2,
@@ -3164,6 +3474,7 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
             "schemaVersion": 1,
             "installationId": identity.get("installationId"),
             "pluginVersion": PLUGIN_VERSION,
+            "agentPlatform": agent_platform,
         },
         token=token,
         timeout=float(config.get("claim_timeout_seconds", 10.0)),
@@ -3179,12 +3490,14 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
     )
     last_signal_at = response.get("lastSignalAt")
     last_signal_plugin_version = response.get("lastSignalPluginVersion")
+    last_signal_agent_platform = response.get("lastSignalAgentPlatform")
     current_version_receipt = bool(
         telemetry_received_since_activation
         and isinstance(last_signal_at, int)
         and not isinstance(last_signal_at, bool)
         and last_signal_at > 0
         and last_signal_plugin_version == PLUGIN_VERSION
+        and last_signal_agent_platform == agent_platform
     )
     print(
         json.dumps(
@@ -3194,7 +3507,9 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
                 # proves this repaired hook path delivered telemetry.
                 "connected": current_version_receipt,
                 "activationReady": True,
-                "hooksTrusted": True,
+                "hooksVerified": True,
+                "hooksTrusted": agent_platform == "codex",
+                "pluginInstalled": agent_platform == "claude_code",
                 "serverVerified": True,
                 "telemetryReceived": telemetry_received,
                 "telemetryReceivedSincePreviousActivation": (
@@ -3206,6 +3521,10 @@ def command_activate(data_dir: Path, cwd: Path | None = None) -> int:
                 "lastSignalPluginVersion": last_signal_plugin_version
                 if isinstance(last_signal_plugin_version, str)
                 else None,
+                "lastSignalAgentPlatform": last_signal_agent_platform
+                if last_signal_agent_platform in AGENT_PLATFORMS
+                else None,
+                "agentPlatform": agent_platform,
                 "hookStatus": hook_result["hookStatus"],
                 "hookCount": hook_result["hookCount"],
                 "installationId": identity.get("installationId"),
@@ -3227,7 +3546,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("hook", help="Ingest one Codex hook payload from stdin")
+    subparsers.add_parser("hook", help="Ingest one agent hook payload from stdin")
 
     claim = subparsers.add_parser("claim", help="Claim this installation once")
     claim.add_argument("--code", help="One-time invite code (interactive prompt if omitted)")
@@ -3289,9 +3608,14 @@ def build_parser() -> argparse.ArgumentParser:
     config_unset.add_argument("key", choices=sorted(CONFIG_KEYS))
 
     subparsers.add_parser("flush", help="Retry queued minimal events")
-    subparsers.add_parser(
+    activate = subparsers.add_parser(
         "activate",
-        help="Verify official Codex hook trust and the claimed server connection",
+        help="Verify one agent's official hooks and the claimed server connection",
+    )
+    activate.add_argument(
+        "--agent",
+        choices=sorted(AGENT_PLATFORMS),
+        default=DEFAULT_AGENT_PLATFORM,
     )
     return parser
 
@@ -3315,7 +3639,7 @@ def main() -> int:
     if args.command == "flush":
         return command_flush(data_dir)
     if args.command == "activate":
-        return command_activate(data_dir)
+        return command_activate(data_dir, agent_platform=args.agent)
     return 2
 
 
