@@ -1,6 +1,6 @@
-# Builder Pulse v0.5.0 setup
+# Builder Pulse v0.5.1 setup
 
-This guide belongs to the immutable `v0.5.0` release. Run it only from the
+This guide belongs to the immutable `v0.5.1` release. Run it only from the
 release-pinned URL. Do not use a guide or installer from a default branch.
 
 The installer targets the current stable release, preserves the existing plugin
@@ -29,27 +29,37 @@ inferred from folder names, prompt text, or the roster's legacy
 Use Python 3.11+ (`python3` on macOS/Linux or `py -3` on Windows). Before
 executing repository code, verify the external release facts:
 
-1. `git ls-remote --exit-code --refs https://github.com/GrowthX-Club/builder-pulse-plugin.git refs/tags/v0.5.0`
+1. `git ls-remote --exit-code --refs https://github.com/GrowthX-Club/builder-pulse-plugin.git refs/tags/v0.5.1`
    must return exactly one tag ref.
 2. An unauthenticated `GET` to
-   `https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/v0.5.0`
-   must return `tag_name: "v0.5.0"`, `draft: false`, and `immutable: true`.
+   `https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/v0.5.1`
+   must return `tag_name: "v0.5.1"`, `draft: false`, and `immutable: true`.
 
 Stop safely if either proof is unavailable. Create a fresh temporary directory,
-then clone only the verified tag with `--depth 1 --branch v0.5.0
+then clone only the verified tag with `--depth 1 --branch v0.5.1
 --single-branch`. Before running anything from the clone, require
-`git describe --tags --exact-match HEAD` to print `v0.5.0` and require the
-clone's `refs/tags/v0.5.0` object ID to equal the object ID returned by
+`git describe --tags --exact-match HEAD` to print `v0.5.1` and require the
+clone's `refs/tags/v0.5.1` object ID to equal the object ID returned by
 `ls-remote`. Run the installer interactively without project arguments:
 
 ```text
-<python> <temporary-v0.5.0-clone>/scripts/setup_builder_pulse.py
+<python> <temporary-v0.5.1-clone>/scripts/setup_builder_pulse.py
 ```
 
 For an already-claimed recovery that deliberately has no new invite, run the
 same command with `--reuse-existing-claim`. It fails closed unless a verified
-installed package reports a complete claimed identity, and it requires the
-same installation, builder, and GrowthX member IDs after replacement.
+preserved local identity is complete, and it requires the same installation,
+builder, and GrowthX member IDs after replacement.
+
+### Recovery from the v0.5.0 upgrade regression
+
+Do not retry the v0.5.0 installer. If that installer removed an existing Codex
+or Claude Code registration, preserve both `~/.builder-pulse` and the legacy
+Codex Builder Pulse data directory. After independently verifying the immutable
+v0.5.1 release as described above, run its installer with
+`--reuse-existing-claim`. The repair reuses the quarantined claimed identity;
+it does not require or consume a new invite code. Do not delete or hand-edit the
+preserved data directories.
 
 The installer securely asks for the personalized handbook code without echoing
 it. An agent that already received the code in its setup prompt may instead
@@ -109,7 +119,7 @@ previous hook manifest or version path in memory. Start a fresh session in each
 agent you use and send one ordinary prompt from inside an enrolled project.
 Then run `activate --agent codex` and/or `activate --agent claude_code` in a
 subsequent turn. Only `telemetryReceivedSincePreviousActivation: true` with a
-non-null `lastSignalAt`, `lastSignalPluginVersion: "0.5.0"`, and the matching
+non-null `lastSignalAt`, `lastSignalPluginVersion: "0.5.1"`, and the matching
 `lastSignalAgentPlatform` is current end-to-end proof for that agent.
 `telemetryReceived: true` alone can describe a historical event. Hook readiness,
 `serverVerified: true`, or empty local queues alone do not prove delivery.

@@ -103,7 +103,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.5.0"
+  "pluginVersion": "0.5.1"
 }
 ```
 
@@ -193,7 +193,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.5.0",
+  "pluginVersion": "0.5.1",
   "agentPlatform": "claude_code",
   "redacted": false,
   "truncated": false
@@ -237,7 +237,7 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.5.0",
+  "pluginVersion": "0.5.1",
   "agentPlatform": "codex"
 }
 ```
@@ -270,7 +270,7 @@ claimed installation. That proves activation readiness, not event delivery.
 `telemetryReceived: true` means the server has received something at
 some point; it can be historical. Current repair proof requires
 `telemetryReceivedSincePreviousActivation: true`, a non-null `lastSignalAt`, and
-`lastSignalPluginVersion: "0.5.0"` with a matching `lastSignalAgentPlatform`.
+`lastSignalPluginVersion: "0.5.1"` with a matching `lastSignalAgentPlatform`.
 That proof uses the server receipt time, not the member computer's event clock.
 Activation does not create a lifecycle event
 or change the builder's work state.
@@ -290,18 +290,18 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. For manual
-recovery, install the current immutable v0.5.0 release. The prepared installer
+recovery, install the current immutable v0.5.1 release. The prepared installer
 installs every supported agent found on the computer. Codex's manual package
 commands are:
 
 ```bash
-codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.0
+codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.1
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 Before installing, verify both the exact Git tag and the corresponding
 published GitHub Release. The release API response must report
-`tag_name: "v0.5.0"`, `draft: false`, and `immutable: true`; a tag existing by
+`tag_name: "v0.5.1"`, `draft: false`, and `immutable: true`; a tag existing by
 itself is not proof of immutability. The prepared installer performs both
 checks and fails closed if either one cannot be verified.
 

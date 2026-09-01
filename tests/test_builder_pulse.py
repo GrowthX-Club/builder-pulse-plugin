@@ -3836,7 +3836,7 @@ class HookManifestTests(unittest.TestCase):
         plugin_name = f"builder-pulse-claude-{platform_directory}"
         root = builder_pulse.PLUGIN_ROOT / "claude-plugins" / platform_directory
         valid = {
-            "id": f"{plugin_name}@growthx-builder-tools-v0-5-0",
+            "id": f"{plugin_name}@growthx-builder-tools-v0-5-1",
             "version": builder_pulse.PLUGIN_VERSION,
             "enabled": True,
             "scope": "user",

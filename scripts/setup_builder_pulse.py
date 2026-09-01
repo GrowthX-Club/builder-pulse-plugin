@@ -29,7 +29,7 @@ APPROVED_EXISTING_REPOSITORIES = {
 }
 MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
-TARGET_RELEASE = "v0.5.0"
+TARGET_RELEASE = "v0.5.1"
 CLAUDE_MARKETPLACE = f"growthx-builder-tools-{TARGET_RELEASE.replace('.', '-')}"
 CLAUDE_POSIX_PLUGIN = f"builder-pulse-claude-posix@{CLAUDE_MARKETPLACE}"
 CLAUDE_WINDOWS_PLUGIN = f"builder-pulse-claude-windows@{CLAUDE_MARKETPLACE}"
@@ -69,15 +69,32 @@ class SetupError(RuntimeError):
     pass
 
 
+class LocalPauseRollbackError(SetupError):
+    def __init__(self, snapshot: LocalCaptureSnapshot, detail: str) -> None:
+        super().__init__(detail)
+        self.snapshot = snapshot
+
+
 class RollbackSource(NamedTuple):
     version: str
     commit: str
     repository: str
 
 
+class LocalCaptureSnapshot(NamedTuple):
+    data_dir: Path
+    identity: dict[str, Any] | None
+    paused_identity: dict[str, Any] | None
+    config: dict[str, Any] | None
+    queues: tuple[tuple[str, bytes], ...]
+
+
 class PausedCapture(NamedTuple):
     data_dir: Path
     identity: dict[str, Any]
+    locations: tuple[LocalCaptureSnapshot, ...] = ()
+    server_paused: bool = False
+    plugin_version: str = ""
 
 
 def is_filesystem_root(path: PurePath) -> bool:
@@ -90,6 +107,12 @@ def run_command(
     env: dict[str, str] | None = None,
     expect_json: bool = False,
 ) -> Any:
+    display_command = arguments[0]
+    if display_command in {"git", "codex", "claude"}:
+        executable = shutil.which(display_command)
+        if executable is None:
+            raise SetupError(f"Command could not start: {display_command}")
+        arguments = [executable, *arguments[1:]]
     try:
         completed = subprocess.run(
             arguments,
@@ -99,16 +122,16 @@ def run_command(
             env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise SetupError(f"Command could not start: {arguments[0]}") from exc
+        raise SetupError(f"Command could not start: {display_command}") from exc
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
-        raise SetupError(detail or f"Command failed: {arguments[0]}")
+        raise SetupError(detail or f"Command failed: {display_command}")
     if not expect_json:
         return completed.stdout
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise SetupError(f"{arguments[0]} returned invalid JSON") from exc
+        raise SetupError(f"{display_command} returned invalid JSON") from exc
 
 
 def cli_command(cli: Path, *arguments: str) -> list[str]:
@@ -137,6 +160,22 @@ def atomic_write_object(path: Path, value: dict[str, Any]) -> None:
     ) as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        temporary = Path(handle.name)
+    try:
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as handle:
+        handle.write(value)
         temporary = Path(handle.name)
     try:
         os.chmod(temporary, 0o600)
@@ -514,6 +553,103 @@ def quarantine_local_capture(data_dir: Path, identity: dict[str, Any]) -> None:
                         pass
 
 
+def local_capture_snapshot(data_dir: Path) -> LocalCaptureSnapshot:
+    def optional_object(path: Path) -> dict[str, Any] | None:
+        return read_object(path, required=True) if path.exists() else None
+
+    queues: list[tuple[str, bytes]] = []
+    try:
+        for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
+            path = data_dir / filename
+            if path.exists():
+                if path.is_symlink() or not path.is_file():
+                    raise SetupError(f"Builder Pulse data is invalid: {filename}")
+                queues.append((filename, path.read_bytes()))
+    except OSError as exc:
+        raise SetupError("Builder Pulse pending delivery data is unreadable") from exc
+    return LocalCaptureSnapshot(
+        data_dir=data_dir.resolve(strict=False),
+        identity=optional_object(data_dir / "identity.json"),
+        paused_identity=optional_object(data_dir / "setup-paused-identity.json"),
+        config=optional_object(data_dir / "config.json"),
+        queues=tuple(queues),
+    )
+
+
+def restore_local_capture_snapshot(snapshot: LocalCaptureSnapshot) -> None:
+    data_dir = snapshot.data_dir
+
+    def restore_object(path: Path, value: dict[str, Any] | None) -> None:
+        if value is None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            atomic_write_object(path, value)
+
+    restore_object(data_dir / "identity.json", snapshot.identity)
+    restore_object(
+        data_dir / "setup-paused-identity.json", snapshot.paused_identity
+    )
+    restore_object(data_dir / "config.json", snapshot.config)
+    queued_names = {filename for filename, _contents in snapshot.queues}
+    for filename in ("outbox.jsonl", "prompt-outbox.jsonl", "quarantine.jsonl"):
+        path = data_dir / filename
+        if filename not in queued_names:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    for filename, contents in snapshot.queues:
+        atomic_write_bytes(data_dir / filename, contents)
+
+
+def pause_local_capture(
+    data_dir: Path, identity: dict[str, Any]
+) -> LocalCaptureSnapshot:
+    """Quarantine one data root while retaining an exact in-process rollback."""
+    with exclusive_file_lock(data_dir / ".delivery.lock"):
+        with exclusive_file_lock(data_dir / ".scope-delivery.lock"):
+            with exclusive_file_lock(data_dir / ".lock"):
+                snapshot = local_capture_snapshot(data_dir)
+                try:
+                    identity_path = data_dir / "identity.json"
+                    paused_path = data_dir / "setup-paused-identity.json"
+                    config_path = data_dir / "config.json"
+                    if identity and not paused_path.exists():
+                        atomic_write_object(paused_path, identity)
+                    paused_identity = dict(identity)
+                    for key in ("installationToken", "pendingInstallationToken"):
+                        paused_identity.pop(key, None)
+                    if paused_identity:
+                        paused_identity["promptCapture"] = "off"
+                        atomic_write_object(identity_path, paused_identity)
+                    config = read_object(config_path) if config_path.exists() else {}
+                    config["enabled"] = False
+                    atomic_write_object(config_path, config)
+                    for filename in (
+                        "outbox.jsonl",
+                        "prompt-outbox.jsonl",
+                        "quarantine.jsonl",
+                    ):
+                        try:
+                            (data_dir / filename).unlink()
+                        except FileNotFoundError:
+                            pass
+                except BaseException as pause_error:
+                    try:
+                        restore_local_capture_snapshot(snapshot)
+                    except BaseException as restore_error:
+                        raise LocalPauseRollbackError(
+                            snapshot,
+                            "Builder Pulse could not be disabled locally and its "
+                            f"previous state could not be restored: {restore_error}",
+                        ) from pause_error
+                    raise
+                return snapshot
+
+
 def pause_existing_capture(
     installation: dict[str, Any] | None,
 ) -> PausedCapture:
@@ -522,9 +658,29 @@ def pause_existing_capture(
     installed_version = (
         installation.get("version") if isinstance(installation, dict) else None
     )
+    locations: list[LocalCaptureSnapshot] = []
+    legacy_data_dir: Path | None = None
+    legacy_identity: dict[str, Any] = {}
+    if installation is not None:
+        try:
+            legacy_cli = installed_cli(installation)
+        except SetupError:
+            legacy_cli = None
+        candidate = legacy_codex_plugin_data_dir(legacy_cli)
+        if candidate != data_dir.resolve(strict=False) and candidate.exists():
+            legacy_data_dir = candidate
+            legacy_identity = authoritative_identity(candidate)
+            if (
+                identity
+                and legacy_identity.get("installationId")
+                != identity.get("installationId")
+            ):
+                raise SetupError("The legacy and shared Builder Pulse identities differ")
+
     server_pause_error: BaseException | None = None
+    server_paused = False
     try:
-        pause_server_capture(
+        server_paused = pause_server_capture(
             identity,
             str(installed_version or TARGET_RELEASE.removeprefix("v")),
         )
@@ -536,33 +692,42 @@ def pause_existing_capture(
     # an idempotent retry. A running legacy process may have cached a token, so
     # the caller must stop until the server pause is known and old sessions exit.
     try:
-        quarantine_local_capture(data_dir, identity)
-        if installation is not None:
+        locations.append(pause_local_capture(data_dir, identity))
+        if legacy_data_dir is not None:
+            locations.append(pause_local_capture(legacy_data_dir, legacy_identity))
+    except BaseException as exc:
+        restore_errors: list[str] = []
+        if isinstance(exc, LocalPauseRollbackError):
+            locations.append(exc.snapshot)
+        for snapshot in reversed(locations):
             try:
-                legacy_cli = installed_cli(installation)
-            except SetupError:
-                legacy_cli = None
-            legacy_data_dir = legacy_codex_plugin_data_dir(legacy_cli)
-            if (
-                legacy_data_dir != data_dir.resolve(strict=False)
-                and legacy_data_dir.exists()
-            ):
-                legacy_identity = authoritative_identity(legacy_data_dir)
-                if (
-                    identity
-                    and legacy_identity.get("installationId")
-                    != identity.get("installationId")
-                ):
-                    raise SetupError(
-                        "The legacy and shared Builder Pulse identities differ"
-                    )
-                quarantine_local_capture(legacy_data_dir, legacy_identity)
-    except (OSError, SetupError) as exc:
+                with exclusive_file_lock(snapshot.data_dir / ".delivery.lock"):
+                    with exclusive_file_lock(snapshot.data_dir / ".scope-delivery.lock"):
+                        with exclusive_file_lock(snapshot.data_dir / ".lock"):
+                            restore_local_capture_snapshot(snapshot)
+            except BaseException as restore_error:
+                restore_errors.append(str(restore_error))
+        if server_paused and not restore_errors:
+            try:
+                resume_server_capture(
+                    identity,
+                    str(installed_version or TARGET_RELEASE.removeprefix("v")),
+                )
+            except BaseException as restore_error:
+                restore_errors.append(str(restore_error))
         detail = (
             " GrowthX server privacy-pause status is also unknown."
             if server_pause_error is not None
             else ""
         )
+        if restore_errors:
+            detail += " The previous capture state could not be restored completely."
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            print(
+                "Builder Pulse pause was interrupted; local and server rollback was attempted.",
+                file=sys.stderr,
+            )
+            raise
         raise SetupError(
             "Builder Pulse could not be disabled locally."
             f"{detail} Exit all running Claude Code and Codex sessions now and do not continue "
@@ -579,7 +744,13 @@ def pause_existing_capture(
             print(detail, file=sys.stderr)
             raise server_pause_error
         raise SetupError(detail) from server_pause_error
-    return PausedCapture(data_dir=data_dir, identity=identity)
+    return PausedCapture(
+        data_dir=data_dir,
+        identity=identity,
+        locations=tuple(locations),
+        server_paused=server_paused,
+        plugin_version=str(installed_version or TARGET_RELEASE.removeprefix("v")),
+    )
 
 
 def restore_paused_identity(cli: Path, paused: PausedCapture | None) -> None:
@@ -599,6 +770,28 @@ def restore_paused_identity(cli: Path, paused: PausedCapture | None) -> None:
                     )
                 atomic_write_object(target_data_dir / "identity.json", stored)
                 paused_path.unlink()
+
+
+def restore_previous_capture(paused: PausedCapture | None) -> None:
+    """Restore every pre-upgrade local state and the prior server policy."""
+    if paused is None:
+        return
+    locations = paused.locations or (
+        LocalCaptureSnapshot(
+            paused.data_dir,
+            paused.identity,
+            None,
+            None,
+            (),
+        ),
+    )
+    for snapshot in locations:
+        with exclusive_file_lock(snapshot.data_dir / ".delivery.lock"):
+            with exclusive_file_lock(snapshot.data_dir / ".scope-delivery.lock"):
+                with exclusive_file_lock(snapshot.data_dir / ".lock"):
+                    restore_local_capture_snapshot(snapshot)
+    if paused.server_paused:
+        resume_server_capture(paused.identity, paused.plugin_version)
 
 
 def marketplace_state() -> dict[str, Any] | None:
@@ -968,20 +1161,33 @@ def verify_claude_marketplace(
     if not isinstance(install_location, str) or not install_location:
         raise SetupError("Claude Code did not report the GrowthX marketplace checkout")
 
-    # Claude Code materializes marketplaces as Git-less snapshots. It records
-    # the resolved revision in .gcs-sha, so validate that marker and then prove
-    # every executable/declarative marketplace file matches the already
-    # verified immutable installer checkout. The source/revision metadata alone
-    # is not sufficient because a local marketplace cache can be modified.
+    # Claude Code may materialize a marketplace as either a Git checkout or a
+    # Git-less snapshot with a .gcs-sha revision marker. Validate whichever
+    # immutable-revision representation it supplied, then prove every package
+    # file matches the already verified installer checkout. Source metadata
+    # alone is insufficient because a local marketplace cache can be modified.
     root = Path(install_location).expanduser().resolve(strict=False)
-    try:
-        commit = (root / ".gcs-sha").read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise SetupError("The Claude Code GrowthX marketplace is unreadable") from exc
-    if not re.fullmatch(r"[0-9a-f]{40}", commit) or commit != expected_commit:
-        raise SetupError(
-            "The Claude Code GrowthX marketplace does not match the immutable release"
-        )
+    marker = root / ".gcs-sha"
+    if marker.is_file():
+        try:
+            commit = marker.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise SetupError("The Claude Code GrowthX marketplace is unreadable") from exc
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or commit != expected_commit:
+            raise SetupError(
+                "The Claude Code GrowthX marketplace does not match the immutable release"
+            )
+    elif (root / ".git").exists():
+        repository, commit = verified_git_checkout(root)
+        if (
+            normalized_repository(repository) != normalized_repository(REPOSITORY)
+            or commit != expected_commit
+        ):
+            raise SetupError(
+                "The Claude Code GrowthX marketplace does not match the immutable release"
+            )
+    else:
+        raise SetupError("The Claude Code GrowthX marketplace is unreadable")
 
     source_root = Path(__file__).resolve().parent.parent
     relative_roots = (
@@ -1058,6 +1264,36 @@ def expected_claude_package_root() -> Path:
     return Path(__file__).resolve().parent.parent / "claude-plugins" / platform_directory
 
 
+def target_claude_plugin_id() -> str:
+    return CLAUDE_WINDOWS_PLUGIN if os.name == "nt" else CLAUDE_POSIX_PLUGIN
+
+
+def preflight_agent_installation_support(
+    *, codex_available: bool, claude_available: bool
+) -> None:
+    """Prove installed agent CLIs can parse the target package before replacement."""
+    if codex_available:
+        run_command(["codex", "plugin", "marketplace", "add", "--help"])
+    if claude_available:
+        source_root = Path(__file__).resolve().parent.parent
+        run_command(
+            [
+                "claude",
+                "plugin",
+                "validate",
+                str(source_root / ".claude-plugin" / "marketplace.json"),
+            ]
+        )
+        run_command(
+            [
+                "claude",
+                "plugin",
+                "validate",
+                str(expected_claude_package_root()),
+            ]
+        )
+
+
 def verify_claude_install_tree(root: Path) -> None:
     """Prove Claude installed the exact package from this immutable checkout."""
     source_root = expected_claude_package_root().resolve(strict=True)
@@ -1082,11 +1318,15 @@ def verify_claude_install_tree(root: Path) -> None:
         )
 
 
-def install_claude_release(expected_commit: str) -> Path:
-    existing_entries = installed_claude_builders()
-    plugin_id = (
-        CLAUDE_WINDOWS_PLUGIN if os.name == "nt" else CLAUDE_POSIX_PLUGIN
-    )
+def install_claude_release(
+    expected_commit: str,
+    *,
+    existing_entries: list[dict[str, Any]] | None = None,
+    remove_previous: bool = True,
+) -> Path:
+    if existing_entries is None:
+        existing_entries = installed_claude_builders()
+    plugin_id = target_claude_plugin_id()
     target_was_installed = any(
         entry.get("id") == plugin_id for entry in existing_entries
     )
@@ -1129,24 +1369,30 @@ def install_claude_release(expected_commit: str) -> Path:
         raise SetupError("The installed Claude Code Builder Pulse manifest is invalid")
     verify_claude_install_tree(root)
 
-    # Only remove older releases or the other OS package after the replacement
-    # is proven. Dormant older marketplace declarations are harmless and remain
-    # available for recovery; their plugins no longer register hooks.
-    for existing_entry in existing_entries:
-        existing_id = existing_entry.get("id")
-        if isinstance(existing_id, str) and existing_id != plugin_id:
-            remove_claude_plugin(existing_id)
+    # Direct callers may remove older registrations after the replacement is
+    # proven. Transactional setup defers that cleanup until both agents and
+    # server delivery are verified, keeping the prior Claude plugin available
+    # throughout every fallible installation and activation step.
+    if remove_previous:
+        remove_previous_claude_builders(existing_entries, plugin_id)
     return root
 
 
+def remove_previous_claude_builders(
+    existing_entries: list[dict[str, Any]],
+    target_plugin_id: str,
+) -> None:
+    for existing_entry in existing_entries:
+        existing_id = existing_entry.get("id")
+        if isinstance(existing_id, str) and existing_id != target_plugin_id:
+            remove_claude_plugin(existing_id)
+
+
 def cleanup_partial() -> None:
-    try:
-        remove_current(
-            plugin_installed=installed_builder() is not None,
-            marketplace_configured=marketplace_state() is not None,
-        )
-    except SetupError:
-        pass
+    remove_current(
+        plugin_installed=installed_builder() is not None,
+        marketplace_configured=marketplace_state() is not None,
+    )
 
 
 def verified_remote_tag_commit(release: str) -> str:
@@ -1329,6 +1575,10 @@ def setup(
     # Verify the installer itself before reading or changing identity state.
     # The runtime installer repeats this check immediately before copying code.
     verified_installer_checkout(target_commit)
+    preflight_agent_installation_support(
+        codex_available=codex_available,
+        claude_available=claude_available,
+    )
     previous = installed_builder() if codex_available else None
     previous_marketplace = marketplace_state() if codex_available else None
     if previous_marketplace:
@@ -1336,10 +1586,6 @@ def setup(
         repository = source.get("source") if isinstance(source, dict) else None
         if not approved_existing_repository(repository):
             raise SetupError("The GrowthX marketplace name points to a different source")
-
-    # Move the old Codex-owned identity to the agent-neutral data directory
-    # before pausing or changing either agent. The old directory is retained.
-    migrate_existing_data_to_shared(previous)
 
     # Resolve and remotely verify the exact currently installed commit before
     # reading its data or changing either Codex registration. A tag is not
@@ -1351,72 +1597,83 @@ def setup(
             authoritative_identity(existing_plugin_data_dir(previous))
         )
 
-    # Claude executes this shared runtime directly. Install it only after any
-    # legacy Codex identity has moved into the shared root so runtime creation
-    # cannot make that migration look like a conflicting identity directory.
-    shared_cli = install_shared_runtime(target_commit)
-
-    # Stop older machine-wide capture without executing the old checkout. The
-    # authentication token remains quarantined on any failed replacement, so
-    # an inherited legacy BUILDER_PULSE_ENABLED=1 cannot resume capture.
-    paused = pause_existing_capture(previous)
-    codex_cli: Path | None = None
-    if codex_available:
-        remove_current(
-            plugin_installed=previous is not None,
-            marketplace_configured=previous_marketplace is not None,
-            rollback_source=rollback_source,
-        )
-        try:
-            codex_cli = install_release(TARGET_RELEASE, expected_commit=target_commit)
-        except SetupError:
-            cleanup_partial()
-            if rollback_source is not None:
-                try:
-                    install_verified_rollback(rollback_source)
-                except SetupError as rollback_error:
-                    raise SetupError(
-                        "Builder Pulse update failed and the previous version could not be restored: "
-                        f"{rollback_error}"
-                    ) from rollback_error
-            raise
-
-    if claude_available:
-        install_claude_release(target_commit)
-    cli = codex_cli or shared_cli
-
-    # A bare package is inert. Preserve that state while restoring or claiming
-    # identity and adding the member-confirmed project to the allowlist.
-    run_command(cli_command(cli, "config", "set", "enabled", "false"))
-    restore_paused_identity(cli, paused)
-    if reuse_existing_claim:
-        if claimed_identity(cli) != preserved_identity:
-            raise SetupError("The Builder Pulse identity changed during repair")
-    else:
-        claim_env = dict(os.environ)
-        claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
-        run_command(
-            cli_command(cli, "claim", "--endpoint", endpoint),
-            env=claim_env,
-        )
-    run_command(
-        cli_command(
-            cli,
-            "work",
-            "enroll",
-            "--root",
-            str(enrolled_root),
-            "--project",
-            confirmed_label,
-        )
+    previous_claude = installed_claude_builders() if claude_available else []
+    claude_target = target_claude_plugin_id()
+    claude_target_was_installed = any(
+        entry.get("id") == claude_target for entry in previous_claude
     )
-    target_plugin_version = TARGET_RELEASE.removeprefix("v")
+    claude_install_attempted = False
+    paused: PausedCapture | None = None
+    codex_mutated = False
+    codex_cli: Path | None = None
+    delivery_data_dir: Path | None = None
+    delivery_identity: dict[str, Any] | None = None
     resume_attempted = False
-    delivery_data_dir = plugin_data_dir(cli)
-    delivery_identity = authoritative_identity(delivery_data_dir)
     setup_succeeded = False
-    setup_failure: BaseException | None = None
     try:
+        # Claude's release-scoped target is additive. Install and verify it while
+        # every previous registration and Codex capture path are still intact.
+        # A marketplace-format or package failure therefore cannot strand a
+        # previously working member.
+        if claude_available:
+            claude_install_attempted = True
+            install_claude_release(
+                target_commit,
+                existing_entries=previous_claude,
+                remove_previous=False,
+            )
+
+        # Move the old Codex-owned identity to the agent-neutral data directory
+        # only after every target agent has proved it can install. The old
+        # directory remains available for an exact rollback.
+        migrate_existing_data_to_shared(previous)
+
+        # Claude executes this immutable shared runtime directly.
+        shared_cli = install_shared_runtime(target_commit)
+
+        # Stop older machine-wide capture immediately before the one package
+        # operation that cannot be side-by-side. Any failure below restores the
+        # exact previous Codex package and capture state.
+        paused = pause_existing_capture(previous)
+        if codex_available:
+            codex_mutated = True
+            remove_current(
+                plugin_installed=previous is not None,
+                marketplace_configured=previous_marketplace is not None,
+                rollback_source=rollback_source,
+            )
+            codex_cli = install_release(TARGET_RELEASE, expected_commit=target_commit)
+
+        cli = codex_cli or shared_cli
+
+        # A bare package is inert. Preserve that state while restoring or claiming
+        # identity and adding the member-confirmed project to the allowlist.
+        delivery_data_dir = plugin_data_dir(cli)
+        run_command(cli_command(cli, "config", "set", "enabled", "false"))
+        restore_paused_identity(cli, paused)
+        if reuse_existing_claim:
+            if claimed_identity(cli) != preserved_identity:
+                raise SetupError("The Builder Pulse identity changed during repair")
+        else:
+            claim_env = dict(os.environ)
+            claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
+            run_command(
+                cli_command(cli, "claim", "--endpoint", endpoint),
+                env=claim_env,
+            )
+        run_command(
+            cli_command(
+                cli,
+                "work",
+                "enroll",
+                "--root",
+                str(enrolled_root),
+                "--project",
+                confirmed_label,
+            )
+        )
+        target_plugin_version = TARGET_RELEASE.removeprefix("v")
+        delivery_identity = authoritative_identity(delivery_data_dir)
         # A network failure can happen after the service commits the resume but
         # before this process receives the acknowledgement. Treat every attempt
         # as potentially successful and restore the server barrier on any later
@@ -1452,40 +1709,99 @@ def setup(
                     f"Builder Pulse activation was not verified for {agent_name}"
                 )
         run_command(cli_command(cli, "flush"))
+        # The target package, hooks, server policy, and first delivery are now
+        # verified. Only at this point may older Claude registrations be
+        # removed. A cleanup failure leaves the verified target and capture
+        # active instead of quarantining a working installation again.
         setup_succeeded = True
-    except BaseException as exc:
-        setup_failure = exc
-        raise
-    finally:
-        cleanup_errors: list[str] = []
-        if not setup_succeeded and resume_attempted:
+        if claude_available:
+            remove_previous_claude_builders(previous_claude, claude_target)
+    except BaseException as setup_error:
+        if setup_succeeded:
+            raise
+
+        rollback_errors: list[str] = []
+        target_capture_safe = True
+        if resume_attempted and delivery_identity is not None:
             try:
                 pause_server_capture(delivery_identity, target_plugin_version)
-            except BaseException:
-                cleanup_errors.append("server privacy-pause status is unknown")
-        if not setup_succeeded:
+            except BaseException as rollback_error:
+                target_capture_safe = False
+                rollback_errors.append(
+                    f"target server privacy-pause status is unknown: {rollback_error}"
+                )
+        if delivery_data_dir is not None:
             try:
-                quarantine_local_capture(delivery_data_dir, delivery_identity)
-            except BaseException:
-                cleanup_errors.append("local capture could not be disabled")
-        if not setup_succeeded and cleanup_errors and not isinstance(
-            setup_failure, (KeyboardInterrupt, SystemExit)
+                current_identity = authoritative_identity(delivery_data_dir)
+                quarantine_local_capture(delivery_data_dir, current_identity)
+            except BaseException as rollback_error:
+                target_capture_safe = False
+                rollback_errors.append(
+                    f"target local capture could not be disabled: {rollback_error}"
+                )
+
+        codex_restored = not codex_mutated
+        if codex_mutated:
+            try:
+                cleanup_partial()
+                if rollback_source is not None:
+                    install_verified_rollback(rollback_source)
+                codex_restored = True
+            except BaseException as rollback_error:
+                rollback_errors.append(f"previous Codex package: {rollback_error}")
+
+        # install_claude_release may register the target and then fail during
+        # version/tree verification. Re-read the registration list when
+        # possible, but if that list is itself unavailable, still attempt the
+        # uninstall: an unverified enabled hook must not survive rollback.
+        claude_restored = True
+        if (
+            claude_available
+            and claude_install_attempted
+            and not claude_target_was_installed
         ):
-            original = (
-                str(setup_failure)
-                if setup_failure is not None and str(setup_failure)
-                else "Builder Pulse setup did not complete"
-            )
+            try:
+                try:
+                    target_is_installed = any(
+                        entry.get("id") == claude_target
+                        for entry in installed_claude_builders()
+                    )
+                except BaseException:
+                    target_is_installed = True
+                if target_is_installed:
+                    remove_claude_plugin(claude_target)
+            except BaseException as rollback_error:
+                claude_restored = False
+                rollback_errors.append(f"new Claude Code package: {rollback_error}")
+
+        # Restore the exact pre-upgrade files, pending queues, and server policy
+        # only after the target is privacy-safe and every prior package is back.
+        if (
+            paused is not None
+            and target_capture_safe
+            and codex_restored
+            and claude_restored
+        ):
+            try:
+                restore_previous_capture(paused)
+            except BaseException as rollback_error:
+                rollback_errors.append(f"previous capture state: {rollback_error}")
+
+        if rollback_errors and not isinstance(
+            setup_error, (KeyboardInterrupt, SystemExit)
+        ):
             raise SetupError(
-                f"{original}; " + "; ".join(cleanup_errors)
-            ) from setup_failure
-        if not setup_succeeded and cleanup_errors:
+                f"{setup_error}; the previous version could not be restored "
+                "completely: " + "; ".join(rollback_errors)
+            ) from setup_error
+        if rollback_errors:
             print(
-                "Builder Pulse emergency shutdown was incomplete: "
-                + "; ".join(cleanup_errors)
+                "Builder Pulse rollback was incomplete: "
+                + "; ".join(rollback_errors)
                 + ". Exit all running Claude Code and Codex sessions now.",
                 file=sys.stderr,
             )
+        raise
 
 
 def main() -> int:
