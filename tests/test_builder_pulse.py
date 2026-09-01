@@ -286,6 +286,10 @@ class BuilderPulseTests(unittest.TestCase):
             },
         ), mock.patch.object(
             builder_pulse,
+            "verify_hook_launcher",
+            return_value={"ready": True, "hookStatus": "launcher_verified"},
+        ), mock.patch.object(
+            builder_pulse,
             "http_post_json",
             return_value=(
                 True,
@@ -342,6 +346,10 @@ class BuilderPulseTests(unittest.TestCase):
             },
         ), mock.patch.object(
             builder_pulse,
+            "verify_hook_launcher",
+            return_value={"ready": True, "hookStatus": "launcher_verified"},
+        ), mock.patch.object(
+            builder_pulse,
             "http_post_json",
             return_value=(
                 True,
@@ -378,6 +386,10 @@ class BuilderPulseTests(unittest.TestCase):
                 "hookStatus": "trusted",
                 "hookCount": 5,
             },
+        ), mock.patch.object(
+            builder_pulse,
+            "verify_hook_launcher",
+            return_value={"ready": True, "hookStatus": "launcher_verified"},
         ), mock.patch.object(
             builder_pulse,
             "http_post_json",
@@ -417,6 +429,10 @@ class BuilderPulseTests(unittest.TestCase):
                 "hookStatus": "trusted",
                 "hookCount": 5,
             },
+        ), mock.patch.object(
+            builder_pulse,
+            "verify_hook_launcher",
+            return_value={"ready": True, "hookStatus": "launcher_verified"},
         ), mock.patch.object(
             builder_pulse,
             "http_post_json",
@@ -490,6 +506,10 @@ class BuilderPulseTests(unittest.TestCase):
                 "hookStatus": "trusted",
                 "hookCount": 5,
             },
+        ), mock.patch.object(
+            builder_pulse,
+            "verify_hook_launcher",
+            return_value={"ready": True, "hookStatus": "launcher_verified"},
         ), mock.patch.object(
             builder_pulse,
             "http_post_json",
