@@ -42,9 +42,10 @@ SETUP_DISCLOSURE = (
     "Builder Pulse installs hooks for Codex and Claude Code when those agents are "
     "available on this computer, but it sends data only from project folders you "
     "explicitly enroll. One shared identity and project allowlist apply to both agents. "
-    "GrowthX stores the claimed member ID, name, email "
-    "address, and any optional default project or program copied from the member record "
-    "so telemetry can be linked to the right person. For each enrolled project, it "
+    "GrowthX stores the claimed member ID, name, email address, and any optional "
+    "roster or program label supplied by GrowthX so telemetry can be linked to the "
+    "right person. A roster or program label is never used as a telemetry project. "
+    "For each enrolled project, it "
     "receives a stable installation ID, "
     "a one-way hashed session ID, the display name you confirm and a sanitized project "
     "ID, any feature name and ID you explicitly set, coarse work state and event/activity "
@@ -1385,7 +1386,7 @@ def setup(
     cli = codex_cli or shared_cli
 
     # A bare package is inert. Preserve that state while restoring or claiming
-    # identity and replacing the project allowlist.
+    # identity and adding the member-confirmed project to the allowlist.
     run_command(cli_command(cli, "config", "set", "enabled", "false"))
     restore_paused_identity(cli, paused)
     if reuse_existing_claim:
@@ -1407,7 +1408,6 @@ def setup(
             str(enrolled_root),
             "--project",
             confirmed_label,
-            "--replace-existing",
         )
     )
     target_plugin_version = TARGET_RELEASE.removeprefix("v")
@@ -1559,8 +1559,8 @@ def main() -> int:
         return 1
     print(
         "Builder Pulse is installed for every supported agent found on this computer. "
-        "The prior project allowlist was replaced; only the confirmed project "
-        "folder is enrolled. "
+        "Only project folders you explicitly confirmed are enrolled; this confirmed "
+        "project was added without removing prior confirmed projects. "
         "Exit all running Claude Code and Codex sessions, start a fresh session "
         "in each agent you use, then send one normal prompt in each to verify "
         "separate server receipts."

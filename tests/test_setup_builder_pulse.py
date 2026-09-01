@@ -622,7 +622,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         enroll_calls = [arguments for arguments in calls if "enroll" in arguments]
         self.assertEqual(len(enroll_calls), 1)
         self.assertEqual(
-            enroll_calls[0][-7:],
+            enroll_calls[0][-6:],
             [
                 "work",
                 "enroll",
@@ -630,7 +630,6 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 str(ROOT.resolve()),
                 "--project",
                 "Builder Pulse",
-                "--replace-existing",
             ],
         )
         self.assertTrue(
