@@ -532,18 +532,21 @@ def install_codex(ref: str, version: str) -> Path:
     """Register the marketplace at `ref` and install the plugin; verify the version."""
     installed, configured = codex_state()
     source = (configured or {}).get("marketplaceSource") or {}
-    keep = configured is not None and approved_slug(source.get("source")) == REPOSITORY_SLUG \
-        and source.get("ref") == ref and installed is not None and installed.get("version") == version
-    if not keep:
-        if configured is not None and approved_slug(source.get("source")) is None:
-            raise SetupError("The GrowthX marketplace name points to a different source")
+    if configured is not None and approved_slug(source.get("source")) is None:
+        raise SetupError("The GrowthX marketplace name points to a different source")
+    already = installed is not None and installed.get("version") == version and configured is not None
+    if already:
+        # Same package already registered from an approved source: a rerun must
+        # not churn the registration (Codex keeps hook trust by content anyway).
+        root = Path(str(installed.get("installedPath") or "")).expanduser().resolve(strict=False)
+    else:
         if installed is not None:
             run_command(["codex", "plugin", "remove", PLUGIN, "--json"])
         if configured is not None:
             run_command(["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"])
         run_command(["codex", "plugin", "marketplace", "add", REPOSITORY_SLUG, "--ref", ref, "--json"])
-    added = run_command(["codex", "plugin", "add", PLUGIN, "--json"], expect_json=True)
-    root = Path(str(added.get("installedPath") if isinstance(added, dict) else "")).expanduser().resolve(strict=False)
+        added = run_command(["codex", "plugin", "add", PLUGIN, "--json"], expect_json=True)
+        root = Path(str(added.get("installedPath") if isinstance(added, dict) else "")).expanduser().resolve(strict=False)
     manifest = read_object(root / ".codex-plugin" / "plugin.json") if root.is_dir() else {}
     if manifest.get("version") != version or not (root / "scripts" / "builder_pulse.py").is_file():
         raise SetupError(f"Codex installed an unexpected Builder Pulse version; expected {version}")

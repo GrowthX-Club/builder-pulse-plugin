@@ -455,7 +455,8 @@ class PackageTests(SetupCase):
         joined = [" ".join(c[1:4]) for c in self.commands.calls]
         self.assertNotIn("plugin remove " + S.PLUGIN, joined)
         self.assertNotIn("plugin marketplace remove", joined)
-        self.assertIn("plugin add " + S.PLUGIN, joined)
+        self.assertNotIn("plugin add " + S.PLUGIN, joined, "already at the target version: no churn")
+        self.assertEqual(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION), cli_path)
 
     def test_codex_install_rejects_foreign_marketplace_source(self) -> None:
         self.commands.codex_marketplace = {"name": S.MARKETPLACE, "marketplaceSource": {"sourceType": "git", "source": "https://github.com/evil/x.git", "ref": "v1"}}

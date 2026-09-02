@@ -7,7 +7,9 @@ H="${HARNESS_ROOT:?set HARNESS_ROOT to a writable scratch directory}"
 P="${HARNESS_PROJECT:?set HARNESS_PROJECT to a real (non-temp) project folder}"
 mkdir -p "$H/bin" "$H/logs" "$H/clones" "$P"
 # The isolated PATH exposes only the tools the installer may use. `claude` is
-# added per scenario so Codex-only and both-agent shapes can be exercised.
+# added per scenario so Codex-only and both-agent shapes can be exercised;
+# resolve it now, before the PATH is narrowed.
+CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
 for tool in codex python3 git node perl; do
   if [ ! -e "$H/bin/$tool" ] && command -v "$tool" >/dev/null 2>&1; then
     ln -sf "$(command -v "$tool")" "$H/bin/$tool"

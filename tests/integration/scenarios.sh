@@ -6,7 +6,7 @@ set -u
 CHECKOUT="$1"; SHA="$2"; SCENARIO="$3"; WITH_CLAUDE="${4:-}"
 . "$(cd "$(dirname "$0")" && pwd)/harness_env.sh"
 rm -f "$H/bin/claude"
-if [ -n "$WITH_CLAUDE" ]; then ln -sf "$(command -v claude)" "$H/bin/claude"; fi
+if [ -n "$WITH_CLAUDE" ]; then [ -n "$CLAUDE_BIN" ] || { echo "claude is not installed; cannot run the claude variant" >&2; exit 2; }; ln -sf "$CLAUDE_BIN" "$H/bin/claude"; fi
 LOG="$H/logs/scenario-$SCENARIO$WITH_CLAUDE-$(date +%H%M%S)"
 mkdir -p "$H/logs"
 STEP() { echo "[$(date +%H:%M:%S)] $*"; }
