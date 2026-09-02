@@ -106,9 +106,10 @@ class FakeCommands:
             self.claude_marketplaces.append({"name": S.CLAUDE_MARKETPLACE, "source": "github", "repo": S.REPOSITORY_SLUG, "ref": S.TARGET_RELEASE})
             return ""
         if argv[1:3] in (["plugin", "install"], ["plugin", "update"]):
-            root = self.case.home / ".claude" / "plugins" / "cache" / S.CLAUDE_MARKETPLACE / "builder-pulse-claude-posix" / S.TARGET_VERSION
+            plugin_name = S.claude_plugin_id().split("@", 1)[0]  # posix or windows, as the installer expects on this platform
+            root = self.case.home / ".claude" / "plugins" / "cache" / S.CLAUDE_MARKETPLACE / plugin_name / S.TARGET_VERSION
             (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-            (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": "builder-pulse-claude-posix", "version": S.TARGET_VERSION}))
+            (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": plugin_name, "version": S.TARGET_VERSION}))
             (root / ".in_use").mkdir(exist_ok=True)
             (root / ".in_use" / "4242").write_text("")
             self.claude_plugins = [p for p in self.claude_plugins if p["id"] != argv[3]]
@@ -243,7 +244,8 @@ class HelperTests(SetupCase):
         self.assertNotIn("harness-invite-code", content)
         self.assertNotIn(str(self.home), content)
         self.assertIn("before open", content)
-        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        if os.name != "nt":  # chmod is a no-op on Windows
+            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
         self.assertLessEqual(len(list(logs.glob("setup-*.log"))), 10)
 
     def test_approved_sources(self) -> None:
@@ -269,9 +271,10 @@ class HelperTests(SetupCase):
             self.assertIsNone(S.codex_executable())
 
     def test_windows_plugin_id_and_argument_display(self) -> None:
+        cli = Path("C:/x/builder_pulse.py")  # built before os.name is patched: 3.11 refuses WindowsPath on POSIX
         with mock.patch.object(S.os, "name", "nt"):
             self.assertEqual(S.claude_plugin_id(), f"builder-pulse-claude-windows@{S.CLAUDE_MARKETPLACE}")
-            self.assertIn("py -3", S.hook_review_message("codex", Path("C:/x/builder_pulse.py"), None))
+            self.assertIn("py -3", S.hook_review_message("codex", cli, None))
         self.assertEqual(S.display_arguments(["--root", "C:\\Users\\m\\proj"]), ["--root", "…/proj"])
 
 
