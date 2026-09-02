@@ -87,7 +87,7 @@ class FakeCommands:
             (root / "scripts" / "builder_pulse.py").write_text("# runtime\n")
             (root / ".codex-plugin").mkdir(exist_ok=True)
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps({"name": "builder-pulse", "version": version}))
-            self.codex_installed = {"pluginId": S.PLUGIN, "version": version, "installedPath": str(root)}
+            self.codex_installed = {"pluginId": S.PLUGIN, "version": version}  # the real list omits installedPath
             self.install_versions.append(version)
             self.case.cli_path = root / "scripts" / "builder_pulse.py"
             return {"installedPath": str(root), "version": version}
@@ -200,7 +200,7 @@ class SetupCase(unittest.TestCase):
         (root / "scripts" / "builder_pulse.py").write_text("# old runtime\n")
         (root / ".codex-plugin").mkdir()
         (root / ".codex-plugin" / "plugin.json").write_text(json.dumps({"name": "builder-pulse", "version": version}))
-        self.commands.codex_installed = {"pluginId": S.PLUGIN, "version": version, "installedPath": str(root)}
+        self.commands.codex_installed = {"pluginId": S.PLUGIN, "version": version}
         self.commands.codex_marketplace = {"name": S.MARKETPLACE, "root": "/m", "marketplaceSource": {"sourceType": "git", "source": S.REPOSITORY, "ref": f"v{version}"}}
 
     def write_identity(self, directory: Path, identity: dict, name="identity.json"):
