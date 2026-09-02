@@ -73,7 +73,9 @@ def main() -> int:
             previous = argument
         return original_run_command(rewritten, **kwargs)
 
-    module.verify_release_exists = lambda _release: sha
+    for name in ("verify_release", "verify_release_exists"):  # v0.6.0 / v0.5.x names
+        if hasattr(module, name):
+            setattr(module, name, lambda _release: sha)
     module.run_command = run_command
     print(
         f"[shim] running {script} as {release} from commit {sha[:12]}"
