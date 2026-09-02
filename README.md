@@ -11,6 +11,21 @@ Windows.
 
 Builder-facing prompts pin an immutable release and link to that release's
 copy of [SETUP.md](SETUP.md). Never bootstrap from a default-branch guide.
+The installer is run by absolute path from inside the temporary release clone
+while the working directory is the member's project folder; the agent must
+never change directory into the clone, and the installer refuses to enroll a
+temporary folder or a Builder Pulse checkout.
+
+Installer exit codes: `0` success; `3` installed and waiting for the member's
+one-time Codex `/hooks` approval (not an error, no rerun needed); `1` failed,
+see the `Details: <log path>` line. Logs live in `~/.builder-pulse/logs/`
+(`setup-<UTC timestamp>.log`, newest ten kept, plus `activate.log`); they
+contain no secrets and no project folder paths.
+
+The Codex hook definition (`hooks/hooks.json`) is byte-identical to the v0.4.5
+release. Codex trusts a hook by hashing its normalized definition, so keeping
+those bytes stable is what lets v0.4.2-v0.4.5 members upgrade without a new
+review; `tests/fixtures/hooks-v0.4.5.json` guards it.
 
 ## Consent and data boundary
 
@@ -103,7 +118,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.5.1"
+  "pluginVersion": "0.5.2"
 }
 ```
 
@@ -156,12 +171,16 @@ projects remains intact. There is no global project fallback.
 
 ## Delivery behavior
 
-Hooks run asynchronously where the host supports it; `SessionEnd` remains
-synchronous. `UserPromptSubmit` records and attempts the current prompt in a
-nonblocking hook so an interpreter, path, or network failure can never block a
-builder's prompt. The current prompt is attempted first under a 750 ms network
-timeout; older prompt and lifecycle backlog is left for later asynchronous
-hooks so an outage cannot stall every submitted prompt behind retries.
+Codex runs every hook as `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py" hook`
+(`py -3` on Windows). `SessionStart`, `PostToolUse`, and `PermissionRequest`
+are asynchronous; `SessionEnd` and `UserPromptSubmit` are synchronous with a
+3 s and 5 s timeout. The prompt hook records the current prompt and attempts
+it once under a 750 ms network timeout, then returns; older prompt and
+lifecycle backlog is left for later asynchronous hooks so an outage cannot
+stall a submitted prompt behind retries. A hook failure of any kind exits 0
+with `{}` so it can never block a builder's prompt. Claude Code hooks run the
+packaged `builder_pulse_claude.sh` / `.cmd` launcher against the shared
+runtime under `~/.builder-pulse/runtime/<version>/`.
 Only essential lifecycle hooks and matched post-tool events launch the runtime.
 A lifecycle telemetry event is created only when
 state changes or a 15-minute heartbeat is due. Observed hook continuity can
@@ -193,7 +212,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.5.1",
+  "pluginVersion": "0.5.2",
   "agentPlatform": "claude_code",
   "redacted": false,
   "truncated": false
@@ -237,7 +256,7 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.5.1",
+  "pluginVersion": "0.5.2",
   "agentPlatform": "codex"
 }
 ```
@@ -270,7 +289,12 @@ claimed installation. That proves activation readiness, not event delivery.
 `telemetryReceived: true` means the server has received something at
 some point; it can be historical. Current repair proof requires
 `telemetryReceivedSincePreviousActivation: true`, a non-null `lastSignalAt`, and
-`lastSignalPluginVersion: "0.5.1"` with a matching `lastSignalAgentPlatform`.
+`lastSignalPluginVersion: "0.5.2"` with a matching `lastSignalAgentPlatform`.
+Every `activate` result that is not ready includes a bounded `detail` string
+naming the exact local condition (which stage of the Codex app-server
+handshake failed, which plugins Codex listed instead, which manifest path it
+loaded, which Python it found), and the same record is appended to
+`~/.builder-pulse/logs/activate.log` with credentials and folder paths removed.
 That proof uses the server receipt time, not the member computer's event clock.
 Activation does not create a lifecycle event
 or change the builder's work state.
@@ -290,25 +314,29 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. For manual
-recovery, install the current immutable v0.5.1 release. The prepared installer
+recovery, install the current immutable v0.5.2 release. The prepared installer
 installs every supported agent found on the computer. Codex's manual package
 commands are:
 
 ```bash
-codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.1
+codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.2
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 Before installing, verify both the exact Git tag and the corresponding
 published GitHub Release. The release API response must report
-`tag_name: "v0.5.1"`, `draft: false`, and `immutable: true`; a tag existing by
+`tag_name: "v0.5.2"`, `draft: false`, and `immutable: true`; a tag existing by
 itself is not proof of immutability. The prepared installer performs both
 checks and fails closed if either one cannot be verified.
 
 The prepared installer defaults to `https://precious-ant-429.convex.site`. It
-records and remotely verifies the existing package's exact full commit before
-changing registration, then uses that commit—not a movable version tag—as the
-only rollback source. Exit every running Claude Code and Codex session before
+records the existing package's exact full commit, proves that commit exists on
+the approved repository with a shallow `git fetch` of that single object (no
+GitHub API response size cap, no per-address rate limit), then uses that
+commit—not a movable version tag—as the only rollback source. Files Codex or
+the OS may leave inside an installed package (`.codex-marketplace-install.json`,
+`.DS_Store`, bytecode caches) do not count as tampering; any tracked-file
+change or other untracked file still does. Exit every running Claude Code and Codex session before
 starting fresh sessions so no process keeps the previous hook manifest or
 version path in memory.
 To pause without removing local identity or the project allowlist, run

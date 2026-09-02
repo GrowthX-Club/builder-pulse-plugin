@@ -76,6 +76,16 @@ Do not scan the home directory or recent projects, infer names from folder
 basenames or prompts, or reuse a server `defaultProject`; that field is
 cohort/roster metadata. The member's local answers are the confirmation.
 
+Run the installer by absolute path from inside the member's project folder;
+never `cd` into the temporary clone, and never offer that clone as the folder
+to monitor. Installer exit `3` means the package is installed and Codex only
+needs the member's one-time `/hooks` approval: tell the member to start Codex
+inside the enrolled folder, run `/hooks`, and trust the builder-pulse hooks;
+no rerun is needed and hooks must never be approved on their behalf. Exit `1`
+ends with `Details: <log path>`; that file under `~/.builder-pulse/logs/`
+contains no secrets and no project folder paths and is what to share when
+asking for help.
+
 For an update or recovery install, verify both the exact Git tag and its
 published GitHub Release before replacing anything. Continue only when the
 release API reports the exact target `tag_name`, `draft: false`, and
