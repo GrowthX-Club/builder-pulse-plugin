@@ -22,6 +22,7 @@ SPEC.loader.exec_module(S)
 
 COMMIT = "e" * 40
 TOKEN = "a" * 64
+REAL_TEMPORARY_ROOTS = S.temporary_roots
 
 
 def claimed_identity(installation: str = "11111111-2222-4333-8444-555555555555") -> dict:
@@ -48,6 +49,7 @@ class FakeCommands:
         self.claude_marketplaces: list[dict] = []
         self.fail_on: dict[str, str] = {}
         self.install_versions: list[str] = []
+        self.marketplace_head = COMMIT
 
     def __call__(self, arguments, *, env=None, expect_json=False):
         argv = [str(a) for a in arguments]
@@ -56,6 +58,8 @@ class FakeCommands:
         for needle, message in self.fail_on.items():
             if needle in key:
                 raise S.SetupError(message)
+        if argv[0] == "git" and argv[1:2] == ["-C"] and argv[3:5] == ["rev-parse", "HEAD"]:
+            return self.marketplace_head + "\n"
         if argv[0] == "codex":
             return self.codex(argv, expect_json)
         if argv[0] == "claude":
@@ -248,6 +252,15 @@ class HelperTests(SetupCase):
             self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
         self.assertLessEqual(len(list(logs.glob("setup-*.log"))), 10)
 
+    def test_windows_home_is_shortened_inside_json_fields(self) -> None:
+        with mock.patch.object(Path, "home", return_value=Path("C:\\Users\\m")):
+            path = S.LOG.open(self.data_dir)
+            S.LOG.write("enrolled", root="C:\\Users\\m\\proj", note="C:\\Users\\m")
+        assert path is not None
+        content = path.read_text()
+        self.assertNotIn("Users", content)
+        self.assertIn("~", content)
+
     def test_approved_sources(self) -> None:
         self.assertEqual(S.approved_slug("https://github.com/udayanwalvekar/builder-pulse-plugin.git"), "udayanwalvekar/builder-pulse-plugin")
         self.assertEqual(S.approved_slug(S.REPOSITORY), S.REPOSITORY_SLUG)
@@ -327,11 +340,17 @@ class DataTests(SetupCase):
         self.assertEqual(S.read_object(self.data_dir / "identity.json"), claimed_identity())
         self.assertTrue((self.data_dir / "contexts.json").is_file())
         self.assertTrue((self.legacy_dir / "identity.json").is_file(), "legacy copy is never deleted")
-        # a claimed shared directory is left alone even when legacy differs
-        other = claimed_identity("99999999-2222-4333-8444-555555555555")
-        self.write_identity(self.legacy_dir, other)
+        # the same claim in both places: shared wins, nothing copied again
+        self.write_identity(self.legacy_dir, {**claimed_identity(), "builderName": "older copy"})
         S.migrate_legacy_data(self.data_dir, self.legacy_dir)
         self.assertEqual(S.read_object(self.data_dir / "identity.json"), claimed_identity())
+        # two different claims: fail closed, touch nothing
+        other = claimed_identity("99999999-2222-4333-8444-555555555555")
+        self.write_identity(self.legacy_dir, other)
+        with self.assertRaisesRegex(S.SetupError, "identities differ"):
+            S.migrate_legacy_data(self.data_dir, self.legacy_dir)
+        self.assertEqual(S.read_object(self.data_dir / "identity.json"), claimed_identity())
+        self.assertEqual(S.read_object(self.legacy_dir / "identity.json"), other)
 
     def test_migration_merges_over_skeleton_runtime_and_logs(self) -> None:
         self.write_identity(self.legacy_dir, claimed_identity())
@@ -452,24 +471,46 @@ class DataTests(SetupCase):
 
 
 class PackageTests(SetupCase):
+    def churn(self) -> list[str]:
+        return [" ".join(c[1:4]) for c in self.commands.calls if c[0] == "codex" and c[2] in {"remove", "add"}] + \
+               [" ".join(c[1:4]) for c in self.commands.calls if c[0] == "codex" and c[1:3] == ["plugin", "marketplace"] and c[3] in {"remove", "add"}]
+
     def test_codex_install_replaces_only_when_ref_or_version_differ(self) -> None:
         with mock.patch.object(S, "run_command", self.commands):
             self.seed_codex("0.4.5")
-            cli_path = S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION)
-        joined = [" ".join(c[1:4]) for c in self.commands.calls]
-        self.assertIn("plugin remove " + S.PLUGIN, joined)
-        self.assertIn("plugin marketplace remove", joined)
-        self.assertIn("plugin marketplace add", joined)
+            cli_path = S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION, COMMIT)
+        churn = self.churn()
+        self.assertIn("plugin remove " + S.PLUGIN, churn)
+        self.assertIn("plugin marketplace remove", churn)
+        self.assertIn("plugin marketplace add", churn)
         self.assertTrue(cli_path.is_file())
+        # same version, marketplace checkout at the release commit: nothing happens
+        self.commands.calls.clear()
+        with mock.patch.object(S, "run_command", self.commands):
+            self.assertEqual(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION, COMMIT), cli_path)
+        self.assertEqual(self.churn(), [])
+        self.assertIn(["git", "-C", "/m", "rev-parse", "HEAD"], self.commands.calls)
+        # same version but the marketplace checkout is some other commit: replaced
+        self.commands.marketplace_head = "d" * 40
+        self.commands.calls.clear()
+        with mock.patch.object(S, "run_command", self.commands):
+            S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION, COMMIT)
+        churn = self.churn()
+        self.assertIn("plugin remove " + S.PLUGIN, churn)
+        self.assertIn("plugin marketplace add", churn)
+        # no expected commit (rollback path): always reinstalled
+        self.commands.marketplace_head = COMMIT
         self.commands.calls.clear()
         with mock.patch.object(S, "run_command", self.commands):
             S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION)
-        joined = [" ".join(c[1:4]) for c in self.commands.calls]
-        self.assertNotIn("plugin remove " + S.PLUGIN, joined)
-        self.assertNotIn("plugin marketplace remove", joined)
-        self.assertNotIn("plugin add " + S.PLUGIN, joined, "already at the target version: no churn")
+        self.assertIn("plugin marketplace add", self.churn())
+
+    def test_codex_install_ignores_a_relative_installed_path(self) -> None:
         with mock.patch.object(S, "run_command", self.commands):
-            self.assertEqual(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION), cli_path)
+            self.seed_codex(S.TARGET_VERSION)
+            self.commands.codex_installed["installedPath"] = "scripts"
+            self.assertTrue(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION, COMMIT).is_absolute())
+        self.assertEqual(self.churn(), [], "the absolute cache path was used instead")
 
     def test_codex_install_rejects_foreign_marketplace_source(self) -> None:
         self.commands.codex_marketplace = {"name": S.MARKETPLACE, "marketplaceSource": {"sourceType": "git", "source": "https://github.com/evil/x.git", "ref": "v1"}}
@@ -545,7 +586,11 @@ class EnrollmentTests(SetupCase):
         self.assertIn("home", S.enrollment_refusal(self.home.parent))
         self.assertIn("filesystem root", S.enrollment_refusal(Path(self.home.anchor)))
         self.assertIn("temporary folder", S.enrollment_refusal(self.home / "tmp" / "proj"))
-        self.assertTrue(any(str(p).startswith(str(Path(tempfile.gettempdir()).resolve())) for p in S.temporary_roots.__wrapped__()) if hasattr(S.temporary_roots, "__wrapped__") else True)
+        roots = REAL_TEMPORARY_ROOTS()
+        self.assertIn(Path(tempfile.gettempdir()).resolve(strict=False), roots)
+        if sys.platform == "darwin":
+            self.assertIn(Path("/private/tmp"), roots)
+            self.assertIn(Path("/private/var/folders"), roots)
         clone = self.home / "clone"
         (clone / "scripts").mkdir(parents=True)
         (clone / "scripts" / "setup_builder_pulse.py").write_text("#\n")
@@ -583,6 +628,13 @@ class SetupFlowTests(SetupCase):
         self.assertEqual(outcome.cli.parent.parent.name, S.TARGET_VERSION)
         removed = [c for c in self.commands.calls if c[1:3] == ["plugin", "remove"]]
         self.assertEqual(len(removed), 1)
+
+    def test_installation_token_is_masked_as_soon_as_identity_is_read(self) -> None:
+        self.write_identity(self.data_dir, claimed_identity())
+        self.run_setup(repair=True, project=False)
+        self.assertIn(TOKEN, S.LOG.secrets)
+        content = S.LOG.path.read_text()
+        self.assertNotIn(TOKEN, content)
 
     def test_repair_reuses_identity_and_never_enrolls_or_claims(self) -> None:
         self.write_identity(self.data_dir, claimed_identity())
@@ -667,6 +719,26 @@ class SetupFlowTests(SetupCase):
         self.assertEqual(self.commands.codex_installed["version"], "0.4.5")
         self.assertEqual(self.server_calls, [("privacy-pause", "0.4.5")], "already paused; not resumed")
         self.assertFalse(S.read_object(self.data_dir / "config.json")["enabled"])
+
+    def test_local_repause_failure_is_reported(self) -> None:
+        self.write_identity(self.data_dir, claimed_identity())
+        original = S.pause_local
+        calls = {"n": 0}
+        def flaky(directory, identity):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise PermissionError("read-only data directory")
+            return original(directory, identity)
+        def failing(cli_path, agent):
+            raise S.SetupError("activation failed")
+        with mock.patch.object(S, "pause_local", side_effect=flaky), \
+                self.assertRaisesRegex(S.SetupError, "activation failed; local capture could not be paused again: read-only"):
+            self.run_setup(repair=True, project=False, activation=failing)
+
+    def test_permission_error_from_pause_propagates_unchanged(self) -> None:
+        self.write_identity(self.data_dir, claimed_identity())
+        with mock.patch.object(S, "pause_local", side_effect=PermissionError("denied")), self.assertRaises(PermissionError):
+            self.run_setup(repair=True, project=False)
 
     def test_rollback_problems_are_reported_not_hidden(self) -> None:
         self.seed_codex("0.4.5")
@@ -777,6 +849,18 @@ class MainTests(SetupCase):
         self.assertEqual(code, 0)
         self.assertIn("installer clone, not your project", err)
         self.assertEqual(setup_call.call_args.args[2], str(self.project))
+
+    def test_unexpected_exceptions_and_interrupts_still_end_with_details(self) -> None:
+        code, out, err, _ = self.run_main(["--reuse-existing-claim"], error=PermissionError(f"denied for Bearer {TOKEN}"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("Builder Pulse setup stopped: denied for Bearer [redacted]", err)
+        self.assertIn("Details: ", err)
+        self.assertNotIn("Traceback", err)
+        code, _, err, _ = self.run_main(["--reuse-existing-claim"], error=KeyboardInterrupt())
+        self.assertEqual(code, 130)
+        self.assertIn("Builder Pulse setup stopped: interrupted", err)
+        self.assertIn("Details: ", err)
 
     def test_closed_terminal_stops_cleanly(self) -> None:
         code, _, err, setup_call = self.run_main(["--reuse-existing-claim"], tty=True)

@@ -172,9 +172,10 @@ def shorten_home(text: str) -> str:
         home = str(Path.home())
     except (OSError, RuntimeError):
         return text
-    candidates = {home, home.replace("\\", "/")}
+    candidates = {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}  # raw, POSIX-style, JSON-escaped
     with contextlib.suppress(OSError):
-        candidates.add(str(Path.home().resolve(strict=False)))
+        resolved = str(Path.home().resolve(strict=False))
+        candidates.update({resolved, resolved.replace("\\", "\\\\")})
     for candidate in sorted(candidates, key=len, reverse=True):
         if candidate and candidate not in {"/", "\\"}:
             text = text.replace(candidate, "~")
@@ -405,7 +406,11 @@ def migrate_legacy_data(target: Path, source: Path) -> None:
     legacy files win, the skeleton is dropped, and the result replaces the
     directory as one unit so a failure leaves it exactly as it was.
     """
-    if not any((source / name).is_file() for name in IDENTITY_FILES) or holds_claim(target):
+    if not any((source / name).is_file() for name in IDENTITY_FILES):
+        return
+    if holds_claim(target):
+        if holds_claim(source) and current_identity(source).get("installationId") != current_identity(target).get("installationId"):
+            raise SetupError("The legacy and shared Builder Pulse identities differ")
         return
     for root in (source, target):
         for candidate in root.rglob("*") if root.exists() else ():
@@ -528,21 +533,39 @@ def codex_state() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     return (installed[0] if installed else None), (configured[0] if configured else None)
 
 
-def install_codex(ref: str, version: str) -> Path:
-    """Register the marketplace at `ref` and install the plugin; verify the version."""
+def marketplace_checkout_commit(configured: dict[str, Any]) -> str | None:
+    """HEAD of Codex's marketplace snapshot; the list output carries no ref."""
+    root = configured.get("root")
+    if not isinstance(root, str) or not root:
+        return None
+    try:
+        head = str(run_command(["git", "-C", root, "rev-parse", "HEAD"])).strip().lower()
+    except SetupError:
+        return None
+    return head if re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+
+def install_codex(ref: str, version: str, expected_commit: str | None = None) -> Path:
+    """Register the marketplace at `ref` and install the plugin; verify the version.
+
+    A rerun that finds the same version already registered from an approved
+    marketplace whose checkout is exactly `expected_commit` changes nothing
+    (Codex keeps hook trust by content anyway). Anything else is replaced.
+    """
     installed, configured = codex_state()
     source = (configured or {}).get("marketplaceSource") or {}
     if configured is not None and approved_slug(source.get("source")) is None:
         raise SetupError("The GrowthX marketplace name points to a different source")
     root: Path | None = None
-    if installed is not None and installed.get("version") == version and configured is not None:
-        # Same package already registered from an approved source: a rerun must
-        # not churn the registration (Codex keeps hook trust by content anyway).
+    if (installed is not None and installed.get("version") == version and configured is not None
+            and expected_commit is not None and marketplace_checkout_commit(configured) == expected_commit):
         # `codex plugin list` does not report the cache path, so derive it.
         codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
-        candidate = Path(str(installed.get("installedPath") or codex_home / "plugins" / "cache" / MARKETPLACE / "builder-pulse" / version))
-        candidate = candidate.expanduser().resolve(strict=False)
-        if candidate.is_absolute() and (candidate / "scripts" / "builder_pulse.py").is_file() \
+        reported = installed.get("installedPath")
+        candidate = Path(reported) if isinstance(reported, str) and Path(reported).is_absolute() \
+            else codex_home / "plugins" / "cache" / MARKETPLACE / "builder-pulse" / version
+        candidate = candidate.resolve(strict=False)
+        if (candidate / "scripts" / "builder_pulse.py").is_file() \
                 and read_object(candidate / ".codex-plugin" / "plugin.json").get("version") == version:
             root = candidate
     if root is None:
@@ -552,7 +575,10 @@ def install_codex(ref: str, version: str) -> Path:
             run_command(["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"])
         run_command(["codex", "plugin", "marketplace", "add", REPOSITORY_SLUG, "--ref", ref, "--json"])
         added = run_command(["codex", "plugin", "add", PLUGIN, "--json"], expect_json=True)
-        root = Path(str(added.get("installedPath") if isinstance(added, dict) else "")).expanduser().resolve(strict=False)
+        reported = added.get("installedPath") if isinstance(added, dict) else None
+        if not isinstance(reported, str) or not Path(reported).is_absolute():
+            raise SetupError("Codex did not report where it installed Builder Pulse")
+        root = Path(reported).resolve(strict=False)
     manifest = read_object(root / ".codex-plugin" / "plugin.json") if root.is_dir() else {}
     if manifest.get("version") != version or not (root / "scripts" / "builder_pulse.py").is_file():
         raise SetupError(f"Codex installed an unexpected Builder Pulse version; expected {version}")
@@ -741,6 +767,7 @@ def setup(invite_code: str, endpoint: str, project_root: str, project_label: str
     previous_claude = claude_builders() if claude else []
     migrate_legacy_data(shared, legacy)
     identity = current_identity(shared)
+    LOG.mask(identity.get("installationToken"))
     if repair:
         preserved = require_claimed(identity)
         LOG.write("identity located", installationId=preserved["installationId"])
@@ -761,7 +788,7 @@ def setup(invite_code: str, endpoint: str, project_root: str, project_label: str
         cli_path = shared_cli
         if codex:
             codex_replaced = previous is not None and previous_version != TARGET_VERSION
-            cli_path = install_codex(TARGET_RELEASE, TARGET_VERSION)
+            cli_path = install_codex(TARGET_RELEASE, TARGET_VERSION, commit)
         cli(cli_path, "config", "set", "enabled", "false")
         restore_identity(shared, identity)
         if repair:
@@ -777,6 +804,7 @@ def setup(invite_code: str, endpoint: str, project_root: str, project_label: str
         if project is not None:
             cli(cli_path, "work", "enroll", "--root", str(project[0]), "--project", project[1])
         identity = current_identity(shared)
+        LOG.mask(identity.get("installationToken"))
         server_call(identity, "privacy-resume", TARGET_VERSION, "resumed")
         server_paused = False
         cli(cli_path, "config", "set", "enabled", "true")
@@ -799,8 +827,10 @@ def setup(invite_code: str, endpoint: str, project_root: str, project_label: str
         # Fail closed: capture stays off locally and paused on the server; the
         # previous Codex tag goes back so already-trusted hooks keep working.
         problems: list[str] = []
-        with contextlib.suppress(BaseException):
+        try:
             pause_local(shared, current_identity(shared))
+        except BaseException as local_error:  # noqa: BLE001
+            problems.append(f"local capture could not be paused again: {local_error}")
         if identity.get("installationToken") and not server_paused:
             try:
                 server_call(identity, "privacy-pause", TARGET_VERSION, "paused")
@@ -874,12 +904,13 @@ def main() -> int:
         elif interactive and root and not label:
             label = ask("Project name GrowthX should display: ")
         outcome = setup(invite, args.endpoint, root, label, repair=args.reuse_existing_claim)
-    except SetupError as exc:
-        LOG.write("setup stopped", error=str(exc))
-        print(f"Builder Pulse setup stopped: {LOG.redact(exc)}", file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as exc:  # every failure ends with a Details line
+        message = "interrupted" if isinstance(exc, KeyboardInterrupt) else (str(exc) or exc.__class__.__name__)
+        LOG.write("setup stopped", error=message)
+        print(f"Builder Pulse setup stopped: {LOG.redact(message)}", file=sys.stderr)
         if LOG.open(data_dir()):
             print(f"Details: {LOG.path}", file=sys.stderr)
-        return 1
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
     log_path = LOG.open(data_dir())
     with contextlib.suppress(SetupError):
         print("Enrolled project folders:\n" + str(cli(outcome.cli, "work", "list")).strip(), file=sys.stderr)
