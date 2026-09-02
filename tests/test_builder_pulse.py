@@ -561,7 +561,10 @@ class BuilderPulseTests(unittest.TestCase):
             {key: stale[key] for key in ("ready", "hookStatus", "hookCount")},
             {"ready": False, "hookStatus": "stale_plugin", "hookCount": 5},
         )
-        self.assertIn("/tmp/stale/hooks/hooks.json", stale["detail"])
+        self.assertIn(
+            str(Path("/tmp/stale/hooks/hooks.json").resolve(strict=False)),
+            stale["detail"],
+        )
 
     def test_hook_readiness_rejects_duplicate_missing_or_extra_hooks(self) -> None:
         source_path = str(builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json")
@@ -4290,8 +4293,9 @@ class ActivationDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnop", content)
         self.assertNotIn("Invite_1234567890", content)
         self.assertIn("[redacted]", content)
-        self.assertNotIn(str(Path.home()), content)
-        self.assertIn("~/.codex/plugins", content)
+        # The log line is JSON, so backslashes in Windows paths are escaped.
+        self.assertNotIn(json.dumps(str(Path.home()))[1:-1], content)
+        self.assertIn(json.dumps(os.path.join("~", ".codex", "plugins"))[1:-1], content)
         if os.name != "nt":
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
