@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import getpass
 import http.client
 import json
@@ -29,7 +30,7 @@ APPROVED_EXISTING_REPOSITORIES = {
 }
 MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
-TARGET_RELEASE = "v0.5.1"
+TARGET_RELEASE = "v0.5.2"
 CLAUDE_MARKETPLACE = f"growthx-builder-tools-{TARGET_RELEASE.replace('.', '-')}"
 CLAUDE_POSIX_PLUGIN = f"builder-pulse-claude-posix@{CLAUDE_MARKETPLACE}"
 CLAUDE_WINDOWS_PLUGIN = f"builder-pulse-claude-windows@{CLAUDE_MARKETPLACE}"
@@ -37,7 +38,24 @@ DEFAULT_ENDPOINT = "https://precious-ant-429.convex.site"
 RELEASE_API = (
     "https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/"
 )
-COMMITS_API = "https://api.github.com/repos/{repository}/commits/{commit}"
+RELEASE_RESPONSE_MAX_BYTES = 1024 * 1024
+SETUP_LOG_KEEP = 10
+SETUP_LOG_MAX_OUTPUT = 600
+HOOK_REVIEW_EXIT_CODE = 3
+CLAIM_KEYS = ("installationToken", "pendingInstallationToken", "builderId")
+# Files an official tool or the OS may leave inside an installed package
+# without changing any tracked file. Anything else in the checkout is a reason
+# to refuse provenance.
+CHECKOUT_NOISE_FILES = frozenset({".codex-marketplace-install.json", ".DS_Store"})
+CHECKOUT_NOISE_PARTS = frozenset({"__pycache__"})
+CHECKOUT_NOISE_SUFFIXES = (".pyc",)
+DIAGNOSTIC_HEX_TOKEN_PATTERN = re.compile(r"\b[0-9a-fA-F]{64}\b")
+DIAGNOSTIC_BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s\"',;]+")
+DIAGNOSTIC_FIELD_PATTERN = re.compile(
+    r"(?i)(\\?\"?(?:inviteCode|installationToken|pendingInstallationToken|"
+    r"BUILDER_PULSE_INVITE_CODE)\\?\"?\s*[:=]\s*)"
+    r"(\\?\"[^\"\\]*\\?\"|'[^']*'|[^\s,;}]+)"
+)
 SETUP_DISCLOSURE = (
     "Builder Pulse installs hooks for Codex and Claude Code when those agents are "
     "available on this computer, but it sends data only from project folders you "
@@ -67,6 +85,178 @@ SETUP_DISCLOSURE = (
 
 class SetupError(RuntimeError):
     pass
+
+
+class HookReviewRequired(Exception):
+    """Setup finished but the agent must approve the hooks once before they run."""
+
+    def __init__(self, message: str, agent_platform: str) -> None:
+        super().__init__(message)
+        self.agent_platform = agent_platform
+
+
+class SetupLog:
+    """Privacy-safe, append-only record of one installer run.
+
+    Every line is redacted before it is written: invite codes, installation
+    tokens, bearer values, and 64-hex secrets never reach disk. Failure to log
+    never changes installer behaviour.
+    """
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+        self.secrets: list[str] = []
+        self._buffer: list[str] = []
+
+    def mask(self, secret: str | None) -> None:
+        if isinstance(secret, str) and len(secret) >= 8 and secret not in self.secrets:
+            self.secrets.append(secret)
+
+    def redact(self, text: Any) -> str:
+        redacted = str(text)
+        for secret in self.secrets:
+            redacted = redacted.replace(secret, "[redacted]")
+        redacted = shorten_home(redacted)
+        redacted = DIAGNOSTIC_HEX_TOKEN_PATTERN.sub("[redacted]", redacted)
+        redacted = DIAGNOSTIC_BEARER_PATTERN.sub("Bearer [redacted]", redacted)
+        redacted = DIAGNOSTIC_FIELD_PATTERN.sub(
+            lambda match: f"{match.group(1)}[redacted]", redacted
+        )
+        return redacted
+
+    def open(self, data_dir: Path) -> Path | None:
+        if self.path is not None:
+            return self.path
+        try:
+            log_dir = data_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(log_dir, 0o700)
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            path = log_dir / f"setup-{stamp}.log"
+            suffix = 1
+            while path.exists():
+                path = log_dir / f"setup-{stamp}-{suffix}.log"
+                suffix += 1
+            path.touch(mode=0o600)
+            os.chmod(path, 0o600)
+            self.path = path
+            for line in self._buffer:
+                self._append(line)
+            self._buffer = []
+            self.prune(log_dir)
+        except OSError:
+            self.path = None
+        return self.path
+
+    @staticmethod
+    def prune(log_dir: Path) -> None:
+        try:
+            logs = sorted(
+                (entry for entry in log_dir.glob("setup-*.log") if entry.is_file()),
+                key=lambda entry: entry.name,
+            )
+            for stale in logs[:-SETUP_LOG_KEEP]:
+                with contextlib.suppress(OSError):
+                    stale.unlink()
+        except OSError:
+            pass
+
+    def _append(self, line: str) -> None:
+        assert self.path is not None
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    def write(self, message: str, **fields: Any) -> None:
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        extra = ""
+        if fields:
+            safe_fields = {
+                key: self.redact(value) if isinstance(value, str) else value
+                for key, value in fields.items()
+            }
+            extra = " " + json.dumps(
+                safe_fields, sort_keys=True, default=str, ensure_ascii=False
+            )
+        line = self.redact(f"{stamp} {message}{extra}") + "\n"
+        if self.path is None:
+            self._buffer.append(line)
+            if len(self._buffer) > 500:
+                del self._buffer[0]
+            return
+        try:
+            self._append(line)
+        except OSError:
+            pass
+
+    def bounded(self, text: Any, limit: int = SETUP_LOG_MAX_OUTPUT) -> str:
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        return "…" + value[-limit:]
+
+
+SETUP_LOG = SetupLog()
+
+
+def shorten_home(text: str) -> str:
+    """Replace the home directory prefix with ~ in logged text."""
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        return text
+    if not home or home in {"/", "\\"}:
+        return text
+    candidates = {home}
+    with contextlib.suppress(OSError):
+        candidates.add(str(Path.home().resolve(strict=False)))
+    candidates.add(home.replace("\\", "/"))
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if candidate and candidate not in {"/", "\\"}:
+            text = text.replace(candidate, "~")
+    return text
+
+
+def folder_label(value: str) -> str:
+    """Log only the last path component of a project folder."""
+    name = PurePath(str(value).replace("\\", "/")).name
+    return f"…/{name}" if name else "…"
+
+
+def display_arguments(arguments: list[str]) -> list[str]:
+    """Return argv with secrets masked and project folders reduced to a label.
+
+    The working directory, the enrolled project root, and any --project-root
+    value are never written to the log; only their basename is.
+    """
+    shown: list[str] = []
+    mask_next: str | None = None
+    for argument in arguments:
+        if mask_next == "secret":
+            shown.append("[redacted]")
+            mask_next = None
+            continue
+        if mask_next == "folder":
+            shown.append(folder_label(argument))
+            mask_next = None
+            continue
+        if argument in {"--code", "--token"}:
+            shown.append(argument)
+            mask_next = "secret"
+            continue
+        if argument in {"--root", "--project-root"}:
+            shown.append(argument)
+            mask_next = "folder"
+            continue
+        if argument.startswith("--code="):
+            shown.append("--code=[redacted]")
+            continue
+        if argument.startswith(("--root=", "--project-root=")):
+            flag, _, value = argument.partition("=")
+            shown.append(f"{flag}={folder_label(value)}")
+            continue
+        shown.append(argument)
+    return shown
 
 
 class LocalPauseRollbackError(SetupError):
@@ -113,6 +303,7 @@ def run_command(
         if executable is None:
             raise SetupError(f"Command could not start: {display_command}")
         arguments = [executable, *arguments[1:]]
+    shown = display_arguments(arguments)
     try:
         completed = subprocess.run(
             arguments,
@@ -122,10 +313,20 @@ def run_command(
             env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        SETUP_LOG.write("command could not start", argv=shown, error=str(exc))
         raise SetupError(f"Command could not start: {display_command}") from exc
+    SETUP_LOG.write(
+        "command finished",
+        argv=shown,
+        returncode=completed.returncode,
+        stderr=SETUP_LOG.bounded(completed.stderr),
+        stdout=SETUP_LOG.bounded(completed.stdout, 300),
+    )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
-        raise SetupError(detail or f"Command failed: {display_command}")
+        raise SetupError(
+            SETUP_LOG.redact(detail) or f"Command failed: {display_command}"
+        )
     if not expect_json:
         return completed.stdout
     try:
@@ -339,37 +540,120 @@ def migrate_existing_data_to_shared(
         (source / "identity.json").is_file()
         or (source / "setup-paused-identity.json").is_file()
     )
+    merge_into_target = False
     if target.exists():
-        target_has_identity = bool(
-            (target / "identity.json").is_file()
-            or (target / "setup-paused-identity.json").is_file()
-        )
-        if source_has_identity and not target_has_identity:
-            raise SetupError(
-                "The shared Builder Pulse data directory exists without the prior identity"
-            )
-        return target
+        if not source_has_identity or directory_holds_claim(target):
+            return target
+        # The shared directory holds no claimed or pending identity: at most the
+        # installer's logs, an unclaimed skeleton written by a runtime hook, a
+        # stale runtime copy, or config left by an earlier failed attempt. None
+        # of that may mask the claimed legacy identity. Overlay the legacy data
+        # on a copy of the directory (legacy files win, the skeleton is dropped)
+        # and swap the result in as one unit.
+        merge_into_target = True
     if not source_has_identity:
         return target
-    for candidate in source.rglob("*"):
-        if candidate.is_symlink():
-            raise SetupError("The existing Builder Pulse data contains a symbolic link")
+    for root in (source, target) if merge_into_target else (source,):
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                raise SetupError("The existing Builder Pulse data contains a symbolic link")
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.parent / f".{target.name}-migration"
     if temporary.exists():
         raise SetupError("A previous Builder Pulse data migration is incomplete")
+    # Build the complete replacement beside the target, then swap it in with a
+    # single rename. A failure at any point leaves the target exactly as it was
+    # (no claimed identity), so a retry migrates everything again instead of
+    # trusting a half-copied directory.
+    replaced: Path | None = None
     try:
-        shutil.copytree(source, temporary, symlinks=False)
+        if merge_into_target:
+            shutil.copytree(target, temporary, symlinks=False)
+            for name in ("identity.json", "setup-paused-identity.json"):
+                with contextlib.suppress(FileNotFoundError):
+                    (temporary / name).unlink()
+            shutil.copytree(source, temporary, symlinks=False, dirs_exist_ok=True)
+            replaced = target.parent / f".{target.name}-replaced"
+            if replaced.exists():
+                shutil.rmtree(replaced)
+            os.replace(target, replaced)
+        else:
+            shutil.copytree(source, temporary, symlinks=False)
         os.replace(temporary, target)
     except OSError as exc:
         shutil.rmtree(temporary, ignore_errors=True)
+        if replaced is not None and replaced.exists() and not target.exists():
+            with contextlib.suppress(OSError):
+                os.replace(replaced, target)
         raise SetupError("The existing Builder Pulse data could not be migrated safely") from exc
+    if replaced is not None:
+        shutil.rmtree(replaced, ignore_errors=True)
     return target
 
 
 def existing_plugin_data_dir(installation: dict[str, Any] | None) -> Path:
     del installation
     return canonical_plugin_data_dir()
+
+
+def directory_holds_identity(directory: Path) -> bool:
+    return bool(
+        (directory / "identity.json").is_file()
+        or (directory / "setup-paused-identity.json").is_file()
+    )
+
+
+def identity_holds_claim(identity: Any) -> bool:
+    """True when an identity record carries something worth preserving."""
+    return isinstance(identity, dict) and any(
+        isinstance(identity.get(key), str) and identity.get(key)
+        for key in CLAIM_KEYS
+    )
+
+
+def directory_holds_claim(directory: Path) -> bool:
+    """True when identity.json or the paused copy carries a claim or pending token.
+
+    The runtime's hook creates an unclaimed skeleton (installationId and
+    promptCapture only) the first time it runs against an empty directory.
+    Such a skeleton must never mask a complete legacy identity.
+    """
+    for name in ("setup-paused-identity.json", "identity.json"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if identity_holds_claim(record):
+            return True
+    return False
+
+
+def repair_identity_dir(installation: dict[str, Any] | None) -> Path:
+    """Locate the identity a repair must preserve.
+
+    The shared directory wins whenever it holds an identity. A member whose
+    earlier v0.5.x attempt stopped before the migration step still has the
+    claimed identity only in the legacy Codex-owned directory, so fall back to
+    it there; the migration step copies it into the shared directory exactly as
+    for any other upgrade, and the pause step still refuses two directories
+    whose installation IDs differ.
+    """
+    shared = existing_plugin_data_dir(installation)
+    if directory_holds_claim(shared):
+        return shared
+    legacy_cli: Path | None = None
+    if installation is not None:
+        try:
+            legacy_cli = installed_cli(installation)
+        except SetupError:
+            legacy_cli = None
+    legacy = legacy_codex_plugin_data_dir(legacy_cli)
+    if directory_holds_claim(legacy):
+        return legacy
+    return shared
 
 
 def authoritative_identity(data_dir: Path) -> dict[str, Any]:
@@ -672,6 +956,7 @@ def pause_existing_capture(
             legacy_identity = authoritative_identity(candidate)
             if (
                 identity
+                and identity_holds_claim(identity)
                 and legacy_identity.get("installationId")
                 != identity.get("installationId")
             ):
@@ -865,8 +1150,8 @@ def verified_git_checkout(root: Path) -> tuple[str, str]:
                 "--untracked-files=all",
             ]
         )
-    ).strip()
-    if checkout_changes:
+    )
+    if not checkout_is_pristine(checkout_changes):
         raise SetupError(
             "The existing Builder Pulse checkout has modified, untracked, or ignored files"
         )
@@ -878,28 +1163,86 @@ def verified_git_checkout(root: Path) -> tuple[str, str]:
     return repository, commit
 
 
+def checkout_noise(path: str) -> bool:
+    """True for files an official tool or the OS may leave in a clean package."""
+    normalized = path.strip().strip('"')
+    if not normalized:
+        return True
+    parts = PurePath(normalized.replace("\\", "/")).parts
+    if not parts:
+        return True
+    if parts[-1] in CHECKOUT_NOISE_FILES:
+        return True
+    if any(part in CHECKOUT_NOISE_PARTS for part in parts):
+        return True
+    return parts[-1].endswith(CHECKOUT_NOISE_SUFFIXES)
+
+
+def checkout_is_pristine(porcelain: str) -> bool:
+    """Accept only tracked-file cleanliness plus allowlisted untracked noise.
+
+    Codex writes `.codex-marketplace-install.json` into every installed package
+    when it refreshes a marketplace, Finder writes `.DS_Store`, and Python may
+    write bytecode caches. None of those can alter the executed scripts, so
+    they must not block an upgrade; every other change still does.
+    """
+    for line in porcelain.splitlines():
+        if not line.strip():
+            continue
+        status = line[:2]
+        path = line[3:] if len(line) > 3 else ""
+        if status in {"??", "!!"}:
+            if checkout_noise(path):
+                continue
+            return False
+        return False
+    return True
+
+
 def verify_remote_commit(repository: str, commit: str) -> None:
-    request = urlrequest.Request(
-        COMMITS_API.format(repository=repository_slug(repository), commit=commit),
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "builder-pulse-installer",
-            "X-GitHub-Api-Version": "2026-03-10",
-        },
-    )
-    try:
-        with urlrequest.urlopen(request, timeout=10) as response:
-            raw = response.read(65_537)
-    except (OSError, ValueError, urlerror.URLError) as exc:
-        raise SetupError("The previous Builder Pulse commit could not be verified") from exc
-    if len(raw) > 65_536:
-        raise SetupError("GitHub returned an invalid Builder Pulse commit response")
-    try:
-        commit_data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise SetupError("GitHub returned an invalid Builder Pulse commit response") from exc
-    if not isinstance(commit_data, dict) or commit_data.get("sha") != commit:
+    """Prove the exact commit exists on the approved remote with git itself.
+
+    The GitHub commits API embeds every file patch and exceeds any sane read
+    cap for large merges, and it is rate limited per address. A shallow fetch
+    of the single object has neither problem and fails closed for unknown
+    commits ("not our ref").
+    """
+    slug = repository_slug(repository)
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise SetupError("The previous Builder Pulse commit could not be verified")
+    probe = tempfile.mkdtemp(prefix="builder-pulse-provenance-")
+    # A public fetch must never block on a credential prompt.
+    git_env = dict(os.environ)
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env["GIT_ASKPASS"] = "echo"
+    try:
+        try:
+            run_command(["git", "init", "--quiet", "--bare", probe], env=git_env)
+            run_command(
+                [
+                    "git",
+                    "-C",
+                    probe,
+                    "fetch",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    f"https://github.com/{slug}.git",
+                    commit,
+                ],
+                env=git_env,
+            )
+            object_type = str(
+                run_command(["git", "-C", probe, "cat-file", "-t", commit], env=git_env)
+            ).strip()
+        except SetupError as exc:
+            raise SetupError(
+                "The previous Builder Pulse commit could not be verified on GitHub"
+            ) from exc
+        if object_type != "commit":
+            raise SetupError("The previous Builder Pulse commit could not be verified")
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 def verified_rollback_source(
@@ -1435,10 +1778,27 @@ def verify_release_exists(release: str) -> str:
     )
     try:
         with urlrequest.urlopen(request, timeout=10) as response:
-            raw = response.read(65_537)
+            raw = response.read(RELEASE_RESPONSE_MAX_BYTES + 1)
+    except urlerror.HTTPError as exc:
+        if exc.code in {403, 429}:
+            reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
+            wait = ""
+            try:
+                if reset:
+                    seconds = int(reset) - int(
+                        dt.datetime.now(dt.timezone.utc).timestamp()
+                    )
+                    wait = f" Retry in about {max(1, (seconds + 59) // 60)} minutes."
+            except ValueError:
+                wait = ""
+            raise SetupError(
+                "GitHub rate limit reached while verifying the Builder Pulse release."
+                + wait
+            ) from exc
+        raise SetupError("The immutable Builder Pulse release could not be verified") from exc
     except (OSError, ValueError, urlerror.URLError) as exc:
         raise SetupError("The immutable Builder Pulse release could not be verified") from exc
-    if len(raw) > 65_536:
+    if len(raw) > RELEASE_RESPONSE_MAX_BYTES:
         raise SetupError("GitHub returned an invalid Builder Pulse release response")
     try:
         release_data = json.loads(raw.decode("utf-8"))
@@ -1477,17 +1837,39 @@ def activate(cli: Path, agent_platform: str = "codex") -> dict[str, Any]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise SetupError("Builder Pulse activation could not start") from exc
     output = completed.stdout.strip()
+    result: dict[str, Any] | None = None
     if output:
         try:
             result = parse_activation(output)
         except SetupError:
             result = None
-        if completed.returncode == 0 and isinstance(result, dict):
+    SETUP_LOG.write(
+        "activation finished",
+        agentPlatform=agent_platform,
+        returncode=completed.returncode,
+        result=result if isinstance(result, dict) else None,
+        stderr=SETUP_LOG.bounded(completed.stderr),
+    )
+    if isinstance(result, dict):
+        if completed.returncode == 0:
             return result
-        if isinstance(result, dict) and result.get("reviewRequired") is True:
+        if result.get("reviewRequired") is True:
             return result
-    detail = completed.stderr.strip()
-    raise SetupError(detail or "Builder Pulse activation failed")
+    detail = SETUP_LOG.redact(completed.stderr.strip())
+    reason_parts: list[str] = []
+    if isinstance(result, dict):
+        for key in ("agentPlatform", "hookStatus", "hookCount", "stage"):
+            if result.get(key) not in (None, ""):
+                reason_parts.append(f"{key}={result[key]}")
+        if isinstance(result.get("detail"), str) and result["detail"]:
+            reason_parts.append(str(result["detail"]))
+    reason = "; ".join(reason_parts)
+    message = "Builder Pulse activation failed"
+    if reason:
+        message += f" ({reason})"
+    if detail:
+        message += f": {detail}"
+    raise SetupError(message)
 
 
 def claimed_identity_fields(identity: Any) -> dict[str, str]:
@@ -1530,6 +1912,74 @@ def claimed_identity(cli: Path) -> dict[str, str]:
     return claimed_identity_fields(identity)
 
 
+class SetupOutcome(NamedTuple):
+    cli: Path
+    enrolled_root: Path | None
+    review_required: tuple[str, ...] = ()
+
+
+def temporary_roots() -> tuple[Path, ...]:
+    candidates = [Path(tempfile.gettempdir())]
+    for literal in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders"):
+        candidates.append(Path(literal))
+    roots: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if resolved not in roots and not is_filesystem_root(resolved):
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def is_builder_pulse_checkout(root: Path) -> bool:
+    """True when the folder, or any parent, is a Builder Pulse package checkout."""
+    for candidate in (root, *root.parents):
+        if (candidate / "scripts" / "setup_builder_pulse.py").is_file():
+            return True
+        manifest = candidate / ".codex-plugin" / "plugin.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("name") == "builder-pulse":
+            return True
+    return False
+
+
+def enrollment_refusal(root: Path) -> str | None:
+    """Return why a folder may never be enrolled, or None when it is acceptable."""
+    home = Path.home().resolve(strict=False)
+    if root == home or root in home.parents or is_filesystem_root(root):
+        return (
+            "The confirmed folder must be a project folder, not the home, one of "
+            "its parents, or the filesystem root"
+        )
+    for temporary in temporary_roots():
+        if root == temporary or temporary in root.parents:
+            return (
+                f"{root} is a temporary folder, not your project; run the installer "
+                "again from inside the project folder Builder Pulse should monitor"
+            )
+    if is_builder_pulse_checkout(root):
+        return f"{root} is the Builder Pulse installer folder, not your project"
+    return None
+
+
+def hook_review_message(agent_platform: str, cli: Path, enrolled_root: Path | None) -> str:
+    folder = str(enrolled_root) if enrolled_root is not None else "an enrolled project folder"
+    python_name = "py -3" if os.name == "nt" else "python3"
+    return (
+        "Builder Pulse is installed but Codex has not approved its hooks yet. "
+        f"One-time step: start Codex inside {folder}; it warns that hooks need "
+        "review. Run /hooks, select the builder-pulse hooks and trust them (Codex "
+        "desktop app: type /hooks in the composer). Telemetry starts as soon as they "
+        "are trusted - no rerun of this installer is needed. To confirm later: "
+        f"{python_name} {cli} activate --agent {agent_platform}"
+    )
+
+
 def setup(
     invite_code: str,
     endpoint: str,
@@ -1537,7 +1987,7 @@ def setup(
     project_label: str,
     *,
     reuse_existing_claim: bool = False,
-) -> None:
+) -> SetupOutcome:
     if sys.version_info < (3, 11):
         raise SetupError("Builder Pulse requires Python 3.11 or newer")
     if shutil.which("git") is None:
@@ -1550,28 +2000,40 @@ def setup(
         raise SetupError("Existing-claim repair must not use a new invite code")
     if not reuse_existing_claim and (len(invite_code) < 16 or len(invite_code) > 256):
         raise SetupError("The Builder Pulse invite code is invalid")
-    if not str(project_root).strip():
-        raise SetupError("A member-confirmed Builder Pulse project folder is required")
-    enrolled_root = Path(project_root).expanduser().resolve(strict=False)
-    if not enrolled_root.is_dir():
-        raise SetupError("The confirmed Builder Pulse project folder does not exist")
-    confirmed_label = project_label.strip()
-    if not confirmed_label or len(confirmed_label) > 160:
-        raise SetupError("The confirmed Builder Pulse project name is invalid")
-    if any(ord(character) < 32 for character in confirmed_label):
-        raise SetupError("The confirmed Builder Pulse project name is invalid")
-    home = Path.home().resolve(strict=False)
-    if (
-        enrolled_root == home
-        or enrolled_root in home.parents
-        or is_filesystem_root(enrolled_root)
-    ):
-        raise SetupError(
-            "The confirmed folder must be a project folder, not the home, one of "
-            "its parents, or the filesystem root"
-        )
+    SETUP_LOG.mask(invite_code)
+    SETUP_LOG.open(canonical_plugin_data_dir())
+    SETUP_LOG.write(
+        "setup started",
+        release=TARGET_RELEASE,
+        mode="repair" if reuse_existing_claim else "setup",
+        codex=codex_available,
+        claude=claude_available,
+        python=".".join(str(part) for part in sys.version_info[:3]),
+        platform=sys.platform,
+    )
+
+    # A repair never invents a project. It enrolls only a folder the member
+    # named explicitly; the existing allowlist is preserved either way.
+    enroll_requested = bool(str(project_root).strip()) or bool(project_label.strip())
+    enrolled_root: Path | None = None
+    confirmed_label = ""
+    if enroll_requested or not reuse_existing_claim:
+        if not str(project_root).strip():
+            raise SetupError("A member-confirmed Builder Pulse project folder is required")
+        enrolled_root = Path(project_root).expanduser().resolve(strict=False)
+        if not enrolled_root.is_dir():
+            raise SetupError("The confirmed Builder Pulse project folder does not exist")
+        confirmed_label = project_label.strip()
+        if not confirmed_label or len(confirmed_label) > 160:
+            raise SetupError("The confirmed Builder Pulse project name is invalid")
+        if any(ord(character) < 32 for character in confirmed_label):
+            raise SetupError("The confirmed Builder Pulse project name is invalid")
+        refusal = enrollment_refusal(enrolled_root)
+        if refusal:
+            raise SetupError(refusal)
 
     target_commit = verify_release_exists(TARGET_RELEASE)
+    SETUP_LOG.write("release verified", release=TARGET_RELEASE, commit=target_commit)
     # Verify the installer itself before reading or changing identity state.
     # The runtime installer repeats this check immediately before copying code.
     verified_installer_checkout(target_commit)
@@ -1581,6 +2043,11 @@ def setup(
     )
     previous = installed_builder() if codex_available else None
     previous_marketplace = marketplace_state() if codex_available else None
+    SETUP_LOG.write(
+        "existing codex registration",
+        installedVersion=previous.get("version") if isinstance(previous, dict) else None,
+        marketplaceConfigured=previous_marketplace is not None,
+    )
     if previous_marketplace:
         source = previous_marketplace.get("marketplaceSource")
         repository = source.get("source") if isinstance(source, dict) else None
@@ -1593,8 +2060,16 @@ def setup(
     rollback_source = verified_rollback_source(previous, previous_marketplace)
     preserved_identity: dict[str, str] | None = None
     if reuse_existing_claim:
+        identity_dir = repair_identity_dir(previous)
         preserved_identity = local_claimed_identity_fields(
-            authoritative_identity(existing_plugin_data_dir(previous))
+            authoritative_identity(identity_dir)
+        )
+        SETUP_LOG.write(
+            "existing identity verified",
+            installationId=preserved_identity.get("installationId"),
+            source="legacy"
+            if identity_dir != existing_plugin_data_dir(previous)
+            else "shared",
         )
 
     previous_claude = installed_claude_builders() if claude_available else []
@@ -1610,6 +2085,7 @@ def setup(
     delivery_identity: dict[str, Any] | None = None
     resume_attempted = False
     setup_succeeded = False
+    review_required: list[str] = []
     try:
         # Claude's release-scoped target is additive. Install and verify it while
         # every previous registration and Codex capture path are still intact.
@@ -1622,6 +2098,7 @@ def setup(
                 existing_entries=previous_claude,
                 remove_previous=False,
             )
+            SETUP_LOG.write("claude package installed", pluginId=claude_target)
 
         # Move the old Codex-owned identity to the agent-neutral data directory
         # only after every target agent has proved it can install. The old
@@ -1635,6 +2112,10 @@ def setup(
         # operation that cannot be side-by-side. Any failure below restores the
         # exact previous Codex package and capture state.
         paused = pause_existing_capture(previous)
+        SETUP_LOG.write(
+            "previous capture paused",
+            serverPaused=paused.server_paused if paused is not None else None,
+        )
         if codex_available:
             codex_mutated = True
             remove_current(
@@ -1643,6 +2124,7 @@ def setup(
                 rollback_source=rollback_source,
             )
             codex_cli = install_release(TARGET_RELEASE, expected_commit=target_commit)
+            SETUP_LOG.write("codex package installed", cli=str(codex_cli))
 
         cli = codex_cli or shared_cli
 
@@ -1654,6 +2136,7 @@ def setup(
         if reuse_existing_claim:
             if claimed_identity(cli) != preserved_identity:
                 raise SetupError("The Builder Pulse identity changed during repair")
+            SETUP_LOG.write("identity restored")
         else:
             claim_env = dict(os.environ)
             claim_env["BUILDER_PULSE_INVITE_CODE"] = invite_code
@@ -1661,17 +2144,20 @@ def setup(
                 cli_command(cli, "claim", "--endpoint", endpoint),
                 env=claim_env,
             )
-        run_command(
-            cli_command(
-                cli,
-                "work",
-                "enroll",
-                "--root",
-                str(enrolled_root),
-                "--project",
-                confirmed_label,
+            SETUP_LOG.write("installation claimed")
+        if enrolled_root is not None:
+            run_command(
+                cli_command(
+                    cli,
+                    "work",
+                    "enroll",
+                    "--root",
+                    str(enrolled_root),
+                    "--project",
+                    confirmed_label,
+                )
             )
-        )
+            SETUP_LOG.write("project enrolled", rootLabel=enrolled_root.name)
         target_plugin_version = TARGET_RELEASE.removeprefix("v")
         delivery_identity = authoritative_identity(delivery_data_dir)
         # A network failure can happen after the service commits the resume but
@@ -1681,6 +2167,7 @@ def setup(
         resume_attempted = True
         resume_server_capture(delivery_identity, target_plugin_version)
         run_command(cli_command(cli, "config", "set", "enabled", "true"))
+        SETUP_LOG.write("capture resumed")
         activations: list[dict[str, Any]] = []
         if codex_available:
             activations.append(activate(codex_cli or cli, "codex"))
@@ -1691,34 +2178,53 @@ def setup(
                 activation.get("hooksVerified") is True
                 or activation.get("hooksTrusted") is True
             )
-            if not (
+            agent_platform = (
+                "claude_code"
+                if activation.get("agentPlatform") == "claude_code"
+                else "codex"
+            )
+            if (
                 activation.get("activationReady") is True
                 and hooks_verified
                 and activation.get("serverVerified") is True
             ):
-                if activation.get("reviewRequired") is True:
-                    raise SetupError(
-                        "Codex requires its official one-time Builder Pulse hook review"
-                    )
-                agent_name = (
-                    "Claude Code"
-                    if activation.get("agentPlatform") == "claude_code"
-                    else "Codex"
+                continue
+            if activation.get("reviewRequired") is True:
+                # The package, identity, enrollment, and server policy are all
+                # verified. Untrusted hooks never execute, so leaving the
+                # installation active is privacy-safe; only the member's one-time
+                # /hooks approval is missing. Rolling back here would uninstall
+                # the very hooks the member is asked to review.
+                review_required.append(agent_platform)
+                SETUP_LOG.write(
+                    "hook review required",
+                    agentPlatform=agent_platform,
+                    hookStatus=activation.get("hookStatus"),
                 )
-                raise SetupError(
-                    f"Builder Pulse activation was not verified for {agent_name}"
-                )
+                continue
+            agent_name = "Claude Code" if agent_platform == "claude_code" else "Codex"
+            reason = "; ".join(
+                f"{key}={activation[key]}"
+                for key in ("hookStatus", "detail")
+                if activation.get(key) not in (None, "")
+            )
+            raise SetupError(
+                f"Builder Pulse activation was not verified for {agent_name}"
+                + (f" ({reason})" if reason else "")
+            )
         run_command(cli_command(cli, "flush"))
         # The target package, hooks, server policy, and first delivery are now
         # verified. Only at this point may older Claude registrations be
         # removed. A cleanup failure leaves the verified target and capture
         # active instead of quarantining a working installation again.
         setup_succeeded = True
+        SETUP_LOG.write("setup verified", reviewRequired=review_required)
         if claude_available:
             remove_previous_claude_builders(previous_claude, claude_target)
     except BaseException as setup_error:
         if setup_succeeded:
             raise
+        SETUP_LOG.write("setup failed; rolling back", error=str(setup_error))
 
         rollback_errors: list[str] = []
         target_capture_safe = True
@@ -1787,6 +2293,7 @@ def setup(
             except BaseException as rollback_error:
                 rollback_errors.append(f"previous capture state: {rollback_error}")
 
+        SETUP_LOG.write("rollback finished", errors=rollback_errors)
         if rollback_errors and not isinstance(
             setup_error, (KeyboardInterrupt, SystemExit)
         ):
@@ -1802,6 +2309,70 @@ def setup(
                 file=sys.stderr,
             )
         raise
+    return SetupOutcome(cli, enrolled_root, tuple(review_required))
+
+
+def open_setup_log_for_report() -> Path | None:
+    """Open the log at its stable location under the shared data directory.
+
+    Only the secret-free `logs` directory is created here; the migration step
+    treats a shared directory holding nothing else as absent.
+    """
+    if SETUP_LOG.path is not None:
+        return SETUP_LOG.path
+    return SETUP_LOG.open(canonical_plugin_data_dir())
+
+
+def prompt_for_project(current_folder: Path) -> tuple[str, str]:
+    repository_root: Path | None = None
+    try:
+        detected = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(current_folder),
+                "rev-parse",
+                "--show-toplevel",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if detected.returncode == 0 and detected.stdout.strip():
+            candidate = Path(detected.stdout.strip()).resolve(strict=False)
+            if candidate.is_dir() and candidate != current_folder:
+                repository_root = candidate
+    except (OSError, subprocess.SubprocessError):
+        repository_root = None
+    print(
+        "Builder Pulse project choices (shown only in this terminal):",
+        file=sys.stderr,
+    )
+    default_root: Path | None = current_folder
+    if is_builder_pulse_checkout(current_folder):
+        print(
+            "The current folder is the Builder Pulse installer clone, not your project.",
+            file=sys.stderr,
+        )
+        default_root = None
+    else:
+        print(f"- Current folder: {current_folder}", file=sys.stderr)
+    if repository_root is not None and not is_builder_pulse_checkout(repository_root):
+        print(
+            f"- Nearest Git repository root: {repository_root}",
+            file=sys.stderr,
+        )
+    prompt = "Which exact project folder should Builder Pulse monitor? "
+    prompt += f"[{default_root}]: " if default_root is not None else "(type the full path): "
+    project_root = ""
+    while not project_root:
+        entered_root = input(prompt).strip()
+        project_root = entered_root or (str(default_root) if default_root is not None else "")
+        if not project_root:
+            print("A project folder path is required.", file=sys.stderr)
+    project_label = input("Project name GrowthX should display: ").strip()
+    return project_root, project_label
 
 
 def main() -> int:
@@ -1818,52 +2389,28 @@ def main() -> int:
     args = parser.parse_args()
     print(SETUP_DISCLOSURE, file=sys.stderr)
     invite_code = args.code or os.environ.get("BUILDER_PULSE_INVITE_CODE") or ""
+    SETUP_LOG.mask(invite_code)
     if not args.reuse_existing_claim and not invite_code and sys.stdin.isatty():
         invite_code = getpass.getpass("Builder Pulse invite code: ")
+        SETUP_LOG.mask(invite_code)
     project_root = args.project_root or ""
     project_label = args.project_label or ""
-    if sys.stdin.isatty() and not project_root:
+    interactive = sys.stdin.isatty()
+    if interactive and not project_root:
         current_folder = Path.cwd().resolve(strict=False)
-        repository_root: Path | None = None
-        try:
-            detected = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(current_folder),
-                    "rev-parse",
-                    "--show-toplevel",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if detected.returncode == 0 and detected.stdout.strip():
-                candidate = Path(detected.stdout.strip()).resolve(strict=False)
-                if candidate.is_dir() and candidate != current_folder:
-                    repository_root = candidate
-        except (OSError, subprocess.SubprocessError):
-            repository_root = None
-        print(
-            "Builder Pulse project choices (shown only in this terminal):",
-            file=sys.stderr,
-        )
-        print(f"- Current folder: {current_folder}", file=sys.stderr)
-        if repository_root is not None:
-            print(
-                f"- Nearest Git repository root: {repository_root}",
-                file=sys.stderr,
-            )
-        entered_root = input(
-            "Which exact project folder should Builder Pulse monitor? "
-            f"[{current_folder}]: "
-        ).strip()
-        project_root = entered_root or str(current_folder)
-    if sys.stdin.isatty() and not project_label:
+        if args.reuse_existing_claim:
+            answer = input(
+                "Existing enrollments are kept. Enroll an additional project folder "
+                "now? [y/N]: "
+            ).strip().lower()
+            if answer in {"y", "yes"}:
+                project_root, project_label = prompt_for_project(current_folder)
+        else:
+            project_root, project_label = prompt_for_project(current_folder)
+    elif interactive and not project_label:
         project_label = input("Project name GrowthX should display: ").strip()
     try:
-        setup(
+        outcome = setup(
             invite_code,
             args.endpoint,
             project_root,
@@ -1871,16 +2418,46 @@ def main() -> int:
             reuse_existing_claim=args.reuse_existing_claim,
         )
     except SetupError as exc:
-        print(f"Builder Pulse setup stopped: {exc}", file=sys.stderr)
+        log_path = open_setup_log_for_report()
+        SETUP_LOG.write("setup stopped", error=str(exc))
+        print(f"Builder Pulse setup stopped: {SETUP_LOG.redact(exc)}", file=sys.stderr)
+        if log_path is not None:
+            print(f"Details: {log_path}", file=sys.stderr)
         return 1
+
+    log_path = open_setup_log_for_report()
+    try:
+        enrolled = str(run_command(cli_command(outcome.cli, "work", "list"))).strip()
+    except SetupError:
+        enrolled = ""
+    if enrolled:
+        print("Enrolled project folders:", file=sys.stderr)
+        print(enrolled, file=sys.stderr)
+    if outcome.review_required:
+        for agent_platform in outcome.review_required:
+            print(
+                hook_review_message(agent_platform, outcome.cli, outcome.enrolled_root),
+                file=sys.stderr,
+            )
+        if log_path is not None:
+            print(f"Details: {log_path}", file=sys.stderr)
+        SETUP_LOG.write("setup finished; hook review pending")
+        return HOOK_REVIEW_EXIT_CODE
     print(
         "Builder Pulse is installed for every supported agent found on this computer. "
-        "Only project folders you explicitly confirmed are enrolled; this confirmed "
-        "project was added without removing prior confirmed projects. "
-        "Exit all running Claude Code and Codex sessions, start a fresh session "
+        "Only project folders you explicitly confirmed are enrolled; "
+        + (
+            "this confirmed project was added without removing prior confirmed projects. "
+            if outcome.enrolled_root is not None
+            else "prior confirmed projects were kept unchanged. "
+        )
+        + "Exit all running Claude Code and Codex sessions, start a fresh session "
         "in each agent you use, then send one normal prompt in each to verify "
         "separate server receipts."
     )
+    if log_path is not None:
+        print(f"Details: {log_path}", file=sys.stderr)
+    SETUP_LOG.write("setup finished")
     return 0
 
 

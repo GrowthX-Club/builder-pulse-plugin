@@ -547,16 +547,23 @@ class BuilderPulseTests(unittest.TestCase):
         )
 
         hooks[0]["trustStatus"] = "untrusted"
+        review = builder_pulse.evaluate_builder_pulse_hooks(response)
         self.assertEqual(
-            builder_pulse.evaluate_builder_pulse_hooks(response),
+            {key: review[key] for key in ("ready", "hookStatus", "hookCount")},
             {"ready": False, "hookStatus": "review_required", "hookCount": 5},
         )
+        self.assertIn("/hooks", review["detail"])
 
         hooks[0]["trustStatus"] = "trusted"
         hooks[0]["sourcePath"] = "/tmp/stale/hooks/hooks.json"
+        stale = builder_pulse.evaluate_builder_pulse_hooks(response)
         self.assertEqual(
-            builder_pulse.evaluate_builder_pulse_hooks(response),
+            {key: stale[key] for key in ("ready", "hookStatus", "hookCount")},
             {"ready": False, "hookStatus": "stale_plugin", "hookCount": 5},
+        )
+        self.assertIn(
+            str(Path("/tmp/stale/hooks/hooks.json").resolve(strict=False)),
+            stale["detail"],
         )
 
     def test_hook_readiness_rejects_duplicate_missing_or_extra_hooks(self) -> None:
@@ -3765,7 +3772,9 @@ class BuilderPulseTests(unittest.TestCase):
         # Windows byte-range locks and atomic replaces have materially higher
         # fixed overhead. Keep a bounded regression guard on every platform
         # without treating required cross-process locking as a performance bug.
-        maximum_elapsed = 8.0 if os.name == "nt" else 2.5
+        # The assertion that matters is "only once"; the wall-clock bound only
+        # guards against a runaway loop and must be generous for shared CI runners.
+        maximum_elapsed = 12.0 if os.name == "nt" else 6.0
         self.assertLess(elapsed, maximum_elapsed)
 
     def test_endpoint_rejects_embedded_secrets(self) -> None:
@@ -3856,7 +3865,7 @@ class HookManifestTests(unittest.TestCase):
         plugin_name = f"builder-pulse-claude-{platform_directory}"
         root = builder_pulse.PLUGIN_ROOT / "claude-plugins" / platform_directory
         valid = {
-            "id": f"{plugin_name}@growthx-builder-tools-v0-5-1",
+            "id": builder_pulse.expected_claude_plugin_id(),
             "version": builder_pulse.PLUGIN_VERSION,
             "enabled": True,
             "scope": "user",
@@ -3927,56 +3936,38 @@ class HookManifestTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "{}\n")
         self.assertEqual(completed.stderr, "")
 
-    @unittest.skipIf(os.name == "nt", "POSIX launcher execution test")
-    def test_codex_launcher_fails_open_when_the_runtime_crashes(self) -> None:
-        source_wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.sh"
-        with tempfile.TemporaryDirectory() as directory:
-            plugin_root = Path(directory) / "plugin"
-            scripts = plugin_root / "scripts"
-            scripts.mkdir(parents=True)
-            wrapper = scripts / "builder_pulse.sh"
-            wrapper.write_bytes(source_wrapper.read_bytes())
-            (scripts / "builder_pulse.py").write_text(
-                "raise SystemExit(9)\n", encoding="utf-8"
-            )
-            completed = subprocess.run(
-                ["sh", str(wrapper)],
-                input="{}\n",
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        self.assertEqual(completed.returncode, 0)
-        self.assertEqual(completed.stdout, "{}\n")
-        self.assertEqual(completed.stderr, "")
+    def test_codex_hook_manifest_is_byte_identical_to_the_v045_release(self) -> None:
+        # Codex hashes the normalized hook definition to decide trust, so any
+        # byte-level drift here forces every v0.4.2-v0.4.5 member through a
+        # new /hooks review. The fixture is `git show v0.4.5:hooks/hooks.json`.
+        manifest_path = builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json"
+        fixture_path = builder_pulse.PLUGIN_ROOT / "tests" / "fixtures" / "hooks-v0.4.5.json"
+        self.assertEqual(manifest_path.read_bytes(), fixture_path.read_bytes())
 
-    def test_codex_hook_commands_use_runtime_plugin_root(self) -> None:
+    def test_codex_hook_commands_run_the_python_runtime_directly(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        self.assertEqual(
+            set(manifest["hooks"]),
+            {"SessionStart", "UserPromptSubmit", "PostToolUse", "PermissionRequest", "SessionEnd"},
+        )
         commands = [
             hook
             for registrations in manifest["hooks"].values()
             for registration in registrations
             for hook in registration["hooks"]
         ]
-        self.assertTrue(commands)
+        self.assertEqual(len(commands), 5)
         for hook in commands:
-            self.assertIn("${PLUGIN_ROOT}", hook["command"])
-            self.assertIn("builder_pulse.sh", hook["command"])
+            self.assertEqual(
+                hook["command"],
+                'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py" hook',
+            )
             self.assertEqual(
                 hook["commandWindows"],
-                '"%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd"',
+                'py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook',
             )
-            self.assertNotIn("CLAUDE_PLUGIN_ROOT", hook["commandWindows"])
-            self.assertNotIn("cd /d", hook["commandWindows"])
-            self.assertNotIn("call ", hook["commandWindows"].lower())
-
-    def test_windows_hook_wrapper_quotes_the_python_script_path(self) -> None:
-        wrapper = builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd"
-        contents = wrapper.read_text(encoding="utf-8")
-        self.assertIn('py -3 "%~dp0builder_pulse.py" hook', contents)
-        self.assertIn('sys.version_info.minor in range(11, 100)', contents)
-        self.assertNotIn('sys.version_info <', contents)
-        self.assertNotIn('sys.version_info ^<', contents)
+        self.assertFalse((builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.sh").exists())
+        self.assertFalse((builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd").exists())
 
     def test_windows_claude_wrapper_uses_the_versioned_plugin_root_layout(self) -> None:
         wrapper = (
@@ -4011,9 +4002,9 @@ class HookManifestTests(unittest.TestCase):
         options = run.call_args.kwargs
         self.assertEqual(
             command,
-            'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
+            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
         )
-        self.assertEqual(options["env"]["PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
+        self.assertEqual(options["env"]["CLAUDE_PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
         self.assertNotIn("cwd", options)
 
     def test_windows_claude_launcher_verification_uses_powershell_hook_semantics(
@@ -4071,9 +4062,9 @@ class HookManifestTests(unittest.TestCase):
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
         self.assertEqual(
             run.call_args.args[0],
-            'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
+            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
         )
-        self.assertEqual(run.call_args.kwargs["env"]["PLUGIN_ROOT"], str(unc_root))
+        self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_PLUGIN_ROOT"], str(unc_root))
         self.assertNotIn("cwd", run.call_args.kwargs)
 
     def test_windows_launcher_expands_percent_bearing_roots_only_once(self) -> None:
@@ -4099,10 +4090,10 @@ class HookManifestTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     run.call_args.args[0],
-                    'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\builder_pulse.cmd""',
+                    'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
                 )
                 self.assertEqual(
-                    run.call_args.kwargs["env"]["PLUGIN_ROOT"], str(root)
+                    run.call_args.kwargs["env"]["CLAUDE_PLUGIN_ROOT"], str(root)
                 )
                 self.assertNotIn("call ", run.call_args.args[0].lower())
 
@@ -4153,10 +4144,195 @@ class HookManifestTests(unittest.TestCase):
         hook = manifest["hooks"]["SessionEnd"][0]["hooks"][0]
         self.assertNotIn("async", hook)
 
-    def test_user_prompt_submit_is_async_so_telemetry_cannot_block_a_prompt(self) -> None:
+    def test_user_prompt_submit_stays_bounded_inside_its_synchronous_timeout(self) -> None:
+        # The v0.4.5 manifest registers UserPromptSubmit synchronously with a
+        # 5 s timeout. The runtime attempts only the current prompt under a
+        # 750 ms deadline and defers every backlog, so the hook cannot hold a
+        # prompt for the full timeout.
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
         hook = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]
-        self.assertIs(hook.get("async"), True)
+        self.assertNotIn("async", hook)
+        self.assertEqual(hook["timeout"], 5)
+        self.assertLess(builder_pulse.CURRENT_PROMPT_DELIVERY_TIMEOUT_SECONDS, 1.0)
+
+
+class ActivationDiagnosticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data_dir = Path(self.temp.name) / "data"
+        self.data_dir.mkdir()
+
+    def hook(self, event_name: str, **overrides: object) -> dict[str, object]:
+        base = {
+            "pluginId": "builder-pulse@growthx-builder-tools",
+            "eventName": event_name,
+            "sourcePath": str(builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json"),
+            "enabled": True,
+            "trustStatus": "trusted",
+        }
+        base.update(overrides)
+        return base
+
+    def test_every_not_ready_codex_result_explains_itself(self) -> None:
+        events = sorted(builder_pulse.EXPECTED_PLUGIN_HOOK_EVENTS)
+        other = {"pluginId": "browser@openai-bundled", "eventName": "sessionStart"}
+        cases = {
+            "not_loaded": ({"result": {"data": [{"hooks": [other], "errors": []}]}}, "browser@openai-bundled"),
+            "incomplete": (
+                {"result": {"data": [{"hooks": [self.hook(event) for event in events[:-1]], "errors": []}]}},
+                "expected exactly 5",
+            ),
+            "discovery_error": (
+                {"result": {"data": [{"hooks": [], "errors": [{"message": "bad hooks.json in x"}]}]}},
+                "bad hooks.json in x",
+            ),
+            "disabled": (
+                {"result": {"data": [{"hooks": [self.hook(event, enabled=event != events[0]) for event in events], "errors": []}]}},
+                "/hooks",
+            ),
+            "invalid_response": ({"error": {"code": -32601, "message": "method not found"}}, "method not found"),
+            "review_required": (
+                {"result": {"data": [{"hooks": [self.hook(event, trustStatus="untrusted") for event in events], "errors": []}]}},
+                "/hooks",
+            ),
+        }
+        for status, (response, fragment) in cases.items():
+            with self.subTest(status=status):
+                result = builder_pulse.evaluate_builder_pulse_hooks(response)
+                self.assertFalse(result["ready"])
+                self.assertEqual(result["hookStatus"], status)
+                self.assertIn(fragment, result["detail"])
+
+    def test_claude_plugin_results_explain_themselves(self) -> None:
+        listed = [{"id": "other@market", "version": "1.0.0", "scope": "user", "enabled": True}]
+        result = builder_pulse.evaluate_claude_plugins(listed)
+        self.assertEqual(result["hookStatus"], "not_loaded")
+        self.assertIn(builder_pulse.expected_claude_plugin_id(), result["detail"])
+        self.assertIn("other@market", result["detail"])
+        stale = builder_pulse.evaluate_claude_plugins(
+            [{"id": builder_pulse.expected_claude_plugin_id(), "version": "0.4.6", "scope": "user", "enabled": True}]
+        )
+        self.assertEqual(stale["hookStatus"], "stale_plugin")
+        self.assertIn("0.4.6", stale["detail"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fake executable")
+    def test_app_server_failure_reports_the_stage_and_stderr(self) -> None:
+        fake = Path(self.temp.name) / "codex"
+        fake.write_text("#!/bin/sh\necho 'boom from app-server' >&2\nexit 7\n", encoding="utf-8")
+        fake.chmod(0o700)
+        with mock.patch.object(builder_pulse.shutil, "which", return_value=str(fake)):
+            result = builder_pulse.inspect_codex_hooks(Path(self.temp.name), timeout_seconds=5)
+        self.assertEqual(result["hookStatus"], "app_server_unavailable")
+        self.assertEqual(result["stage"], "initialize")
+        self.assertIn("boom from app-server", result["detail"])
+        self.assertIn("codex app-server exited with 7 during initialize", result["detail"])
+        self.assertNotIn("did not answer", result["detail"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fake executable")
+    def test_app_server_that_never_answers_is_reported_as_a_timeout(self) -> None:
+        fake = Path(self.temp.name) / "codex"
+        fake.write_text("#!/bin/sh\ncat > /dev/null\n", encoding="utf-8")
+        fake.chmod(0o700)
+        with mock.patch.object(builder_pulse.shutil, "which", return_value=str(fake)):
+            result = builder_pulse.inspect_codex_hooks(Path(self.temp.name), timeout_seconds=0.5)
+        self.assertEqual(result["hookStatus"], "app_server_unavailable")
+        self.assertEqual(result["stage"], "initialize")
+        self.assertIn("did not answer during initialize within 0.5s", result["detail"])
+        self.assertNotIn("exited with", result["detail"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX python3 resolution")
+    def test_codex_launcher_verification_explains_a_missing_or_old_python3(self) -> None:
+        with mock.patch.object(builder_pulse.shutil, "which", return_value=None):
+            missing = builder_pulse.verify_hook_launcher(self.data_dir)
+        self.assertEqual(missing["hookStatus"], "launcher_unavailable")
+        self.assertIn("python3 is not on PATH", missing["detail"])
+        with (
+            mock.patch.object(builder_pulse.shutil, "which", return_value="/usr/bin/python3"),
+            mock.patch.object(builder_pulse, "interpreter_version_text", return_value="3.9.6"),
+        ):
+            old = builder_pulse.verify_hook_launcher(self.data_dir)
+        self.assertEqual(old["hookStatus"], "launcher_unavailable")
+        self.assertIn("3.9.6", old["detail"])
+        self.assertIn("3.11", old["detail"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX python3 resolution")
+    def test_codex_launcher_verification_runs_the_python_runtime_directly(self) -> None:
+        plugin_root = Path(self.temp.name) / "plugin"
+        (plugin_root / "scripts").mkdir(parents=True)
+        (plugin_root / "scripts" / "builder_pulse.py").write_text(
+            "import sys\nsys.stderr.write('runtime exploded')\nraise SystemExit(9)\n",
+            encoding="utf-8",
+        )
+        result = builder_pulse.verify_hook_launcher(self.data_dir, plugin_root=plugin_root)
+        self.assertEqual(result["hookStatus"], "launcher_unavailable")
+        self.assertIn("exited 9", result["detail"])
+        self.assertIn("runtime exploded", result["detail"])
+        (plugin_root / "scripts" / "builder_pulse.py").write_text(
+            "import sys\nsys.stdin.read()\nprint('{}')\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            builder_pulse.verify_hook_launcher(self.data_dir, plugin_root=plugin_root),
+            {"ready": True, "hookStatus": "launcher_verified"},
+        )
+
+    def test_diagnostic_log_redacts_and_stays_private_and_bounded(self) -> None:
+        token = "b" * 64
+        path = builder_pulse.append_diagnostic_log(
+            self.data_dir,
+            "activate.log",
+            {
+                "detail": f"token {token} Authorization Bearer abcdefghijklmnop",
+                "body": '{"inviteCode": "Invite_1234567890"}',
+                "home": str(Path.home() / ".codex" / "plugins"),
+            },
+        )
+        assert path is not None
+        content = path.read_text(encoding="utf-8")
+        self.assertNotIn(token, content)
+        self.assertNotIn("abcdefghijklmnop", content)
+        self.assertNotIn("Invite_1234567890", content)
+        self.assertIn("[redacted]", content)
+        # The log line is JSON, so backslashes in Windows paths are escaped.
+        self.assertNotIn(json.dumps(str(Path.home()))[1:-1], content)
+        self.assertIn(json.dumps(os.path.join("~", ".codex", "plugins"))[1:-1], content)
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        for index in range(600):
+            builder_pulse.append_diagnostic_log(self.data_dir, "activate.log", {"n": index, "pad": "x" * 900})
+        size = path.stat().st_size
+        self.assertLessEqual(size, builder_pulse.DIAGNOSTIC_LOG_MAX_BYTES)
+        first = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        self.assertTrue(first.startswith("{"), first[:40])
+        self.assertTrue(first.endswith("}"), first[-40:])
+
+    def test_activate_records_the_reason_in_the_local_log(self) -> None:
+        identity = builder_pulse.ensure_identity(self.data_dir)
+        identity.update(
+            {
+                "builderId": "builder-1",
+                "memberId": "growthx-member-1",
+                "builderName": "Builder One",
+                "installationToken": "a" * 64,
+                "claimedEndpoint": "https://pulse.example",
+                "promptCapture": "on",
+            }
+        )
+        builder_pulse.atomic_write_json(builder_pulse.identity_path(self.data_dir), identity)
+        output = io.StringIO()
+        with mock.patch.object(
+            builder_pulse,
+            "inspect_codex_hooks",
+            return_value={"ready": False, "hookStatus": "not_loaded", "hookCount": 0, "detail": "plugins seen: none"},
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(builder_pulse.command_activate(self.data_dir), 3)
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed["detail"], "plugins seen: none")
+        log = (self.data_dir / "logs" / "activate.log").read_text(encoding="utf-8")
+        self.assertIn("hooks_not_ready", log)
+        self.assertIn("plugins seen: none", log)
+        self.assertNotIn("a" * 64, log)
 
 
 if __name__ == "__main__":

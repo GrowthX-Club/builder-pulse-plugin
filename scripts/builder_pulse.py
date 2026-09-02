@@ -3030,21 +3030,167 @@ EXPECTED_PLUGIN_HOOK_EVENTS = {
 }
 
 
+DIAGNOSTIC_LOG_MAX_BYTES = 256 * 1024
+DIAGNOSTIC_DETAIL_LIMIT = 400
+DIAGNOSTIC_HEX_TOKEN_PATTERN = re.compile(r"\b[0-9a-fA-F]{64}\b")
+DIAGNOSTIC_BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s\"',;]+")
+DIAGNOSTIC_FIELD_PATTERN = re.compile(
+    r"(?i)(\\?\"?(?:inviteCode|installationToken|pendingInstallationToken|"
+    r"BUILDER_PULSE_INVITE_CODE)\\?\"?\s*[:=]\s*)"
+    r"(\\?\"[^\"\\]*\\?\"|'[^']*'|[^\s,;}]+)"
+)
+
+
+def shorten_home_in_text(text: str) -> str:
+    """Replace the home directory prefix with ~ in logged text."""
+    try:
+        home = str(Path.home())
+    except (OSError, RuntimeError):
+        return text
+    candidates = {home}
+    with contextlib.suppress(OSError):
+        candidates.add(str(Path.home().resolve(strict=False)))
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if candidate and candidate not in {"/", "\\"}:
+            text = text.replace(candidate, "~")
+    return text
+
+
+def redact_diagnostic_text(text: str, secrets_to_mask: Iterable[str] = ()) -> str:
+    """Strip credentials and the home prefix from text destined for a local log."""
+    redacted = str(text)
+    for secret in secrets_to_mask:
+        if isinstance(secret, str) and len(secret) >= 8:
+            redacted = redacted.replace(secret, "[redacted]")
+    redacted = shorten_home_in_text(redacted)
+    redacted = DIAGNOSTIC_HEX_TOKEN_PATTERN.sub("[redacted]", redacted)
+    redacted = DIAGNOSTIC_BEARER_PATTERN.sub("Bearer [redacted]", redacted)
+    redacted = DIAGNOSTIC_FIELD_PATTERN.sub(lambda match: f"{match.group(1)}[redacted]", redacted)
+    return redacted
+
+
+def bounded_diagnostic_text(text: Any, limit: int = DIAGNOSTIC_DETAIL_LIMIT) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return "…" + value[-limit:]
+
+
+def append_diagnostic_log(data_dir: Path, name: str, record: dict[str, Any]) -> Path | None:
+    """Append one redacted JSON line to a private, size-bounded local log.
+
+    The log never receives tokens, invite codes, prompt text, or transcript
+    content: every line is passed through redact_diagnostic_text and callers
+    only hand over bounded status strings. Failure to log never affects the
+    caller.
+    """
+    try:
+        log_dir = data_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(log_dir, 0o700)
+        path = log_dir / name
+        safe_record = {
+            key: redact_diagnostic_text(value) if isinstance(value, str) else value
+            for key, value in record.items()
+        }
+        line = json.dumps(
+            {
+                "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                **safe_record,
+            },
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+        )
+        encoded = (redact_diagnostic_text(line) + "\n").encode("utf-8")
+        existing = b""
+        if path.exists():
+            existing = path.read_bytes()
+        data = existing + encoded
+        if len(data) > DIAGNOSTIC_LOG_MAX_BYTES:
+            data = data[-DIAGNOSTIC_LOG_MAX_BYTES:]
+            newline = data.find(b"\n")
+            if 0 <= newline < len(data) - 1:
+                data = data[newline + 1 :]
+        atomic_write_bytes_private(path, data)
+        return path
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def atomic_write_bytes_private(path: Path, data: bytes) -> None:
+    handle = tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(data)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+HOOK_REVIEW_INSTRUCTION = (
+    "Codex has not trusted the current builder-pulse hooks yet. Start Codex inside "
+    "the enrolled project folder, then run /hooks, select the builder-pulse hooks, "
+    "and trust them. Telemetry starts as soon as they are trusted."
+)
+
+
 def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
-    """Reduce Codex's official hooks/list response to a safe readiness result."""
+    """Reduce Codex's official hooks/list response to a safe readiness result.
+
+    Every not-ready result carries a bounded ``detail`` string that names the
+    exact local condition so a failed activation can be diagnosed from the
+    terminal or the local log without exposing prompts or credentials.
+    """
     if not isinstance(response, dict):
-        return {"ready": False, "hookStatus": "invalid_response"}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "hooks/list returned no JSON object",
+        }
+    if "error" in response and not isinstance(response.get("result"), dict):
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "hooks/list error: "
+            + bounded_diagnostic_text(json.dumps(response.get("error"), default=str)),
+        }
     result = response.get("result")
     data = result.get("data") if isinstance(result, dict) else None
     if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-        return {"ready": False, "hookStatus": "invalid_response"}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "hooks/list returned an unexpected result shape",
+        }
 
     entry = data[0]
-    if entry.get("errors"):
-        return {"ready": False, "hookStatus": "discovery_error"}
+    errors = entry.get("errors")
+    if errors:
+        messages = []
+        for error in errors if isinstance(errors, list) else [errors]:
+            if isinstance(error, dict):
+                messages.append(str(error.get("message") or error.get("error") or error))
+            else:
+                messages.append(str(error))
+        return {
+            "ready": False,
+            "hookStatus": "discovery_error",
+            "detail": "Codex reported hook discovery errors for this folder: "
+            + bounded_diagnostic_text("; ".join(messages)),
+        }
     hooks = entry.get("hooks")
     if not isinstance(hooks, list):
-        return {"ready": False, "hookStatus": "invalid_response"}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "hooks/list entry has no hook list",
+        }
     plugin_hooks = [
         hook
         for hook in hooks
@@ -3052,7 +3198,24 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
         and hook.get("pluginId") == "builder-pulse@growthx-builder-tools"
     ]
     if not plugin_hooks:
-        return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
+        plugin_ids = sorted(
+            {
+                str(hook.get("pluginId"))
+                for hook in hooks
+                if isinstance(hook, dict) and hook.get("pluginId")
+            }
+        )
+        return {
+            "ready": False,
+            "hookStatus": "not_loaded",
+            "hookCount": 0,
+            "detail": bounded_diagnostic_text(
+                "Codex lists no builder-pulse@growthx-builder-tools hooks for this "
+                f"folder; hooks seen: {len(hooks)}; plugins seen: "
+                f"{', '.join(plugin_ids) or 'none'}. Check `codex plugin list` shows "
+                "builder-pulse installed and enabled."
+            ),
+        }
 
     source_path = (PLUGIN_ROOT / "hooks" / "hooks.json").resolve(strict=False)
     discovered_event_counts = Counter(
@@ -3067,16 +3230,29 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
         len(plugin_hooks) != len(EXPECTED_PLUGIN_HOOK_EVENTS)
         or discovered_event_counts != expected_event_counts
     ):
+        seen = ", ".join(
+            f"{name}x{count}" if count != 1 else str(name)
+            for name, count in sorted(discovered_event_counts.items(), key=str)
+        )
         return {
             "ready": False,
             "hookStatus": "incomplete",
             "hookCount": len(plugin_hooks),
+            "detail": bounded_diagnostic_text(
+                f"expected exactly {len(EXPECTED_PLUGIN_HOOK_EVENTS)} builder-pulse "
+                f"hooks ({', '.join(sorted(EXPECTED_PLUGIN_HOOK_EVENTS))}); "
+                f"Codex lists {len(plugin_hooks)}: {seen or 'none'}"
+            ),
         }
+    seen_paths: list[str] = []
     try:
-        current_plugin = all(
-            Path(str(hook.get("sourcePath"))).resolve(strict=False) == source_path
-            for hook in plugin_hooks
-        )
+        current_plugin = True
+        for hook in plugin_hooks:
+            resolved = Path(str(hook.get("sourcePath"))).resolve(strict=False)
+            if str(resolved) not in seen_paths:
+                seen_paths.append(str(resolved))
+            if resolved != source_path:
+                current_plugin = False
     except (OSError, ValueError):
         current_plugin = False
     if not current_plugin:
@@ -3084,12 +3260,21 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
             "ready": False,
             "hookStatus": "stale_plugin",
             "hookCount": len(plugin_hooks),
+            "detail": bounded_diagnostic_text(
+                f"Codex loads builder-pulse hooks from {', '.join(seen_paths) or 'an unknown path'} "
+                f"but this runtime is {source_path}; exit every Codex session and "
+                "rerun activate"
+            ),
         }
     if not all(hook.get("enabled") is True for hook in plugin_hooks):
         return {
             "ready": False,
             "hookStatus": "disabled",
             "hookCount": len(plugin_hooks),
+            "detail": (
+                "one or more builder-pulse hooks are disabled in Codex; run /hooks "
+                "in Codex and enable them"
+            ),
         }
     trust_statuses = {hook.get("trustStatus") for hook in plugin_hooks}
     if not trust_statuses.issubset({"trusted", "managed"}):
@@ -3098,6 +3283,7 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
             "ready": False,
             "hookStatus": status,
             "hookCount": len(plugin_hooks),
+            "detail": HOOK_REVIEW_INSTRUCTION,
         }
     return {
         "ready": True,
@@ -3106,34 +3292,118 @@ def evaluate_builder_pulse_hooks(response: Any) -> dict[str, Any]:
     }
 
 
+def codex_version_text(codex: str) -> str:
+    try:
+        completed = subprocess.run(
+            [codex, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return bounded_diagnostic_text(completed.stdout or completed.stderr, 80) or "unknown"
+
+
 def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, Any]:
-    """Call the local Codex app-server hooks/list API without changing config."""
+    """Call the local Codex app-server hooks/list API without changing config.
+
+    Every failure is reported deterministically: when the app-server process
+    has exited, the result names its exit code; only a process that is still
+    running is reported as not answering within the timeout.
+    """
     codex = shutil.which("codex")
     if not codex:
-        return {"ready": False, "hookStatus": "codex_not_found"}
+        return {
+            "ready": False,
+            "hookStatus": "codex_not_found",
+            "detail": "the codex command is not on PATH for this process",
+        }
+
+    stderr_tail: list[str] = []
+    version_text = codex_version_text(codex)
 
     try:
         process = subprocess.Popen(
             [codex, "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-    except OSError:
-        return {"ready": False, "hookStatus": "app_server_unavailable"}
+    except OSError as exc:
+        return {
+            "ready": False,
+            "hookStatus": "app_server_unavailable",
+            "stage": "spawn",
+            "detail": bounded_diagnostic_text(
+                f"codex app-server could not start (codex {version_text}): {exc}", 600
+            ),
+        }
 
     responses: queue.Queue[str | None] = queue.Queue()
 
     def read_stdout() -> None:
         assert process.stdout is not None
-        for line in process.stdout:
-            responses.put(line)
+        try:
+            for line in process.stdout:
+                responses.put(line)
+        except (OSError, ValueError):
+            pass
         responses.put(None)
 
-    reader = threading.Thread(target=read_stdout, daemon=True)
-    reader.start()
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        try:
+            for line in process.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 40:
+                    del stderr_tail[0]
+        except (OSError, ValueError):
+            pass
+
+    stdout_reader = threading.Thread(target=read_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+
+    def unavailable(stage: str, *, eof: bool = False, extra: str = "") -> dict[str, Any]:
+        """Describe the failure from the process state, never from timing."""
+        exit_code: int | None = None
+        if eof:
+            # stdout reached EOF, which means the process closed it: almost
+            # always because it exited. Wait briefly so the exit code and the
+            # complete stderr tail are available instead of racing the reaper.
+            try:
+                exit_code = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                exit_code = None
+        else:
+            exit_code = process.poll()
+        if exit_code is not None:
+            stderr_reader.join(timeout=1)
+            detail = (
+                f"codex app-server exited with {exit_code} during {stage} "
+                f"(codex {version_text})"
+            )
+        else:
+            detail = (
+                f"codex app-server did not answer during {stage} within "
+                f"{timeout_seconds:g}s (codex {version_text})"
+            )
+        if extra:
+            detail += f": {extra}"
+        tail = redact_diagnostic_text("".join(stderr_tail))
+        if tail.strip():
+            detail += "; app-server stderr: " + bounded_diagnostic_text(tail)
+        return {
+            "ready": False,
+            "hookStatus": "app_server_unavailable",
+            "stage": stage,
+            "detail": bounded_diagnostic_text(detail, 600),
+        }
 
     def send(message: dict[str, Any]) -> bool:
         if process.stdin is None:
@@ -3145,27 +3415,28 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
         except (BrokenPipeError, OSError):
             return False
 
-    def receive(response_id: int) -> dict[str, Any] | None:
+    def receive(response_id: int) -> tuple[dict[str, Any] | None, bool]:
+        """Return (response, eof). eof=True means stdout closed without it."""
         deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
         while True:
             remaining = deadline - dt.datetime.now(dt.timezone.utc).timestamp()
             if remaining <= 0:
-                return None
+                return None, False
             try:
                 line = responses.get(timeout=remaining)
             except queue.Empty:
-                return None
+                return None, False
             if line is None:
-                return None
+                return None, True
             try:
                 response = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(response, dict) and response.get("id") == response_id:
-                return response
+                return response, False
 
     try:
-        initialized = send(
+        if not send(
             {
                 "method": "initialize",
                 "id": 1,
@@ -3178,9 +3449,17 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                     "capabilities": {},
                 },
             }
-        ) and receive(1)
-        if not initialized or "error" in initialized:
-            return {"ready": False, "hookStatus": "app_server_unavailable"}
+        ):
+            return unavailable("initialize", eof=True, extra="stdin closed")
+        initialized, eof = receive(1)
+        if initialized is None:
+            return unavailable("initialize", eof=eof)
+        if "error" in initialized:
+            return unavailable(
+                "initialize",
+                extra="rejected: "
+                + bounded_diagnostic_text(json.dumps(initialized.get("error"), default=str)),
+            )
         if not send({"method": "initialized", "params": {}}) or not send(
             {
                 "method": "hooks/list",
@@ -3188,10 +3467,10 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 "params": {"cwds": [str(cwd.resolve(strict=False))]},
             }
         ):
-            return {"ready": False, "hookStatus": "app_server_unavailable"}
-        response = receive(2)
+            return unavailable("hooks_list", eof=True, extra="stdin closed")
+        response, eof = receive(2)
         if response is None:
-            return {"ready": False, "hookStatus": "app_server_unavailable"}
+            return unavailable("hooks_list", eof=eof)
         return evaluate_builder_pulse_hooks(response)
     finally:
         if process.stdin is not None:
@@ -3205,6 +3484,14 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=2)
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
 
 
 EXPECTED_CLAUDE_HOOK_EVENTS = {
@@ -3229,7 +3516,11 @@ def expected_claude_plugin_id() -> str:
 def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
     """Reduce Claude's official plugin list to a bounded hook readiness result."""
     if not isinstance(response, list):
-        return {"ready": False, "hookStatus": "invalid_response"}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "claude plugin list --json did not return a list",
+        }
     expected_id = expected_claude_plugin_id()
     matches = [
         entry
@@ -3237,15 +3528,47 @@ def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
         if isinstance(entry, dict) and entry.get("id") == expected_id
     ]
     if len(matches) != 1:
-        return {"ready": False, "hookStatus": "not_loaded", "hookCount": 0}
+        seen = sorted(
+            str(entry.get("id"))
+            for entry in response
+            if isinstance(entry, dict) and entry.get("id")
+        )
+        return {
+            "ready": False,
+            "hookStatus": "not_loaded",
+            "hookCount": 0,
+            "detail": bounded_diagnostic_text(
+                f"expected exactly one Claude Code plugin {expected_id}; "
+                f"found {len(matches)}; installed plugins: {', '.join(seen) or 'none'}"
+            ),
+        }
     entry = matches[0]
     if entry.get("enabled") is not True:
-        return {"ready": False, "hookStatus": "disabled", "hookCount": 0}
+        return {
+            "ready": False,
+            "hookStatus": "disabled",
+            "hookCount": 0,
+            "detail": f"{expected_id} is installed but disabled in Claude Code",
+        }
     if entry.get("scope") != "user" or entry.get("version") != PLUGIN_VERSION:
-        return {"ready": False, "hookStatus": "stale_plugin", "hookCount": 0}
+        return {
+            "ready": False,
+            "hookStatus": "stale_plugin",
+            "hookCount": 0,
+            "detail": (
+                f"{expected_id} reports scope={entry.get('scope')!r} "
+                f"version={entry.get('version')!r}; expected scope='user' "
+                f"version={PLUGIN_VERSION!r}"
+            ),
+        }
     install_path = entry.get("installPath")
     if not isinstance(install_path, str) or not install_path:
-        return {"ready": False, "hookStatus": "invalid_response", "hookCount": 0}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "hookCount": 0,
+            "detail": f"Claude Code did not report an installPath for {expected_id}",
+        }
     try:
         plugin_root = Path(install_path).resolve(strict=True)
         manifest_path = plugin_root / "hooks" / "hooks.json"
@@ -3253,10 +3576,24 @@ def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
             raise OSError
         manifest = read_json(manifest_path, {})
     except (OSError, ValueError):
-        return {"ready": False, "hookStatus": "stale_plugin", "hookCount": 0}
+        return {
+            "ready": False,
+            "hookStatus": "stale_plugin",
+            "hookCount": 0,
+            "detail": f"the installed Claude Code package at {install_path} has no readable hooks/hooks.json",
+        }
     hooks = manifest.get("hooks") if isinstance(manifest, dict) else None
+    incomplete = {
+        "ready": False,
+        "hookStatus": "incomplete",
+        "hookCount": 0,
+        "detail": (
+            f"the installed Claude Code hook manifest at {install_path} does not "
+            "declare the exact expected builder-pulse hook set"
+        ),
+    }
     if not isinstance(hooks, dict) or set(hooks) != EXPECTED_CLAUDE_HOOK_EVENTS:
-        return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+        return incomplete
     launcher_name = (
         "builder_pulse_claude.cmd"
         if os.name == "nt"
@@ -3265,20 +3602,20 @@ def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
     for event_name in EXPECTED_CLAUDE_HOOK_EVENTS:
         groups = hooks.get(event_name)
         if not isinstance(groups, list) or len(groups) != 1:
-            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+            return incomplete
         group = groups[0]
         commands = group.get("hooks") if isinstance(group, dict) else None
         if not isinstance(commands, list) or len(commands) != 1:
-            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+            return incomplete
         command = commands[0]
         if (
             not isinstance(command, dict)
             or command.get("type") != "command"
             or launcher_name not in str(command.get("command") or "")
         ):
-            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+            return incomplete
         if os.name == "nt" and command.get("shell") != "powershell":
-            return {"ready": False, "hookStatus": "incomplete", "hookCount": 0}
+            return incomplete
     return {
         "ready": True,
         "hookStatus": "installed",
@@ -3290,7 +3627,11 @@ def evaluate_claude_plugins(response: Any) -> dict[str, Any]:
 def inspect_claude_hooks(timeout_seconds: float = 10.0) -> dict[str, Any]:
     claude = shutil.which("claude")
     if not claude:
-        return {"ready": False, "hookStatus": "claude_not_found"}
+        return {
+            "ready": False,
+            "hookStatus": "claude_not_found",
+            "detail": "the claude command is not on PATH for this process",
+        }
     try:
         completed = subprocess.run(
             [claude, "plugin", "list", "--json"],
@@ -3299,15 +3640,52 @@ def inspect_claude_hooks(timeout_seconds: float = 10.0) -> dict[str, Any]:
             timeout=timeout_seconds,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {"ready": False, "hookStatus": "plugin_list_unavailable"}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ready": False,
+            "hookStatus": "plugin_list_unavailable",
+            "detail": bounded_diagnostic_text(
+                f"claude plugin list --json could not run: {exc}"
+            ),
+        }
     if completed.returncode != 0:
-        return {"ready": False, "hookStatus": "plugin_list_unavailable"}
+        return {
+            "ready": False,
+            "hookStatus": "plugin_list_unavailable",
+            "detail": bounded_diagnostic_text(
+                f"claude plugin list --json exited {completed.returncode}: "
+                + redact_diagnostic_text(completed.stderr or completed.stdout)
+            ),
+        }
     try:
         response = json.loads(completed.stdout)
     except json.JSONDecodeError:
-        return {"ready": False, "hookStatus": "invalid_response"}
+        return {
+            "ready": False,
+            "hookStatus": "invalid_response",
+            "detail": "claude plugin list --json returned invalid JSON",
+        }
     return evaluate_claude_plugins(response)
+
+
+def interpreter_version_text(executable: str) -> str | None:
+    """Return the dotted version of a Python executable, or None if it cannot run."""
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "-c",
+                "import sys; print('%d.%d.%d' % sys.version_info[:3])",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version = completed.stdout.strip()
+    return version if completed.returncode == 0 and version else None
 
 
 def verify_hook_launcher(
@@ -3315,46 +3693,77 @@ def verify_hook_launcher(
     agent_platform: str = DEFAULT_AGENT_PLATFORM,
     plugin_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Execute the exact platform launcher the selected agent will invoke."""
+    """Execute the exact command the selected agent's hooks will invoke.
+
+    Codex hooks run ``python3 "${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py" hook``
+    (``py -3`` on Windows). Claude Code hooks run the packaged launcher script.
+    """
     launcher_root = plugin_root or PLUGIN_ROOT
     environment = dict(os.environ)
     environment["BUILDER_PULSE_DATA_DIR"] = str(data_dir)
     environment["BUILDER_PULSE_AGENT_PLATFORM"] = agent_platform
     environment["BUILDER_PULSE_PLUGIN_VERSION"] = PLUGIN_VERSION
-    if os.name == "nt":
-        launcher_name = (
-            "builder_pulse_claude.cmd"
-            if agent_platform == "claude_code"
-            else "builder_pulse.cmd"
-        )
-        if agent_platform == "claude_code":
-            environment["CLAUDE_PLUGIN_ROOT"] = str(launcher_root)
+    environment["CLAUDE_PLUGIN_ROOT"] = str(launcher_root)
+    environment["PLUGIN_ROOT"] = str(launcher_root)
+    command: list[str] | str
+    if agent_platform == "claude_code":
+        if os.name == "nt":
             powershell = (
                 shutil.which("pwsh")
                 or shutil.which("powershell")
                 or shutil.which("powershell.exe")
             )
             if not powershell:
-                return {"ready": False, "hookStatus": "launcher_unavailable"}
+                return {
+                    "ready": False,
+                    "hookStatus": "launcher_unavailable",
+                    "detail": "neither pwsh nor powershell is available to run the Claude Code hook",
+                }
             command = [
                 powershell,
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                f'& "{launcher_root}\\scripts\\{launcher_name}"',
+                f'& "{launcher_root}\\scripts\\builder_pulse_claude.cmd"',
             ]
         else:
-            environment["PLUGIN_ROOT"] = str(launcher_root)
-            # Expand PLUGIN_ROOT exactly once. CALL reparses the expanded path and
-            # corrupts legal roots containing paired percent tokens such as %TEAM%.
-            command = f'cmd /d /s /c ""%PLUGIN_ROOT%\\scripts\\{launcher_name}""'
-    else:
-        launcher_name = (
-            "builder_pulse_claude.sh"
-            if agent_platform == "claude_code"
-            else "builder_pulse.sh"
+            command = ["sh", str(launcher_root / "scripts" / "builder_pulse_claude.sh")]
+    elif os.name == "nt":
+        # Expand CLAUDE_PLUGIN_ROOT exactly once, the way Codex's commandWindows
+        # runs it. CALL would reparse the expanded path and corrupt legal roots
+        # containing paired percent tokens such as %TEAM%.
+        command = (
+            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"'
         )
-        command = ["sh", str(launcher_root / "scripts" / launcher_name)]
+    else:
+        interpreter = shutil.which("python3")
+        if not interpreter:
+            return {
+                "ready": False,
+                "hookStatus": "launcher_unavailable",
+                "detail": (
+                    "python3 is not on PATH; Codex runs the Builder Pulse hook as "
+                    "`python3 .../scripts/builder_pulse.py hook`"
+                ),
+            }
+        version = interpreter_version_text(interpreter)
+        if version is None:
+            return {
+                "ready": False,
+                "hookStatus": "launcher_unavailable",
+                "detail": f"{interpreter} could not report its version",
+            }
+        parts = tuple(int(part) for part in version.split("."))
+        if parts < (3, 11):
+            return {
+                "ready": False,
+                "hookStatus": "launcher_unavailable",
+                "detail": (
+                    f"python3 on PATH is {version} at {interpreter}; Builder Pulse "
+                    "hooks require Python 3.11 or newer"
+                ),
+            }
+        command = [interpreter, str(launcher_root / "scripts" / "builder_pulse.py"), "hook"]
     try:
         completed = subprocess.run(
             command,
@@ -3365,16 +3774,35 @@ def verify_hook_launcher(
             timeout=5,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {"ready": False, "hookStatus": "launcher_unavailable"}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ready": False,
+            "hookStatus": "launcher_unavailable",
+            "detail": bounded_diagnostic_text(f"the hook command could not run: {exc}"),
+        }
     if completed.returncode != 0:
-        return {"ready": False, "hookStatus": "launcher_unavailable"}
+        return {
+            "ready": False,
+            "hookStatus": "launcher_unavailable",
+            "detail": bounded_diagnostic_text(
+                f"the hook command exited {completed.returncode}: "
+                + redact_diagnostic_text(completed.stderr or completed.stdout)
+            ),
+        }
     try:
         output = json.loads(completed.stdout.strip())
     except json.JSONDecodeError:
-        return {"ready": False, "hookStatus": "launcher_invalid_output"}
+        return {
+            "ready": False,
+            "hookStatus": "launcher_invalid_output",
+            "detail": "the hook command did not print a JSON object",
+        }
     if output != {}:
-        return {"ready": False, "hookStatus": "launcher_invalid_output"}
+        return {
+            "ready": False,
+            "hookStatus": "launcher_invalid_output",
+            "detail": "the hook command printed something other than {}",
+        }
     return {"ready": True, "hookStatus": "launcher_verified"}
 
 
@@ -3387,6 +3815,23 @@ def command_activate(
     identity = claimed_identity(data_dir)
     token = identity.get("installationToken")
     endpoint = identity.get("claimedEndpoint")
+
+    def log(outcome: str, **fields: Any) -> None:
+        append_diagnostic_log(
+            data_dir,
+            "activate.log",
+            {
+                "command": "activate",
+                "agentPlatform": agent_platform,
+                "pluginVersion": PLUGIN_VERSION,
+                "outcome": outcome,
+                **fields,
+            },
+        )
+
+    def emit(payload: dict[str, Any]) -> None:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
     if (
         not isinstance(token, str)
         or not token
@@ -3394,24 +3839,22 @@ def command_activate(
         or not endpoint
     ):
         print("Activation failed: this installation has not been claimed.", file=sys.stderr)
+        log("unclaimed")
         return 2
 
     config = load_config(data_dir)
     if config.get("enabled") is not True:
-        print(
-            json.dumps(
-                {
-                    "connected": False,
-                    "activationReady": False,
-                    "ready": False,
-                    "reviewRequired": False,
-                    "hookStatus": "disabled",
-                    "agentPlatform": agent_platform,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        payload = {
+            "connected": False,
+            "activationReady": False,
+            "ready": False,
+            "reviewRequired": False,
+            "hookStatus": "disabled",
+            "detail": "Builder Pulse is paused locally (config enabled=false)",
+            "agentPlatform": agent_platform,
+        }
+        emit(payload)
+        log("local_disabled", hookStatus="disabled")
         return 3
 
     hook_result = (
@@ -3425,19 +3868,19 @@ def command_activate(
             for key, value in hook_result.items()
             if not key.startswith("_")
         }
-        print(
-            json.dumps(
-                {
-                    "connected": False,
-                    "activationReady": False,
-                    "reviewRequired": hook_result.get("hookStatus")
-                    in {"modified", "review_required"},
-                    "agentPlatform": agent_platform,
-                    **public_hook_result,
-                },
-                indent=2,
-                sort_keys=True,
-            )
+        payload = {
+            "connected": False,
+            "activationReady": False,
+            "reviewRequired": hook_result.get("hookStatus")
+            in {"modified", "review_required"},
+            "agentPlatform": agent_platform,
+            **public_hook_result,
+        }
+        emit(payload)
+        log(
+            "hooks_not_ready",
+            hookStatus=hook_result.get("hookStatus"),
+            detail=hook_result.get("detail"),
         )
         return 3
 
@@ -3453,18 +3896,18 @@ def command_activate(
         plugin_root=launcher_root,
     )
     if not launcher_result.get("ready"):
-        print(
-            json.dumps(
-                {
-                    "connected": False,
-                    "activationReady": False,
-                    "reviewRequired": False,
-                    "agentPlatform": agent_platform,
-                    **launcher_result,
-                },
-                indent=2,
-                sort_keys=True,
-            )
+        payload = {
+            "connected": False,
+            "activationReady": False,
+            "reviewRequired": False,
+            "agentPlatform": agent_platform,
+            **launcher_result,
+        }
+        emit(payload)
+        log(
+            "launcher_not_ready",
+            hookStatus=launcher_result.get("hookStatus"),
+            detail=launcher_result.get("detail"),
         )
         return 3
 
@@ -3481,7 +3924,21 @@ def command_activate(
         expect_json=True,
     )
     if not ok or not isinstance(response, dict) or response.get("accepted") is not True:
-        print(f"Activation failed: {result}.", file=sys.stderr)
+        server_error = (
+            response.get("error") if isinstance(response, dict) else None
+        )
+        print(
+            f"Activation failed: {result}"
+            + (f" ({server_error})" if isinstance(server_error, str) else "")
+            + f". Endpoint: {sanitized_endpoint(endpoint)}.",
+            file=sys.stderr,
+        )
+        log(
+            "server_rejected",
+            result=result,
+            serverError=server_error if isinstance(server_error, str) else None,
+            endpoint=sanitized_endpoint(endpoint),
+        )
         return 1
 
     telemetry_received = response.get("telemetryReceived") is True
@@ -3499,39 +3956,41 @@ def command_activate(
         and last_signal_plugin_version == PLUGIN_VERSION
         and last_signal_agent_platform == agent_platform
     )
-    print(
-        json.dumps(
-            {
-                # A successful activation proves identity and hook trust. Only
-                # a same-version server receipt after the previous activation
-                # proves this repaired hook path delivered telemetry.
-                "connected": current_version_receipt,
-                "activationReady": True,
-                "hooksVerified": True,
-                "hooksTrusted": agent_platform == "codex",
-                "pluginInstalled": agent_platform == "claude_code",
-                "serverVerified": True,
-                "telemetryReceived": telemetry_received,
-                "telemetryReceivedSincePreviousActivation": (
-                    telemetry_received_since_activation
-                ),
-                "lastSignalAt": last_signal_at
-                if isinstance(last_signal_at, int)
-                else None,
-                "lastSignalPluginVersion": last_signal_plugin_version
-                if isinstance(last_signal_plugin_version, str)
-                else None,
-                "lastSignalAgentPlatform": last_signal_agent_platform
-                if last_signal_agent_platform in AGENT_PLATFORMS
-                else None,
-                "agentPlatform": agent_platform,
-                "hookStatus": hook_result["hookStatus"],
-                "hookCount": hook_result["hookCount"],
-                "installationId": identity.get("installationId"),
-            },
-            indent=2,
-            sort_keys=True,
-        )
+    payload = {
+        # A successful activation proves identity and hook trust. Only
+        # a same-version server receipt after the previous activation
+        # proves this repaired hook path delivered telemetry.
+        "connected": current_version_receipt,
+        "activationReady": True,
+        "hooksVerified": True,
+        "hooksTrusted": agent_platform == "codex",
+        "pluginInstalled": agent_platform == "claude_code",
+        "serverVerified": True,
+        "telemetryReceived": telemetry_received,
+        "telemetryReceivedSincePreviousActivation": (
+            telemetry_received_since_activation
+        ),
+        "lastSignalAt": last_signal_at
+        if isinstance(last_signal_at, int)
+        else None,
+        "lastSignalPluginVersion": last_signal_plugin_version
+        if isinstance(last_signal_plugin_version, str)
+        else None,
+        "lastSignalAgentPlatform": last_signal_agent_platform
+        if last_signal_agent_platform in AGENT_PLATFORMS
+        else None,
+        "agentPlatform": agent_platform,
+        "hookStatus": hook_result["hookStatus"],
+        "hookCount": hook_result["hookCount"],
+        "installationId": identity.get("installationId"),
+    }
+    emit(payload)
+    log(
+        "verified",
+        hookStatus=hook_result["hookStatus"],
+        connected=current_version_receipt,
+        telemetryReceivedSincePreviousActivation=telemetry_received_since_activation,
+        lastSignalPluginVersion=payload["lastSignalPluginVersion"],
     )
     return 0
 

@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path, PureWindowsPath
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib import error as urlerror
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +53,7 @@ def claude_only_which(command: str) -> str | None:
     return f"/usr/bin/{command}" if command == "claude" else None
 
 
-class SetupBuilderPulseTests(unittest.TestCase):
+class SetupCaseBase(unittest.TestCase):
     def setUp(self) -> None:
         self.test_home = tempfile.TemporaryDirectory()
         root = Path(self.test_home.name)
@@ -85,8 +87,23 @@ class SetupBuilderPulseTests(unittest.TestCase):
         )
         self.preflight_mock = self.preflight.start()
         self.addCleanup(self.preflight.stop)
+        # A plain project folder outside every refused location. Temporary
+        # roots are refused by design, so the shared temporary-root rule is
+        # disabled here and exercised on its own in EnrollmentRefusalTests.
+        self.project_root = root / "project"
+        self.project_root.mkdir()
+        self.temporary_roots = mock.patch.object(
+            setup_builder_pulse, "temporary_roots", return_value=()
+        )
+        self.temporary_roots.start()
+        self.addCleanup(self.temporary_roots.stop)
+        setup_builder_pulse.SETUP_LOG.path = None
+        setup_builder_pulse.SETUP_LOG.secrets = []
+        setup_builder_pulse.SETUP_LOG._buffer = []
         self.addCleanup(self.test_home.cleanup)
 
+
+class SetupBuilderPulseTests(SetupCaseBase):
     def test_standalone_installer_uses_the_canonical_privacy_disclosure(self) -> None:
         self.assertEqual(
             setup_builder_pulse.SETUP_DISCLOSURE,
@@ -652,7 +669,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 paused = setup_builder_pulse.pause_existing_capture(None)
 
             self.assertEqual(paused.data_dir, data_dir)
-            server_pause.assert_called_once_with(identity, "0.5.1")
+            server_pause.assert_called_once_with(identity, "0.5.2")
             self.assertFalse(
                 json.loads((data_dir / "config.json").read_text())["enabled"]
             )
@@ -741,7 +758,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 invite_code,
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
@@ -764,7 +781,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "installationToken": "token-1",
                 "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
             },
-            "0.5.1",
+            "0.5.2",
         )
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
@@ -776,7 +793,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 "work",
                 "enroll",
                 "--root",
-                str(ROOT.resolve()),
+                str(self.project_root.resolve()),
                 "--project",
                 "Builder Pulse",
             ],
@@ -878,7 +895,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
                 reuse_existing_claim=True,
             )
@@ -896,7 +913,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
                 reuse_existing_claim=True,
             )
@@ -924,7 +941,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
                 reuse_existing_claim=True,
             )
@@ -1119,7 +1136,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     setup_builder_pulse.setup(
                         "InviteCode_1234567890",
                         setup_builder_pulse.DEFAULT_ENDPOINT,
-                        ROOT,
+                        self.project_root,
                         "Builder Pulse",
                     )
 
@@ -1143,7 +1160,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         "installationToken": "token-1",
                         "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
                     },
-                    "0.5.1",
+                    "0.5.2",
                 )
                 local_quarantine.assert_called_once_with(
                     ROOT,
@@ -1255,12 +1272,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     setup_builder_pulse.setup(
                         "InviteCode_1234567890",
                         setup_builder_pulse.DEFAULT_ENDPOINT,
-                        ROOT,
+                        self.project_root,
                         "Builder Pulse",
                     )
 
-                resume.assert_called_once_with(identity, "0.5.1")
-                repause.assert_called_once_with(identity, "0.5.1")
+                resume.assert_called_once_with(identity, "0.5.2")
+                repause.assert_called_once_with(identity, "0.5.2")
                 local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_keyboard_interrupt_after_resume_still_repauses_and_quarantines(self) -> None:
@@ -1319,12 +1336,12 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
-        resume.assert_called_once_with(identity, "0.5.1")
-        repause.assert_called_once_with(identity, "0.5.1")
+        resume.assert_called_once_with(identity, "0.5.2")
+        repause.assert_called_once_with(identity, "0.5.2")
         local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_activation_normalizes_a_process_start_failure(self) -> None:
@@ -1398,7 +1415,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
@@ -1526,7 +1543,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
-                    ROOT,
+                    self.project_root,
                     "Builder Pulse",
                 )
 
@@ -1590,7 +1607,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         *previous_claude,
                         {
                             "id": setup_builder_pulse.target_claude_plugin_id(),
-                            "version": "0.5.1",
+                            "version": "0.5.2",
                             "enabled": True,
                         },
                     ],
@@ -1636,7 +1653,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
@@ -1739,7 +1756,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                         previous_claude,
                         [
                             *previous_claude,
-                            {"id": target, "version": "0.5.1", "enabled": True},
+                            {"id": target, "version": "0.5.2", "enabled": True},
                         ],
                     ],
                 )
@@ -1830,11 +1847,11 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
-        repause.assert_called_once_with(identity, "0.5.1")
+        repause.assert_called_once_with(identity, "0.5.2")
         restore_codex.assert_called_once_with(rollback)
         remove_claude.assert_called_once_with(target)
         restore_capture.assert_called_once_with(paused)
@@ -1867,7 +1884,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     previous_claude,
                     [
                         *previous_claude,
-                        {"id": target, "version": "0.5.1", "enabled": True},
+                        {"id": target, "version": "0.5.2", "enabled": True},
                     ],
                 ],
             ),
@@ -1890,7 +1907,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
@@ -1945,7 +1962,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
 
@@ -2085,7 +2102,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                     setup_builder_pulse.setup(
                         "InviteCode_1234567890",
                         setup_builder_pulse.DEFAULT_ENDPOINT,
-                        ROOT,
+                        self.project_root,
                         "Builder Pulse",
                     )
 
@@ -2099,13 +2116,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
-                    ROOT,
+                    self.project_root,
                     "Builder Pulse",
                     reuse_existing_claim=True,
                 )
 
             self.assertEqual(server_pause.call_count, 2)
-            server_resume.assert_called_once_with(identity, "0.5.1")
+            server_resume.assert_called_once_with(identity, "0.5.2")
             self.assertFalse((data_dir / "setup-paused-identity.json").exists())
             self.assertEqual(
                 json.loads((data_dir / "identity.json").read_text()),
@@ -2405,7 +2422,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
         after = [
             {
                 "id": target,
-                "version": "0.5.1",
+                "version": "0.5.2",
                 "enabled": True,
                 "scope": "user",
                 "installPath": str(installed_root),
@@ -2664,7 +2681,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             runtime_root = (
                 setup_builder_pulse.canonical_plugin_data_dir()
                 / "runtime"
-                / "0.5.1"
+                / "0.5.2"
             )
             self.assertEqual(
                 installed_cli,
@@ -2678,7 +2695,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             runtime_module = importlib.util.module_from_spec(runtime_spec)
             runtime_spec.loader.exec_module(runtime_module)
             self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.1")
+            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.2")
             self.assertTrue(runtime_module.DEFAULTS_PATH.is_file())
             self.assertTrue(runtime_module.MANIFEST_PATH.is_file())
 
@@ -2755,7 +2772,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 runtime_root = (
                     setup_builder_pulse.canonical_plugin_data_dir()
                     / "runtime"
-                    / "0.5.1"
+                    / "0.5.2"
                 )
                 self.assertEqual(cli, runtime_root / "scripts" / "builder_pulse.py")
                 runtime_spec = importlib.util.spec_from_file_location(
@@ -2766,7 +2783,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 runtime_module = importlib.util.module_from_spec(runtime_spec)
                 runtime_spec.loader.exec_module(runtime_module)
                 self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.1")
+                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.2")
                 activated.append(cli)
                 return {
                     "activationReady": True,
@@ -2842,7 +2859,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
-                    ROOT,
+                    self.project_root,
                     "Builder Pulse",
                 )
 
@@ -2855,7 +2872,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 previous_claude,
                 setup_builder_pulse.target_claude_plugin_id(),
             )
-            resume.assert_called_once_with(identity, "0.5.1")
+            resume.assert_called_once_with(identity, "0.5.2")
             self.assertEqual(len(activated), 1)
             self.assertTrue(any("claim" in arguments for arguments in commands))
             self.assertTrue(any("enroll" in arguments for arguments in commands))
@@ -2982,13 +2999,13 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
-                    ROOT,
+                    self.project_root,
                     "Builder Pulse",
                 )
 
             self.assertEqual(
                 installed_runtime,
-                [shared / "runtime" / "0.5.1" / "scripts" / "builder_pulse.py"],
+                [shared / "runtime" / "0.5.2" / "scripts" / "builder_pulse.py"],
             )
             self.assertEqual(
                 json.loads((shared / "identity.json").read_text(encoding="utf-8")),
@@ -3072,7 +3089,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
                 setup_builder_pulse.setup(
                     "InviteCode_1234567890",
                     setup_builder_pulse.DEFAULT_ENDPOINT,
-                    ROOT,
+                    self.project_root,
                     "Builder Pulse",
                 )
 
@@ -3237,7 +3254,7 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "Builder Pulse",
             )
         pause.assert_not_called()
@@ -3282,9 +3299,743 @@ class SetupBuilderPulseTests(unittest.TestCase):
             setup_builder_pulse.setup(
                 "InviteCode_1234567890",
                 setup_builder_pulse.DEFAULT_ENDPOINT,
-                ROOT,
+                self.project_root,
                 "",
             )
+
+
+class SetupLogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data_dir = Path(self.temp.name) / ".builder-pulse"
+        self.data_dir.mkdir()
+
+    def test_log_redacts_tokens_bearers_invite_codes_and_home(self) -> None:
+        log = setup_builder_pulse.SetupLog()
+        invite = "InviteCode_1234567890"
+        token = "a" * 64
+        log.mask(invite)
+        path = log.open(self.data_dir)
+        assert path is not None
+        log.write(
+            "claim finished",
+            stderr=f"code {invite} token {token} Authorization: Bearer abcdefghijkl",
+            body='{"inviteCode": "' + invite + '", "installationToken": "' + token + '"}',
+            env="BUILDER_PULSE_INVITE_CODE=" + invite,
+        )
+        content = path.read_text(encoding="utf-8")
+        self.assertNotIn(invite, content)
+        self.assertNotIn(token, content)
+        self.assertNotIn("abcdefghijkl", content)
+        self.assertIn("[redacted]", content)
+        self.assertIn("claim finished", content)
+
+    def test_log_never_contains_the_home_prefix_or_a_project_root(self) -> None:
+        fake_home = Path("/Users/fakehome")
+        project = "/Users/fakehome/code/my-secret-project"
+        with mock.patch.object(setup_builder_pulse.Path, "home", return_value=fake_home):
+            log = setup_builder_pulse.SetupLog()
+            path = log.open(self.data_dir)
+            assert path is not None
+            shown = setup_builder_pulse.display_arguments(
+                ["python3", "cli.py", "work", "enroll", "--root", project, "--project", "Name"]
+            )
+            log.write("command finished", argv=shown)
+            log.write("codex package installed", cli="/Users/fakehome/.codex/plugins/cache/x")
+        content = path.read_text(encoding="utf-8")
+        self.assertNotIn("/Users/fakehome", content)
+        self.assertNotIn(project, content)
+        self.assertNotIn("code/my-secret-project", content)
+        self.assertIn("…/my-secret-project", content)
+        self.assertIn("~/.codex/plugins/cache/x", content)
+
+    def test_display_arguments_masks_secrets_and_folders(self) -> None:
+        self.assertEqual(
+            setup_builder_pulse.display_arguments(
+                ["cli", "claim", "--code", "secret-code-value", "--root=/x/y/proj", "--project-root", "/a/b"]
+            ),
+            ["cli", "claim", "--code", "[redacted]", "--root=…/proj", "--project-root", "…/b"],
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_log_file_and_directory_are_private(self) -> None:
+        log = setup_builder_pulse.SetupLog()
+        path = log.open(self.data_dir)
+        assert path is not None
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_open_keeps_only_the_newest_ten_logs(self) -> None:
+        logs = self.data_dir / "logs"
+        logs.mkdir()
+        for index in range(12):
+            (logs / f"setup-20260101-0000{index:02d}.log").write_text("old\n")
+        log = setup_builder_pulse.SetupLog()
+        path = log.open(self.data_dir)
+        remaining = sorted(entry.name for entry in logs.glob("setup-*.log"))
+        self.assertEqual(len(remaining), setup_builder_pulse.SETUP_LOG_KEEP)
+        assert path is not None
+        self.assertIn(path.name, remaining)
+        self.assertNotIn("setup-20260101-000000.log", remaining)
+
+    def test_buffered_lines_are_flushed_when_the_log_opens(self) -> None:
+        log = setup_builder_pulse.SetupLog()
+        log.write("before open", step=1)
+        path = log.open(self.data_dir)
+        assert path is not None
+        self.assertIn("before open", path.read_text(encoding="utf-8"))
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_checkout_is_pristine_accepts_only_allowlisted_noise(self) -> None:
+        for porcelain, expected in (
+            ("", True),
+            ("?? .codex-marketplace-install.json\n", True),
+            ("!! scripts/__pycache__/x.pyc\n", True),
+            ("?? .DS_Store\n", True),
+            ("!! scripts/builder_pulse.pyc\n", True),
+            (" M scripts/builder_pulse.py\n", False),
+            ("?? urllib/\n", False),
+            ("!! json.py\n", False),
+            ("?? .codex-marketplace-install.json\n M README.md\n", False),
+            ("D  scripts/setup_builder_pulse.py\n", False),
+        ):
+            with self.subTest(porcelain=porcelain):
+                self.assertIs(setup_builder_pulse.checkout_is_pristine(porcelain), expected)
+
+    def test_verified_git_checkout_tolerates_codex_marketplace_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(
+                setup_builder_pulse,
+                "run_command",
+                side_effect=[
+                    str(root),
+                    setup_builder_pulse.REPOSITORY,
+                    "?? .codex-marketplace-install.json\n?? .DS_Store\n",
+                    "c" * 40,
+                ],
+            ):
+                self.assertEqual(
+                    setup_builder_pulse.verified_git_checkout(root),
+                    (setup_builder_pulse.REPOSITORY, "c" * 40),
+                )
+
+    def test_remote_commit_is_verified_with_a_shallow_git_fetch(self) -> None:
+        commit = "d" * 40
+        calls: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            calls.append(arguments)
+            if arguments[-2:] == ["-t", commit]:
+                return "commit\n"
+            return ""
+
+        with mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command):
+            setup_builder_pulse.verify_remote_commit(setup_builder_pulse.REPOSITORY, commit)
+        fetch = [arguments for arguments in calls if "fetch" in arguments][0]
+        self.assertEqual(fetch[-1], commit)
+        self.assertIn("https://github.com/GrowthX-Club/builder-pulse-plugin.git", fetch)
+        self.assertIn("--depth", fetch)
+        self.assertEqual(sum(1 for arguments in calls if "init" in arguments), 1)
+
+    def test_remote_commit_probe_never_prompts_and_rejects_non_commit_objects(self) -> None:
+        commit = "d" * 40
+        environments: list[dict | None] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del expect_json
+            environments.append(env)
+            if arguments[-2:] == ["-t", commit]:
+                return "tag\n"
+            return ""
+
+        with mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be verified"):
+                setup_builder_pulse.verify_remote_commit(setup_builder_pulse.REPOSITORY, commit)
+        self.assertTrue(environments)
+        for env in environments:
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(env["GIT_ASKPASS"], "echo")
+
+    def test_remote_commit_verification_fails_closed(self) -> None:
+        commit = "d" * 40
+
+        def failing(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            if "fetch" in arguments:
+                raise setup_builder_pulse.SetupError("fatal: remote error: upload-pack: not our ref")
+            return ""
+
+        with mock.patch.object(setup_builder_pulse, "run_command", side_effect=failing):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be verified on GitHub"):
+                setup_builder_pulse.verify_remote_commit(setup_builder_pulse.REPOSITORY, commit)
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be verified"):
+            setup_builder_pulse.verify_remote_commit(setup_builder_pulse.REPOSITORY, "not-a-sha")
+
+    def test_release_verification_reports_a_github_rate_limit(self) -> None:
+        error = urlerror.HTTPError(
+            "https://api.github.com/x",
+            403,
+            "rate limited",
+            http.client.HTTPMessage(),
+            io.BytesIO(b"{}"),
+        )
+        with (
+            mock.patch.object(setup_builder_pulse, "verified_remote_tag_commit", return_value="e" * 40),
+            mock.patch.object(setup_builder_pulse.urlrequest, "urlopen", side_effect=error),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "rate limit"),
+        ):
+            setup_builder_pulse.verify_release_exists(setup_builder_pulse.TARGET_RELEASE)
+
+
+class EnrollmentRefusalTests(unittest.TestCase):
+    def test_temporary_folders_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            refusal = setup_builder_pulse.enrollment_refusal(root)
+        self.assertIsNotNone(refusal)
+        self.assertIn("temporary folder, not your project", refusal)
+
+    def test_builder_pulse_checkout_and_its_subfolders_are_refused(self) -> None:
+        refusal = setup_builder_pulse.enrollment_refusal(ROOT.resolve())
+        self.assertIsNotNone(refusal)
+        self.assertIn("is the Builder Pulse installer folder, not your project", refusal)
+        nested = setup_builder_pulse.enrollment_refusal((ROOT / "scripts").resolve())
+        self.assertIsNotNone(nested)
+        self.assertIn("installer folder", nested)
+
+    def test_plain_project_folder_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "project"
+            root.mkdir()
+            with mock.patch.object(setup_builder_pulse, "temporary_roots", return_value=()):
+                self.assertIsNone(setup_builder_pulse.enrollment_refusal(root))
+
+
+class ReviewFlowTests(SetupCaseBase):
+    def repair_stack(self, stack: contextlib.ExitStack, activation: dict, run_command):
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        identity = {
+            "installationId": "installation-1",
+            "builderId": "builder-1",
+            "memberId": "member-1",
+            "installationToken": "token-1",
+            "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
+        }
+        status_identity = {
+            "claimed": True,
+            "tokenConfigured": True,
+            "installationId": "installation-1",
+            "builderId": "builder-1",
+            "memberId": "member-1",
+        }
+        stack.enter_context(mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "verify_release_exists", return_value=TARGET_COMMIT))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "installed_builder", return_value=None))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "marketplace_state", return_value=None))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "verified_rollback_source", return_value=None))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "existing_plugin_data_dir", return_value=ROOT))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "plugin_data_dir", return_value=ROOT))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "authoritative_identity", return_value=identity))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "claimed_identity", return_value=setup_builder_pulse.claimed_identity_fields(status_identity)))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "pause_existing_capture", return_value=None))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "remove_current"))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "install_release", return_value=cli))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "resume_server_capture"))
+        stack.enter_context(mock.patch.object(setup_builder_pulse, "activate", return_value=activation))
+        run = stack.enter_context(mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command))
+        repause = stack.enter_context(mock.patch.object(setup_builder_pulse, "pause_server_capture"))
+        quarantine = stack.enter_context(mock.patch.object(setup_builder_pulse, "quarantine_local_capture"))
+        cleanup = stack.enter_context(mock.patch.object(setup_builder_pulse, "cleanup_partial"))
+        rollback = stack.enter_context(mock.patch.object(setup_builder_pulse, "install_verified_rollback"))
+        return cli, run, repause, quarantine, cleanup, rollback
+
+    def test_review_required_keeps_the_install_active_and_reports_it(self) -> None:
+        calls: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            calls.append(arguments)
+            return ""
+
+        activation = {
+            "connected": False,
+            "activationReady": False,
+            "reviewRequired": True,
+            "hookStatus": "modified",
+            "agentPlatform": "codex",
+            "detail": "run /hooks",
+        }
+        with contextlib.ExitStack() as stack:
+            cli, run, repause, quarantine, cleanup, rollback = self.repair_stack(
+                stack, activation, run_command
+            )
+            outcome = setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                "",
+                "",
+                reuse_existing_claim=True,
+            )
+        self.assertEqual(outcome.review_required, ("codex",))
+        self.assertEqual(outcome.cli, cli)
+        self.assertIsNone(outcome.enrolled_root)
+        repause.assert_not_called()
+        quarantine.assert_not_called()
+        cleanup.assert_not_called()
+        rollback.assert_not_called()
+        enabled_calls = [arguments[-1] for arguments in calls if arguments[-4:-1] == ["config", "set", "enabled"]]
+        self.assertEqual(enabled_calls[-1], "true")
+        self.assertTrue(any(arguments[-1] == "flush" for arguments in calls))
+        self.assertFalse(any("enroll" in arguments for arguments in calls))
+
+    def test_non_review_activation_failure_still_rolls_back(self) -> None:
+        activation = {
+            "connected": False,
+            "activationReady": False,
+            "reviewRequired": False,
+            "hookStatus": "not_loaded",
+            "agentPlatform": "codex",
+            "detail": "no hooks",
+        }
+        with contextlib.ExitStack() as stack:
+            cli, run, repause, quarantine, cleanup, rollback = self.repair_stack(
+                stack, activation, lambda arguments, *, env=None, expect_json=False: ""
+            )
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                r"not verified for Codex \(hookStatus=not_loaded; detail=no hooks\)",
+            ):
+                setup_builder_pulse.setup(
+                    "",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                    "",
+                    "",
+                    reuse_existing_claim=True,
+                )
+        repause.assert_called_once()
+        quarantine.assert_called_once()
+        cleanup.assert_called_once()
+
+    def test_repair_enrolls_only_an_explicitly_named_folder(self) -> None:
+        calls: list[list[str]] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del env, expect_json
+            calls.append(arguments)
+            return ""
+
+        ready = {"activationReady": True, "hooksTrusted": True, "serverVerified": True}
+        with contextlib.ExitStack() as stack:
+            self.repair_stack(stack, ready, run_command)
+            outcome = setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                self.project_root,
+                "My Project",
+                reuse_existing_claim=True,
+            )
+        self.assertEqual(outcome.enrolled_root, self.project_root.resolve())
+        enroll = [arguments for arguments in calls if "enroll" in arguments]
+        self.assertEqual(len(enroll), 1)
+        self.assertNotIn("--replace-existing", enroll[0])
+
+    def test_setup_mode_refuses_the_installer_clone_and_temporary_folders(self) -> None:
+        with (
+            mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
+            self.assertRaisesRegex(setup_builder_pulse.SetupError, "installer folder, not your project"),
+        ):
+            setup_builder_pulse.setup(
+                "InviteCode_1234567890",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                ROOT,
+                "Builder Pulse",
+            )
+        self.temporary_roots.stop()
+        try:
+            with (
+                mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which),
+                self.assertRaisesRegex(setup_builder_pulse.SetupError, "temporary folder, not your project"),
+            ):
+                setup_builder_pulse.setup(
+                    "InviteCode_1234567890",
+                    setup_builder_pulse.DEFAULT_ENDPOINT,
+                    self.project_root,
+                    "Builder Pulse",
+                )
+        finally:
+            self.temporary_roots.start()
+
+
+class MainEntrypointTests(SetupCaseBase):
+    def test_review_outcome_exits_3_with_hooks_instructions_and_no_success_line(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        outcome = setup_builder_pulse.SetupOutcome(cli, self.project_root, ("codex",))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+            mock.patch.object(setup_builder_pulse, "setup", return_value=outcome),
+            mock.patch.object(setup_builder_pulse, "run_command", return_value="harness-project\n"),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 3)
+        self.assertIn("/hooks", stderr.getvalue())
+        self.assertIn("has not approved its hooks yet", stderr.getvalue())
+        self.assertIn("activate --agent codex", stderr.getvalue())
+        self.assertIn("Details: ", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("harness-project", stderr.getvalue())
+
+    def test_failure_exit_1_ends_with_a_details_line_and_a_private_log(self) -> None:
+        data_dir = Path(os.environ["BUILDER_PULSE_DATA_DIR"])
+        self.assertFalse(data_dir.exists())
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+            mock.patch.object(
+                setup_builder_pulse,
+                "setup",
+                side_effect=setup_builder_pulse.SetupError("Builder Pulse activation failed (hookStatus=not_loaded)"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 1)
+        lines = [line for line in stderr.getvalue().splitlines() if line.strip()]
+        self.assertTrue(lines[-1].startswith("Details: "), lines[-1])
+        log_path = Path(lines[-1].removeprefix("Details: "))
+        self.assertTrue(log_path.is_file())
+        # The log always lives at the stable shared location, even when the
+        # failure happened before the shared directory existed; only the
+        # secret-free logs directory is created for it.
+        self.assertEqual(log_path.parent, data_dir.resolve() / "logs")
+        self.assertEqual({entry.name for entry in data_dir.iterdir()}, {"logs"})
+        self.assertIn("hookStatus=not_loaded", log_path.read_text(encoding="utf-8"))
+        self.assertIn("Builder Pulse setup stopped: Builder Pulse activation failed", stderr.getvalue())
+
+    def test_success_prints_the_completion_sentence_last(self) -> None:
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        outcome = setup_builder_pulse.SetupOutcome(cli, None, ())
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+            mock.patch.object(setup_builder_pulse, "setup", return_value=outcome),
+            mock.patch.object(setup_builder_pulse, "run_command", return_value=""),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 0)
+        self.assertTrue(
+            stdout.getvalue().strip().endswith("verify separate server receipts.")
+        )
+        self.assertIn("prior confirmed projects were kept unchanged", stdout.getvalue())
+
+    def test_interactive_repair_defaults_to_no_new_enrollment(self) -> None:
+        captured: dict = {}
+
+        def fake_setup(invite_code, endpoint, project_root, project_label, *, reuse_existing_claim=False):
+            captured.update(root=project_root, label=project_label, reuse=reuse_existing_claim)
+            return setup_builder_pulse.SetupOutcome(ROOT / "scripts" / "builder_pulse.py", None, ())
+
+        with (
+            mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", return_value=""),
+            mock.patch.object(setup_builder_pulse, "setup", side_effect=fake_setup),
+            mock.patch.object(setup_builder_pulse, "run_command", return_value=""),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 0)
+        self.assertEqual(captured, {"root": "", "label": "", "reuse": True})
+
+    def test_interactive_prompt_never_defaults_to_the_installer_clone(self) -> None:
+        captured: dict = {}
+        answers = iter(["", str(self.project_root), "My Project"])
+
+        def fake_setup(invite_code, endpoint, project_root, project_label, *, reuse_existing_claim=False):
+            captured.update(root=project_root, label=project_label)
+            return setup_builder_pulse.SetupOutcome(ROOT / "scripts" / "builder_pulse.py", Path(project_root), ())
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch.dict(setup_builder_pulse.os.environ, {"BUILDER_PULSE_INVITE_CODE": "InviteCode_1234567890"}),
+            mock.patch.object(setup_builder_pulse.Path, "cwd", return_value=ROOT),
+            mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)),
+            mock.patch.object(setup_builder_pulse, "setup", side_effect=fake_setup),
+            mock.patch.object(setup_builder_pulse, "run_command", return_value=""),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 0)
+        self.assertIn("installer clone, not your project", stderr.getvalue())
+        self.assertNotIn(f"- Current folder: {ROOT}", stderr.getvalue())
+        self.assertEqual(captured, {"root": str(self.project_root), "label": "My Project"})
+
+
+class RealDirectoryRepairMixin:
+    def claimed_identity(self) -> dict:
+        return {
+            "installationId": "11111111-2222-4333-8444-555555555555",
+            "builderId": "builder-legacy",
+            "memberId": "member-legacy",
+            "builderName": "Legacy Member",
+            "installationToken": "f" * 64,
+            "claimedEndpoint": "https://pulse.example",
+            "promptCapture": "on",
+        }
+
+    def repair_with_real_directories(self):
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "verify_release_exists", return_value=TARGET_COMMIT))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "installed_builder", return_value={"version": "0.4.6"}))
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "marketplace_state",
+                    return_value={"marketplaceSource": {"source": setup_builder_pulse.REPOSITORY}},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_rollback_source",
+                    return_value=setup_builder_pulse.RollbackSource("0.4.6", "a" * 40, setup_builder_pulse.REPOSITORY),
+                )
+            )
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "pause_server_capture", return_value=True))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "resume_server_capture"))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "remove_current"))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "install_release", return_value=cli))
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "activate",
+                    return_value={"activationReady": True, "hooksTrusted": True, "serverVerified": True},
+                )
+            )
+            return setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                "",
+                "",
+                reuse_existing_claim=True,
+            )
+
+
+
+class LegacyIdentityRepairTests(RealDirectoryRepairMixin, SetupCaseBase):
+    def test_repair_recovers_an_identity_that_exists_only_in_the_legacy_directory(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        self.assertFalse(shared.exists())
+
+        outcome = self.repair_with_real_directories()
+
+        self.assertEqual(outcome.review_required, ())
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored["installationId"], identity["installationId"])
+        self.assertEqual(restored["builderId"], identity["builderId"])
+        self.assertEqual(restored["installationToken"], identity["installationToken"])
+        self.assertFalse((shared / "setup-paused-identity.json").exists())
+        self.assertTrue((legacy / "identity.json").is_file())
+        self.assertEqual(
+            json.loads((legacy / "setup-paused-identity.json").read_text(encoding="utf-8"))["installationId"],
+            identity["installationId"],
+        )
+        log_text = (setup_builder_pulse.SETUP_LOG.path or Path("/nonexistent")).read_text(encoding="utf-8")
+        self.assertIn('"source": "legacy"', log_text)
+        self.assertNotIn("f" * 64, log_text)
+
+    def test_repair_still_fails_closed_when_no_directory_holds_an_identity(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "config.json").write_text("{}", encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        (shared / "logs").mkdir()
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "not fully claimed"):
+            self.repair_with_real_directories()
+
+    def test_repair_identity_dir_prefers_a_shared_claim_over_legacy(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text(
+            json.dumps({"installationId": "legacy", "builderId": "builder-1"}), encoding="utf-8"
+        )
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        shared.mkdir(parents=True)
+        (shared / "logs").mkdir()
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        # an unclaimed skeleton does not count
+        (shared / "identity.json").write_text(
+            json.dumps({"installationId": "skeleton", "promptCapture": "off"}), encoding="utf-8"
+        )
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": "shared", "pendingInstallationToken": "c" * 64}),
+            encoding="utf-8",
+        )
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), shared)
+
+    def test_migration_merges_into_an_identity_less_shared_directory(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"legacy": true}', encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "logs" / "setup-20260101-000000.log").write_text("earlier failure\n")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(
+            json.loads((shared / "identity.json").read_text(encoding="utf-8")), identity
+        )
+        self.assertTrue((shared / "contexts.json").is_file())
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        self.assertFalse((shared.parent / f".{shared.name}-migration").exists())
+        self.assertFalse((shared.parent / f".{shared.name}-replaced").exists())
+
+    def test_migration_overlays_legacy_data_on_a_failed_attempt_layout(self) -> None:
+        """The layout a failed v0.5.0 attempt leaves behind (real machine state)."""
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "config.json").write_text('{"enabled": false, "endpoint": "https://pulse.example"}', encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"legacy": true}', encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "runtime" / "0.5.0" / "scripts").mkdir(parents=True)
+        (shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py").write_text("# stale runtime\n")
+        (shared / "logs").mkdir()
+        (shared / "identity.json").write_text(
+            json.dumps({"installationId": "8c8006e7-0000-4000-8000-000000000001", "promptCapture": "off"}),
+            encoding="utf-8",
+        )
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": "8c8006e7-0000-4000-8000-000000000001"}), encoding="utf-8"
+        )
+        (shared / "config.json").write_text('{"enabled": false}', encoding="utf-8")
+        for lock in (".lock", ".delivery.lock", ".scope-delivery.lock"):
+            (shared / lock).write_bytes(b"")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored, identity)
+        self.assertFalse((shared / "setup-paused-identity.json").exists())
+        self.assertEqual(
+            json.loads((shared / "config.json").read_text(encoding="utf-8")),
+            {"enabled": False, "endpoint": "https://pulse.example"},
+        )
+        self.assertEqual((shared / "contexts.json").read_text(encoding="utf-8"), '{"legacy": true}')
+        self.assertTrue((shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py").is_file())
+        self.assertTrue((shared / "logs").is_dir())
+        self.assertTrue((legacy / "identity.json").is_file(), "legacy copy is never deleted")
+        self.assertFalse((shared.parent / f".{shared.name}-replaced").exists())
+
+    def test_migration_never_touches_a_shared_directory_that_holds_a_claim(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text(json.dumps(self.claimed_identity()), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        pending = {"installationId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "pendingInstallationToken": "c" * 64}
+        (shared / "identity.json").write_text(json.dumps(pending), encoding="utf-8")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(
+            json.loads((shared / "identity.json").read_text(encoding="utf-8")), pending
+        )
+
+
+class SharedSkeletonTests(RealDirectoryRepairMixin, SetupCaseBase):
+    def skeleton(self) -> dict:
+        return {"installationId": "99999999-8888-4777-8666-555555555555", "promptCapture": "off"}
+
+    def test_repair_ignores_an_unclaimed_shared_skeleton(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "identity.json").write_text(json.dumps(self.skeleton()), encoding="utf-8")
+        (shared / ".lock").write_bytes(b"")
+
+        outcome = self.repair_with_real_directories()
+
+        self.assertEqual(outcome.review_required, ())
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored["installationId"], identity["installationId"])
+        self.assertEqual(restored["installationToken"], identity["installationToken"])
+
+    def test_skeleton_without_a_legacy_claim_is_not_a_claim(self) -> None:
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": self.skeleton()["installationId"]}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "not fully claimed"):
+            self.repair_with_real_directories()
+
+    def test_two_different_claimed_identities_still_differ(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text(json.dumps(self.claimed_identity()), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        other = dict(self.claimed_identity())
+        other["installationId"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        other["builderId"] = "builder-other"
+        (shared / "identity.json").write_text(json.dumps(other), encoding="utf-8")
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "identities differ"):
+            self.repair_with_real_directories()
+
+    def test_partial_migration_leaves_no_identity_and_the_retry_migrates_everything(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"projects": 1}', encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "logs" / "setup-20260101-000000.log").write_text("earlier\n")
+        real_copytree = shutil.copytree
+
+        def failing_copytree(source, destination, **kwargs):
+            destination = Path(destination)
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(source) / "identity.json", destination / "identity.json")
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(setup_builder_pulse.shutil, "copytree", side_effect=failing_copytree):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be migrated safely"):
+                setup_builder_pulse.migrate_existing_data_to_shared(None)
+        self.assertFalse((shared / "identity.json").exists())
+        self.assertFalse((shared / "contexts.json").exists())
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        self.assertFalse((shared.parent / f".{shared.name}-migration").exists())
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(json.loads((shared / "identity.json").read_text(encoding="utf-8")), identity)
+        self.assertEqual((shared / "contexts.json").read_text(encoding="utf-8"), '{"projects": 1}')
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        del real_copytree
 
 
 if __name__ == "__main__":
