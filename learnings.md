@@ -13,6 +13,18 @@
 - Require the immutable installer release before promoting a prompt that references it.
 - Verify the production alias, exact deployed commit, generated prompt version, and recovery mode before declaring rollout complete.
 
+## Measure the product outcome for the whole population, not the path you just fixed
+### Every proof in the v0.5.2–v0.6.0 work was green while 85 of 86 builders sent nothing.
+- The harness, the real-machine run and the production prompt check all passed; none of them asked "how many builders are actually reporting?"
+- The cause was on the receiving service, not in this repo, and one aggregate query over accepted-vs-rejected events by client version exposed it.
+- Add the population check to the definition of done: before declaring a rollout fixed, count the affected users who are actually working.
+
+## Treat a subagent's "all green" as a claim to verify, not a result
+### Independent reruns found a real gap and a self-inflicted false failure that the agent's own report had not surfaced.
+- Rerunning the harness personally exposed a repair path that failed when the identity lived only in the legacy Codex data directory.
+- One agent's test escaped its mocks and mutated the real machine's live installation; fence agents from production state and live config, and check the machine afterwards.
+- A false failure came from a `chmod` dirtying a tracked file, which the installer correctly refused: read the error and confirm whose fault it is before editing code.
+
 ---
 
 ### Known gaps
@@ -48,3 +60,4 @@
 ## Release train: tag, immutable release, then the prompt, then the deploy
 ### The backend on Vercel deploys manually; a merged prompt pointing at a missing tag stops every member at step one.
 - Order: plugin PR → CI + harness → merge → tag → immutable release → harness against the tag → backend prompt PR → manual `vercel deploy --prod` → verify the production prompt via the platform API.
+- 83 members are still on v0.4.2–v0.5.1. The service accepts them again, but nobody has been asked to upgrade to v0.6.0.
