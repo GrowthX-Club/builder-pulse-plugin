@@ -42,21 +42,6 @@ RELEASE_RESPONSE_MAX_BYTES = 1024 * 1024
 SETUP_LOG_KEEP = 10
 SETUP_LOG_MAX_OUTPUT = 600
 HOOK_REVIEW_EXIT_CODE = 3
-# Entries the installer itself may create in the shared data directory before
-# the legacy identity has been migrated. They never hold secrets.
-INSTALLER_OWNED_SHARED_ENTRIES = frozenset({"logs"})
-# Files the runtime may create in the shared directory before any claim exists
-# (an unclaimed identity skeleton and its lock files). Together with the logs
-# directory they never represent data worth preserving over a legacy claim.
-UNCLAIMED_SKELETON_ENTRIES = frozenset(
-    {
-        "identity.json",
-        "setup-paused-identity.json",
-        ".lock",
-        ".delivery.lock",
-        ".scope-delivery.lock",
-    }
-)
 CLAIM_KEYS = ("installationToken", "pendingInstallationToken", "builderId")
 # Files an official tool or the OS may leave inside an installed package
 # without changing any tracked file. Anything else in the checkout is a reason
@@ -555,50 +540,54 @@ def migrate_existing_data_to_shared(
         (source / "identity.json").is_file()
         or (source / "setup-paused-identity.json").is_file()
     )
-    disposable_target = False
+    merge_into_target = False
     if target.exists():
         if not source_has_identity or directory_holds_claim(target):
             return target
-        if directory_holds_identity(target) and not shared_directory_is_disposable(target):
-            # A claimed-looking record that is not a claim, next to other data:
-            # an earlier partial migration. Fail closed.
-            raise SetupError(
-                "The shared Builder Pulse data directory exists without the prior identity"
-            )
-        # The installer creates only the secret-free logs directory before this
-        # step, and the runtime may add an unclaimed identity skeleton. A shared
-        # directory holding nothing else is still "absent" for migration
-        # purposes; anything more is a partial earlier migration.
-        if not shared_directory_is_disposable(target):
-            raise SetupError(
-                "The shared Builder Pulse data directory exists without the prior identity"
-            )
-        disposable_target = True
+        # The shared directory holds no claimed or pending identity: at most the
+        # installer's logs, an unclaimed skeleton written by a runtime hook, a
+        # stale runtime copy, or config left by an earlier failed attempt. None
+        # of that may mask the claimed legacy identity. Overlay the legacy data
+        # on a copy of the directory (legacy files win, the skeleton is dropped)
+        # and swap the result in as one unit.
+        merge_into_target = True
     if not source_has_identity:
         return target
-    for candidate in source.rglob("*"):
-        if candidate.is_symlink():
-            raise SetupError("The existing Builder Pulse data contains a symbolic link")
+    for root in (source, target) if merge_into_target else (source,):
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                raise SetupError("The existing Builder Pulse data contains a symbolic link")
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.parent / f".{target.name}-migration"
     if temporary.exists():
         raise SetupError("A previous Builder Pulse data migration is incomplete")
     # Build the complete replacement beside the target, then swap it in with a
     # single rename. A failure at any point leaves the target exactly as it was
-    # (no identity), so a retry migrates everything again instead of trusting a
-    # half-copied directory.
+    # (no claimed identity), so a retry migrates everything again instead of
+    # trusting a half-copied directory.
+    replaced: Path | None = None
     try:
-        shutil.copytree(source, temporary, symlinks=False)
-        if disposable_target and (target / "logs").is_dir():
-            shutil.copytree(
-                target / "logs", temporary / "logs", symlinks=False, dirs_exist_ok=True
-            )
-        if disposable_target:
-            shutil.rmtree(target)
+        if merge_into_target:
+            shutil.copytree(target, temporary, symlinks=False)
+            for name in ("identity.json", "setup-paused-identity.json"):
+                with contextlib.suppress(FileNotFoundError):
+                    (temporary / name).unlink()
+            shutil.copytree(source, temporary, symlinks=False, dirs_exist_ok=True)
+            replaced = target.parent / f".{target.name}-replaced"
+            if replaced.exists():
+                shutil.rmtree(replaced)
+            os.replace(target, replaced)
+        else:
+            shutil.copytree(source, temporary, symlinks=False)
         os.replace(temporary, target)
     except OSError as exc:
         shutil.rmtree(temporary, ignore_errors=True)
+        if replaced is not None and replaced.exists() and not target.exists():
+            with contextlib.suppress(OSError):
+                os.replace(replaced, target)
         raise SetupError("The existing Builder Pulse data could not be migrated safely") from exc
+    if replaced is not None:
+        shutil.rmtree(replaced, ignore_errors=True)
     return target
 
 
@@ -640,17 +629,6 @@ def directory_holds_claim(directory: Path) -> bool:
         if identity_holds_claim(record):
             return True
     return False
-
-
-def shared_directory_is_disposable(directory: Path) -> bool:
-    """True when the shared directory holds only logs and an unclaimed skeleton."""
-    try:
-        entries = {entry.name for entry in directory.iterdir()}
-    except OSError:
-        return False
-    if not entries <= (INSTALLER_OWNED_SHARED_ENTRIES | UNCLAIMED_SKELETON_ENTRIES):
-        return False
-    return not directory_holds_claim(directory)
 
 
 def repair_identity_dir(installation: dict[str, Any] | None) -> Path:

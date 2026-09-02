@@ -3892,12 +3892,12 @@ class LegacyIdentityRepairTests(RealDirectoryRepairMixin, SetupCaseBase):
         )
         self.assertEqual(setup_builder_pulse.repair_identity_dir(None), shared)
 
-    def test_migration_merges_into_a_logs_only_shared_directory_and_refuses_more(self) -> None:
+    def test_migration_merges_into_an_identity_less_shared_directory(self) -> None:
         legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
         legacy.mkdir(parents=True)
         identity = self.claimed_identity()
         (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
-        (legacy / "contexts.json").write_text("{}", encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"legacy": true}', encoding="utf-8")
         shared = setup_builder_pulse.canonical_plugin_data_dir()
         (shared / "logs").mkdir(parents=True)
         (shared / "logs" / "setup-20260101-000000.log").write_text("earlier failure\n")
@@ -3908,13 +3908,59 @@ class LegacyIdentityRepairTests(RealDirectoryRepairMixin, SetupCaseBase):
         )
         self.assertTrue((shared / "contexts.json").is_file())
         self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        self.assertFalse((shared.parent / f".{shared.name}-migration").exists())
+        self.assertFalse((shared.parent / f".{shared.name}-replaced").exists())
 
-        partial = shared.parent / "partial-shared"
-        (partial / "logs").mkdir(parents=True)
-        (partial / "contexts.json").write_text("{}", encoding="utf-8")
-        with mock.patch.dict(setup_builder_pulse.os.environ, {"BUILDER_PULSE_DATA_DIR": str(partial)}):
-            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "exists without the prior identity"):
-                setup_builder_pulse.migrate_existing_data_to_shared(None)
+    def test_migration_overlays_legacy_data_on_a_failed_attempt_layout(self) -> None:
+        """The layout a failed v0.5.0 attempt leaves behind (real machine state)."""
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "config.json").write_text('{"enabled": false, "endpoint": "https://pulse.example"}', encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"legacy": true}', encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "runtime" / "0.5.0" / "scripts").mkdir(parents=True)
+        (shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py").write_text("# stale runtime\n")
+        (shared / "logs").mkdir()
+        (shared / "identity.json").write_text(
+            json.dumps({"installationId": "8c8006e7-0000-4000-8000-000000000001", "promptCapture": "off"}),
+            encoding="utf-8",
+        )
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": "8c8006e7-0000-4000-8000-000000000001"}), encoding="utf-8"
+        )
+        (shared / "config.json").write_text('{"enabled": false}', encoding="utf-8")
+        for lock in (".lock", ".delivery.lock", ".scope-delivery.lock"):
+            (shared / lock).write_bytes(b"")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored, identity)
+        self.assertFalse((shared / "setup-paused-identity.json").exists())
+        self.assertEqual(
+            json.loads((shared / "config.json").read_text(encoding="utf-8")),
+            {"enabled": False, "endpoint": "https://pulse.example"},
+        )
+        self.assertEqual((shared / "contexts.json").read_text(encoding="utf-8"), '{"legacy": true}')
+        self.assertTrue((shared / "runtime" / "0.5.0" / "scripts" / "builder_pulse.py").is_file())
+        self.assertTrue((shared / "logs").is_dir())
+        self.assertTrue((legacy / "identity.json").is_file(), "legacy copy is never deleted")
+        self.assertFalse((shared.parent / f".{shared.name}-replaced").exists())
+
+    def test_migration_never_touches_a_shared_directory_that_holds_a_claim(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text(json.dumps(self.claimed_identity()), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        pending = {"installationId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "pendingInstallationToken": "c" * 64}
+        (shared / "identity.json").write_text(json.dumps(pending), encoding="utf-8")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(
+            json.loads((shared / "identity.json").read_text(encoding="utf-8")), pending
+        )
 
 
 class SharedSkeletonTests(RealDirectoryRepairMixin, SetupCaseBase):
