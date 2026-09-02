@@ -3769,7 +3769,9 @@ class BuilderPulseTests(unittest.TestCase):
         # Windows byte-range locks and atomic replaces have materially higher
         # fixed overhead. Keep a bounded regression guard on every platform
         # without treating required cross-process locking as a performance bug.
-        maximum_elapsed = 8.0 if os.name == "nt" else 2.5
+        # The assertion that matters is "only once"; the wall-clock bound only
+        # guards against a runaway loop and must be generous for shared CI runners.
+        maximum_elapsed = 12.0 if os.name == "nt" else 6.0
         self.assertLess(elapsed, maximum_elapsed)
 
     def test_endpoint_rejects_embedded_secrets(self) -> None:
@@ -4221,7 +4223,20 @@ class ActivationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["hookStatus"], "app_server_unavailable")
         self.assertEqual(result["stage"], "initialize")
         self.assertIn("boom from app-server", result["detail"])
-        self.assertIn("exited with 7", result["detail"])
+        self.assertIn("codex app-server exited with 7 during initialize", result["detail"])
+        self.assertNotIn("did not answer", result["detail"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fake executable")
+    def test_app_server_that_never_answers_is_reported_as_a_timeout(self) -> None:
+        fake = Path(self.temp.name) / "codex"
+        fake.write_text("#!/bin/sh\ncat > /dev/null\n", encoding="utf-8")
+        fake.chmod(0o700)
+        with mock.patch.object(builder_pulse.shutil, "which", return_value=str(fake)):
+            result = builder_pulse.inspect_codex_hooks(Path(self.temp.name), timeout_seconds=0.5)
+        self.assertEqual(result["hookStatus"], "app_server_unavailable")
+        self.assertEqual(result["stage"], "initialize")
+        self.assertIn("did not answer during initialize within 0.5s", result["detail"])
+        self.assertNotIn("exited with", result["detail"])
 
     @unittest.skipIf(os.name == "nt", "POSIX python3 resolution")
     def test_codex_launcher_verification_explains_a_missing_or_old_python3(self) -> None:

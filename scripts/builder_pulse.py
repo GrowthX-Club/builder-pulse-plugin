@@ -3307,7 +3307,12 @@ def codex_version_text(codex: str) -> str:
 
 
 def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, Any]:
-    """Call the local Codex app-server hooks/list API without changing config."""
+    """Call the local Codex app-server hooks/list API without changing config.
+
+    Every failure is reported deterministically: when the app-server process
+    has exited, the result names its exit code; only a process that is still
+    running is reported as not answering within the timeout.
+    """
     codex = shutil.which("codex")
     if not codex:
         return {
@@ -3317,23 +3322,7 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
         }
 
     stderr_tail: list[str] = []
-
-    def unavailable(stage: str, extra: str = "") -> dict[str, Any]:
-        tail = redact_diagnostic_text("".join(stderr_tail))
-        detail = (
-            f"codex app-server did not answer during {stage} "
-            f"(codex {codex_version_text(codex)}, timeout {timeout_seconds:g}s)"
-        )
-        if extra:
-            detail += f": {extra}"
-        if tail.strip():
-            detail += "; app-server stderr: " + bounded_diagnostic_text(tail)
-        return {
-            "ready": False,
-            "hookStatus": "app_server_unavailable",
-            "stage": stage,
-            "detail": bounded_diagnostic_text(detail, 600),
-        }
+    version_text = codex_version_text(codex)
 
     try:
         process = subprocess.Popen(
@@ -3345,7 +3334,14 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
             bufsize=1,
         )
     except OSError as exc:
-        return unavailable("spawn", str(exc))
+        return {
+            "ready": False,
+            "hookStatus": "app_server_unavailable",
+            "stage": "spawn",
+            "detail": bounded_diagnostic_text(
+                f"codex app-server could not start (codex {version_text}): {exc}", 600
+            ),
+        }
 
     responses: queue.Queue[str | None] = queue.Queue()
 
@@ -3362,8 +3358,46 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
             if len(stderr_tail) > 40:
                 del stderr_tail[0]
 
-    threading.Thread(target=read_stdout, daemon=True).start()
-    threading.Thread(target=read_stderr, daemon=True).start()
+    stdout_reader = threading.Thread(target=read_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+
+    def unavailable(stage: str, *, eof: bool = False, extra: str = "") -> dict[str, Any]:
+        """Describe the failure from the process state, never from timing."""
+        exit_code: int | None = None
+        if eof:
+            # stdout reached EOF, which means the process closed it: almost
+            # always because it exited. Wait briefly so the exit code and the
+            # complete stderr tail are available instead of racing the reaper.
+            try:
+                exit_code = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                exit_code = None
+        else:
+            exit_code = process.poll()
+        if exit_code is not None:
+            stderr_reader.join(timeout=1)
+            detail = (
+                f"codex app-server exited with {exit_code} during {stage} "
+                f"(codex {version_text})"
+            )
+        else:
+            detail = (
+                f"codex app-server did not answer during {stage} within "
+                f"{timeout_seconds:g}s (codex {version_text})"
+            )
+        if extra:
+            detail += f": {extra}"
+        tail = redact_diagnostic_text("".join(stderr_tail))
+        if tail.strip():
+            detail += "; app-server stderr: " + bounded_diagnostic_text(tail)
+        return {
+            "ready": False,
+            "hookStatus": "app_server_unavailable",
+            "stage": stage,
+            "detail": bounded_diagnostic_text(detail, 600),
+        }
 
     def send(message: dict[str, Any]) -> bool:
         if process.stdin is None:
@@ -3375,24 +3409,25 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
         except (BrokenPipeError, OSError):
             return False
 
-    def receive(response_id: int) -> dict[str, Any] | None:
+    def receive(response_id: int) -> tuple[dict[str, Any] | None, bool]:
+        """Return (response, eof). eof=True means stdout closed without it."""
         deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout_seconds
         while True:
             remaining = deadline - dt.datetime.now(dt.timezone.utc).timestamp()
             if remaining <= 0:
-                return None
+                return None, False
             try:
                 line = responses.get(timeout=remaining)
             except queue.Empty:
-                return None
+                return None, False
             if line is None:
-                return None
+                return None, True
             try:
                 response = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(response, dict) and response.get("id") == response_id:
-                return response
+                return response, False
 
     try:
         if not send(
@@ -3409,18 +3444,15 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 },
             }
         ):
-            return unavailable("initialize", "stdin closed")
-        initialized = receive(1)
+            return unavailable("initialize", eof=True, extra="stdin closed")
+        initialized, eof = receive(1)
         if initialized is None:
-            exit_code = process.poll()
-            return unavailable(
-                "initialize",
-                f"process exited with {exit_code}" if exit_code is not None else "timed out",
-            )
+            return unavailable("initialize", eof=eof)
         if "error" in initialized:
             return unavailable(
                 "initialize",
-                bounded_diagnostic_text(json.dumps(initialized.get("error"), default=str)),
+                extra="rejected: "
+                + bounded_diagnostic_text(json.dumps(initialized.get("error"), default=str)),
             )
         if not send({"method": "initialized", "params": {}}) or not send(
             {
@@ -3429,14 +3461,10 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 "params": {"cwds": [str(cwd.resolve(strict=False))]},
             }
         ):
-            return unavailable("hooks_list", "stdin closed")
-        response = receive(2)
+            return unavailable("hooks_list", eof=True, extra="stdin closed")
+        response, eof = receive(2)
         if response is None:
-            exit_code = process.poll()
-            return unavailable(
-                "hooks_list",
-                f"process exited with {exit_code}" if exit_code is not None else "timed out",
-            )
+            return unavailable("hooks_list", eof=eof)
         return evaluate_builder_pulse_hooks(response)
     finally:
         if process.stdin is not None:
