@@ -3441,6 +3441,25 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("--depth", fetch)
         self.assertEqual(sum(1 for arguments in calls if "init" in arguments), 1)
 
+    def test_remote_commit_probe_never_prompts_and_rejects_non_commit_objects(self) -> None:
+        commit = "d" * 40
+        environments: list[dict | None] = []
+
+        def run_command(arguments, *, env=None, expect_json=False):
+            del expect_json
+            environments.append(env)
+            if arguments[-2:] == ["-t", commit]:
+                return "tag\n"
+            return ""
+
+        with mock.patch.object(setup_builder_pulse, "run_command", side_effect=run_command):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be verified"):
+                setup_builder_pulse.verify_remote_commit(setup_builder_pulse.REPOSITORY, commit)
+        self.assertTrue(environments)
+        for env in environments:
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(env["GIT_ASKPASS"], "echo")
+
     def test_remote_commit_verification_fails_closed(self) -> None:
         commit = "d" * 40
 
@@ -3665,11 +3684,11 @@ class MainEntrypointTests(SetupCaseBase):
             contextlib.redirect_stderr(stderr),
         ):
             self.assertEqual(setup_builder_pulse.main(), 3)
-        self.assertIn("/hooks", stdout.getvalue())
-        self.assertIn("has not approved its hooks yet", stdout.getvalue())
-        self.assertIn("activate --agent codex", stdout.getvalue())
-        self.assertIn("Details: ", stdout.getvalue())
-        self.assertNotIn("Builder Pulse is installed for every supported agent", stdout.getvalue())
+        self.assertIn("/hooks", stderr.getvalue())
+        self.assertIn("has not approved its hooks yet", stderr.getvalue())
+        self.assertIn("activate --agent codex", stderr.getvalue())
+        self.assertIn("Details: ", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
         self.assertIn("harness-project", stderr.getvalue())
 
     def test_failure_exit_1_ends_with_a_details_line_and_a_private_log(self) -> None:
@@ -3762,7 +3781,7 @@ class MainEntrypointTests(SetupCaseBase):
         self.assertEqual(captured, {"root": str(self.project_root), "label": "My Project"})
 
 
-class LegacyIdentityRepairTests(SetupCaseBase):
+class RealDirectoryRepairMixin:
     def claimed_identity(self) -> dict:
         return {
             "installationId": "11111111-2222-4333-8444-555555555555",
@@ -3813,6 +3832,9 @@ class LegacyIdentityRepairTests(SetupCaseBase):
                 reuse_existing_claim=True,
             )
 
+
+
+class LegacyIdentityRepairTests(RealDirectoryRepairMixin, SetupCaseBase):
     def test_repair_recovers_an_identity_that_exists_only_in_the_legacy_directory(self) -> None:
         legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
         legacy.mkdir(parents=True)
@@ -3848,16 +3870,26 @@ class LegacyIdentityRepairTests(SetupCaseBase):
         with self.assertRaisesRegex(setup_builder_pulse.SetupError, "not fully claimed"):
             self.repair_with_real_directories()
 
-    def test_repair_identity_dir_prefers_shared_over_legacy(self) -> None:
+    def test_repair_identity_dir_prefers_a_shared_claim_over_legacy(self) -> None:
         legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
         legacy.mkdir(parents=True)
-        (legacy / "identity.json").write_text("{}", encoding="utf-8")
+        (legacy / "identity.json").write_text(
+            json.dumps({"installationId": "legacy", "builderId": "builder-1"}), encoding="utf-8"
+        )
         shared = setup_builder_pulse.canonical_plugin_data_dir()
         self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
         shared.mkdir(parents=True)
         (shared / "logs").mkdir()
         self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
-        (shared / "setup-paused-identity.json").write_text("{}", encoding="utf-8")
+        # an unclaimed skeleton does not count
+        (shared / "identity.json").write_text(
+            json.dumps({"installationId": "skeleton", "promptCapture": "off"}), encoding="utf-8"
+        )
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": "shared", "pendingInstallationToken": "c" * 64}),
+            encoding="utf-8",
+        )
         self.assertEqual(setup_builder_pulse.repair_identity_dir(None), shared)
 
     def test_migration_merges_into_a_logs_only_shared_directory_and_refuses_more(self) -> None:
@@ -3883,6 +3915,81 @@ class LegacyIdentityRepairTests(SetupCaseBase):
         with mock.patch.dict(setup_builder_pulse.os.environ, {"BUILDER_PULSE_DATA_DIR": str(partial)}):
             with self.assertRaisesRegex(setup_builder_pulse.SetupError, "exists without the prior identity"):
                 setup_builder_pulse.migrate_existing_data_to_shared(None)
+
+
+class SharedSkeletonTests(RealDirectoryRepairMixin, SetupCaseBase):
+    def skeleton(self) -> dict:
+        return {"installationId": "99999999-8888-4777-8666-555555555555", "promptCapture": "off"}
+
+    def test_repair_ignores_an_unclaimed_shared_skeleton(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "identity.json").write_text(json.dumps(self.skeleton()), encoding="utf-8")
+        (shared / ".lock").write_bytes(b"")
+
+        outcome = self.repair_with_real_directories()
+
+        self.assertEqual(outcome.review_required, ())
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored["installationId"], identity["installationId"])
+        self.assertEqual(restored["installationToken"], identity["installationToken"])
+
+    def test_skeleton_without_a_legacy_claim_is_not_a_claim(self) -> None:
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "setup-paused-identity.json").write_text(
+            json.dumps({"installationId": self.skeleton()["installationId"]}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "not fully claimed"):
+            self.repair_with_real_directories()
+
+    def test_two_different_claimed_identities_still_differ(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text(json.dumps(self.claimed_identity()), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        other = dict(self.claimed_identity())
+        other["installationId"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        other["builderId"] = "builder-other"
+        (shared / "identity.json").write_text(json.dumps(other), encoding="utf-8")
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "identities differ"):
+            self.repair_with_real_directories()
+
+    def test_partial_migration_leaves_no_identity_and_the_retry_migrates_everything(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "contexts.json").write_text('{"projects": 1}', encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "logs" / "setup-20260101-000000.log").write_text("earlier\n")
+        real_copytree = shutil.copytree
+
+        def failing_copytree(source, destination, **kwargs):
+            destination = Path(destination)
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(source) / "identity.json", destination / "identity.json")
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(setup_builder_pulse.shutil, "copytree", side_effect=failing_copytree):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "could not be migrated safely"):
+                setup_builder_pulse.migrate_existing_data_to_shared(None)
+        self.assertFalse((shared / "identity.json").exists())
+        self.assertFalse((shared / "contexts.json").exists())
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        self.assertFalse((shared.parent / f".{shared.name}-migration").exists())
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(json.loads((shared / "identity.json").read_text(encoding="utf-8")), identity)
+        self.assertEqual((shared / "contexts.json").read_text(encoding="utf-8"), '{"projects": 1}')
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+        del real_copytree
 
 
 if __name__ == "__main__":

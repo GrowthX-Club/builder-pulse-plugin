@@ -3347,16 +3347,22 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
 
     def read_stdout() -> None:
         assert process.stdout is not None
-        for line in process.stdout:
-            responses.put(line)
+        try:
+            for line in process.stdout:
+                responses.put(line)
+        except (OSError, ValueError):
+            pass
         responses.put(None)
 
     def read_stderr() -> None:
         assert process.stderr is not None
-        for line in process.stderr:
-            stderr_tail.append(line)
-            if len(stderr_tail) > 40:
-                del stderr_tail[0]
+        try:
+            for line in process.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 40:
+                    del stderr_tail[0]
+        except (OSError, ValueError):
+            pass
 
     stdout_reader = threading.Thread(target=read_stdout, daemon=True)
     stderr_reader = threading.Thread(target=read_stderr, daemon=True)
@@ -3478,6 +3484,14 @@ def inspect_codex_hooks(cwd: Path, timeout_seconds: float = 10.0) -> dict[str, A
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=2)
+        stdout_reader.join(timeout=1)
+        stderr_reader.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
 
 
 EXPECTED_CLAUDE_HOOK_EVENTS = {

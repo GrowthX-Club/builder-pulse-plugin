@@ -76,6 +76,8 @@ Do not scan the home directory or recent projects, infer names from folder
 basenames or prompts, or reuse a server `defaultProject`; that field is
 cohort/roster metadata. The member's local answers are the confirmation.
 
+A repair (`--reuse-existing-claim`) never enrolls a folder by itself; it keeps
+the existing enrollments and only adds one the member explicitly names.
 Run the installer by absolute path from inside the member's project folder;
 never `cd` into the temporary clone, and never offer that clone as the folder
 to monitor. Installer exit `3` means the package is installed and Codex only

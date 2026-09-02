@@ -45,6 +45,19 @@ HOOK_REVIEW_EXIT_CODE = 3
 # Entries the installer itself may create in the shared data directory before
 # the legacy identity has been migrated. They never hold secrets.
 INSTALLER_OWNED_SHARED_ENTRIES = frozenset({"logs"})
+# Files the runtime may create in the shared directory before any claim exists
+# (an unclaimed identity skeleton and its lock files). Together with the logs
+# directory they never represent data worth preserving over a legacy claim.
+UNCLAIMED_SKELETON_ENTRIES = frozenset(
+    {
+        "identity.json",
+        "setup-paused-identity.json",
+        ".lock",
+        ".delivery.lock",
+        ".scope-delivery.lock",
+    }
+)
+CLAIM_KEYS = ("installationToken", "pendingInstallationToken", "builderId")
 # Files an official tool or the OS may leave inside an installed package
 # without changing any tracked file. Anything else in the checkout is a reason
 # to refuse provenance.
@@ -542,37 +555,25 @@ def migrate_existing_data_to_shared(
         (source / "identity.json").is_file()
         or (source / "setup-paused-identity.json").is_file()
     )
+    disposable_target = False
     if target.exists():
-        target_has_identity = bool(
-            (target / "identity.json").is_file()
-            or (target / "setup-paused-identity.json").is_file()
-        )
-        if target_has_identity or not source_has_identity:
+        if not source_has_identity or directory_holds_claim(target):
             return target
-        # The installer creates only the secret-free logs directory before this
-        # step. A shared directory holding nothing else is still "absent" for
-        # migration purposes; anything more is a partial earlier migration and
-        # must fail closed.
-        try:
-            entries = {entry.name for entry in target.iterdir()}
-        except OSError as exc:
-            raise SetupError(
-                "The shared Builder Pulse data directory exists without the prior identity"
-            ) from exc
-        if not entries <= INSTALLER_OWNED_SHARED_ENTRIES:
+        if directory_holds_identity(target) and not shared_directory_is_disposable(target):
+            # A claimed-looking record that is not a claim, next to other data:
+            # an earlier partial migration. Fail closed.
             raise SetupError(
                 "The shared Builder Pulse data directory exists without the prior identity"
             )
-        for candidate in source.rglob("*"):
-            if candidate.is_symlink():
-                raise SetupError("The existing Builder Pulse data contains a symbolic link")
-        try:
-            shutil.copytree(source, target, symlinks=False, dirs_exist_ok=True)
-        except OSError as exc:
+        # The installer creates only the secret-free logs directory before this
+        # step, and the runtime may add an unclaimed identity skeleton. A shared
+        # directory holding nothing else is still "absent" for migration
+        # purposes; anything more is a partial earlier migration.
+        if not shared_directory_is_disposable(target):
             raise SetupError(
-                "The existing Builder Pulse data could not be migrated safely"
-            ) from exc
-        return target
+                "The shared Builder Pulse data directory exists without the prior identity"
+            )
+        disposable_target = True
     if not source_has_identity:
         return target
     for candidate in source.rglob("*"):
@@ -582,8 +583,18 @@ def migrate_existing_data_to_shared(
     temporary = target.parent / f".{target.name}-migration"
     if temporary.exists():
         raise SetupError("A previous Builder Pulse data migration is incomplete")
+    # Build the complete replacement beside the target, then swap it in with a
+    # single rename. A failure at any point leaves the target exactly as it was
+    # (no identity), so a retry migrates everything again instead of trusting a
+    # half-copied directory.
     try:
         shutil.copytree(source, temporary, symlinks=False)
+        if disposable_target and (target / "logs").is_dir():
+            shutil.copytree(
+                target / "logs", temporary / "logs", symlinks=False, dirs_exist_ok=True
+            )
+        if disposable_target:
+            shutil.rmtree(target)
         os.replace(temporary, target)
     except OSError as exc:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -603,6 +614,45 @@ def directory_holds_identity(directory: Path) -> bool:
     )
 
 
+def identity_holds_claim(identity: Any) -> bool:
+    """True when an identity record carries something worth preserving."""
+    return isinstance(identity, dict) and any(
+        isinstance(identity.get(key), str) and identity.get(key)
+        for key in CLAIM_KEYS
+    )
+
+
+def directory_holds_claim(directory: Path) -> bool:
+    """True when identity.json or the paused copy carries a claim or pending token.
+
+    The runtime's hook creates an unclaimed skeleton (installationId and
+    promptCapture only) the first time it runs against an empty directory.
+    Such a skeleton must never mask a complete legacy identity.
+    """
+    for name in ("setup-paused-identity.json", "identity.json"):
+        path = directory / name
+        if not path.is_file():
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if identity_holds_claim(record):
+            return True
+    return False
+
+
+def shared_directory_is_disposable(directory: Path) -> bool:
+    """True when the shared directory holds only logs and an unclaimed skeleton."""
+    try:
+        entries = {entry.name for entry in directory.iterdir()}
+    except OSError:
+        return False
+    if not entries <= (INSTALLER_OWNED_SHARED_ENTRIES | UNCLAIMED_SKELETON_ENTRIES):
+        return False
+    return not directory_holds_claim(directory)
+
+
 def repair_identity_dir(installation: dict[str, Any] | None) -> Path:
     """Locate the identity a repair must preserve.
 
@@ -614,7 +664,7 @@ def repair_identity_dir(installation: dict[str, Any] | None) -> Path:
     whose installation IDs differ.
     """
     shared = existing_plugin_data_dir(installation)
-    if directory_holds_identity(shared):
+    if directory_holds_claim(shared):
         return shared
     legacy_cli: Path | None = None
     if installation is not None:
@@ -623,7 +673,7 @@ def repair_identity_dir(installation: dict[str, Any] | None) -> Path:
         except SetupError:
             legacy_cli = None
     legacy = legacy_codex_plugin_data_dir(legacy_cli)
-    if directory_holds_identity(legacy):
+    if directory_holds_claim(legacy):
         return legacy
     return shared
 
@@ -928,6 +978,7 @@ def pause_existing_capture(
             legacy_identity = authoritative_identity(candidate)
             if (
                 identity
+                and identity_holds_claim(identity)
                 and legacy_identity.get("installationId")
                 != identity.get("installationId")
             ):
@@ -1182,9 +1233,13 @@ def verify_remote_commit(repository: str, commit: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise SetupError("The previous Builder Pulse commit could not be verified")
     probe = tempfile.mkdtemp(prefix="builder-pulse-provenance-")
+    # A public fetch must never block on a credential prompt.
+    git_env = dict(os.environ)
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env["GIT_ASKPASS"] = "echo"
     try:
         try:
-            run_command(["git", "init", "--quiet", "--bare", probe])
+            run_command(["git", "init", "--quiet", "--bare", probe], env=git_env)
             run_command(
                 [
                     "git",
@@ -1196,10 +1251,11 @@ def verify_remote_commit(repository: str, commit: str) -> None:
                     "1",
                     f"https://github.com/{slug}.git",
                     commit,
-                ]
+                ],
+                env=git_env,
             )
             object_type = str(
-                run_command(["git", "-C", probe, "cat-file", "-t", commit])
+                run_command(["git", "-C", probe, "cat-file", "-t", commit], env=git_env)
             ).strip()
         except SetupError as exc:
             raise SetupError(
@@ -2401,9 +2457,12 @@ def main() -> int:
         print(enrolled, file=sys.stderr)
     if outcome.review_required:
         for agent_platform in outcome.review_required:
-            print(hook_review_message(agent_platform, outcome.cli, outcome.enrolled_root))
+            print(
+                hook_review_message(agent_platform, outcome.cli, outcome.enrolled_root),
+                file=sys.stderr,
+            )
         if log_path is not None:
-            print(f"Details: {log_path}")
+            print(f"Details: {log_path}", file=sys.stderr)
         SETUP_LOG.write("setup finished; hook review pending")
         return HOOK_REVIEW_EXIT_CODE
     print(
