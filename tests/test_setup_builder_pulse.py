@@ -669,7 +669,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 paused = setup_builder_pulse.pause_existing_capture(None)
 
             self.assertEqual(paused.data_dir, data_dir)
-            server_pause.assert_called_once_with(identity, "0.5.2")
+            server_pause.assert_called_once_with(identity, "0.5.3")
             self.assertFalse(
                 json.loads((data_dir / "config.json").read_text())["enabled"]
             )
@@ -781,7 +781,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 "installationToken": "token-1",
                 "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
             },
-            "0.5.2",
+            "0.5.3",
         )
         calls = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any("claim" in arguments for arguments in calls))
@@ -1160,7 +1160,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                         "installationToken": "token-1",
                         "claimedEndpoint": setup_builder_pulse.DEFAULT_ENDPOINT,
                     },
-                    "0.5.2",
+                    "0.5.3",
                 )
                 local_quarantine.assert_called_once_with(
                     ROOT,
@@ -1276,8 +1276,8 @@ class SetupBuilderPulseTests(SetupCaseBase):
                         "Builder Pulse",
                     )
 
-                resume.assert_called_once_with(identity, "0.5.2")
-                repause.assert_called_once_with(identity, "0.5.2")
+                resume.assert_called_once_with(identity, "0.5.3")
+                repause.assert_called_once_with(identity, "0.5.3")
                 local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_keyboard_interrupt_after_resume_still_repauses_and_quarantines(self) -> None:
@@ -1340,8 +1340,8 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 "Builder Pulse",
             )
 
-        resume.assert_called_once_with(identity, "0.5.2")
-        repause.assert_called_once_with(identity, "0.5.2")
+        resume.assert_called_once_with(identity, "0.5.3")
+        repause.assert_called_once_with(identity, "0.5.3")
         local_quarantine.assert_called_once_with(ROOT, identity)
 
     def test_activation_normalizes_a_process_start_failure(self) -> None:
@@ -1607,7 +1607,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                         *previous_claude,
                         {
                             "id": setup_builder_pulse.target_claude_plugin_id(),
-                            "version": "0.5.2",
+                            "version": "0.5.3",
                             "enabled": True,
                         },
                     ],
@@ -1756,7 +1756,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                         previous_claude,
                         [
                             *previous_claude,
-                            {"id": target, "version": "0.5.2", "enabled": True},
+                            {"id": target, "version": "0.5.3", "enabled": True},
                         ],
                     ],
                 )
@@ -1851,7 +1851,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 "Builder Pulse",
             )
 
-        repause.assert_called_once_with(identity, "0.5.2")
+        repause.assert_called_once_with(identity, "0.5.3")
         restore_codex.assert_called_once_with(rollback)
         remove_claude.assert_called_once_with(target)
         restore_capture.assert_called_once_with(paused)
@@ -1884,7 +1884,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                     previous_claude,
                     [
                         *previous_claude,
-                        {"id": target, "version": "0.5.2", "enabled": True},
+                        {"id": target, "version": "0.5.3", "enabled": True},
                     ],
                 ],
             ),
@@ -2122,7 +2122,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 )
 
             self.assertEqual(server_pause.call_count, 2)
-            server_resume.assert_called_once_with(identity, "0.5.2")
+            server_resume.assert_called_once_with(identity, "0.5.3")
             self.assertFalse((data_dir / "setup-paused-identity.json").exists())
             self.assertEqual(
                 json.loads((data_dir / "identity.json").read_text()),
@@ -2216,6 +2216,46 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 "differs from the immutable release",
             ):
                 setup_builder_pulse.verify_claude_install_tree(installed)
+
+    def test_claude_install_tree_ignores_claude_session_markers(self) -> None:
+        """Claude Code writes .in_use/<pid> into a loaded plugin; that is not package content."""
+        with tempfile.TemporaryDirectory() as directory:
+            installed = Path(directory) / "installed"
+            shutil.copytree(
+                setup_builder_pulse.expected_claude_package_root(),
+                installed,
+            )
+            (installed / ".in_use").mkdir()
+            (installed / ".in_use" / "1664").write_text("", encoding="utf-8")
+            (installed / ".in_use" / "99204").write_text("", encoding="utf-8")
+            setup_builder_pulse.verify_claude_install_tree(installed)
+
+            # a real content change is still rejected even with markers present
+            (installed / "scripts" / "builder_pulse_claude.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                setup_builder_pulse.SetupError,
+                "differs from the immutable release",
+            ):
+                setup_builder_pulse.verify_claude_install_tree(installed)
+
+    def test_claude_marketplace_comparison_ignores_session_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "marketplace"
+            shutil.copytree(ROOT / "claude-plugins", root / "claude-plugins")
+            (root / ".claude-plugin").mkdir()
+            shutil.copy2(ROOT / ".claude-plugin" / "marketplace.json", root / ".claude-plugin" / "marketplace.json")
+            marker_dir = root / "claude-plugins" / "posix" / ".in_use"
+            marker_dir.mkdir()
+            (marker_dir / "946").write_text("", encoding="utf-8")
+            (root / ".gcs-sha").write_text(TARGET_COMMIT + "\n", encoding="utf-8")
+            setup_builder_pulse.verify_claude_marketplace(
+                {
+                    "source": "github",
+                    "repo": "GrowthX-Club/builder-pulse-plugin",
+                    "installLocation": str(root),
+                },
+                TARGET_COMMIT,
+            )
 
     def test_claude_marketplace_name_collision_is_rejected_before_mutation(
         self,
@@ -2422,7 +2462,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
         after = [
             {
                 "id": target,
-                "version": "0.5.2",
+                "version": "0.5.3",
                 "enabled": True,
                 "scope": "user",
                 "installPath": str(installed_root),
@@ -2681,7 +2721,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
             runtime_root = (
                 setup_builder_pulse.canonical_plugin_data_dir()
                 / "runtime"
-                / "0.5.2"
+                / "0.5.3"
             )
             self.assertEqual(
                 installed_cli,
@@ -2695,7 +2735,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
             runtime_module = importlib.util.module_from_spec(runtime_spec)
             runtime_spec.loader.exec_module(runtime_module)
             self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.2")
+            self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.3")
             self.assertTrue(runtime_module.DEFAULTS_PATH.is_file())
             self.assertTrue(runtime_module.MANIFEST_PATH.is_file())
 
@@ -2772,7 +2812,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 runtime_root = (
                     setup_builder_pulse.canonical_plugin_data_dir()
                     / "runtime"
-                    / "0.5.2"
+                    / "0.5.3"
                 )
                 self.assertEqual(cli, runtime_root / "scripts" / "builder_pulse.py")
                 runtime_spec = importlib.util.spec_from_file_location(
@@ -2783,7 +2823,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 runtime_module = importlib.util.module_from_spec(runtime_spec)
                 runtime_spec.loader.exec_module(runtime_module)
                 self.assertEqual(runtime_module.PLUGIN_ROOT, runtime_root)
-                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.2")
+                self.assertEqual(runtime_module.PLUGIN_VERSION, "0.5.3")
                 activated.append(cli)
                 return {
                     "activationReady": True,
@@ -2872,7 +2912,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
                 previous_claude,
                 setup_builder_pulse.target_claude_plugin_id(),
             )
-            resume.assert_called_once_with(identity, "0.5.2")
+            resume.assert_called_once_with(identity, "0.5.3")
             self.assertEqual(len(activated), 1)
             self.assertTrue(any("claim" in arguments for arguments in commands))
             self.assertTrue(any("enroll" in arguments for arguments in commands))
@@ -3005,7 +3045,7 @@ class SetupBuilderPulseTests(SetupCaseBase):
 
             self.assertEqual(
                 installed_runtime,
-                [shared / "runtime" / "0.5.2" / "scripts" / "builder_pulse.py"],
+                [shared / "runtime" / "0.5.3" / "scripts" / "builder_pulse.py"],
             )
             self.assertEqual(
                 json.loads((shared / "identity.json").read_text(encoding="utf-8")),
@@ -3403,6 +3443,8 @@ class ProvenanceTests(unittest.TestCase):
         ):
             with self.subTest(porcelain=porcelain):
                 self.assertIs(setup_builder_pulse.checkout_is_pristine(porcelain), expected)
+        self.assertTrue(setup_builder_pulse.checkout_is_pristine('?? .in_use/1664\n'))
+        self.assertTrue(setup_builder_pulse.checkout_is_pristine('?? claude-plugins/posix/.in_use/99204\n'))
 
     def test_verified_git_checkout_tolerates_codex_marketplace_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3690,6 +3732,21 @@ class MainEntrypointTests(SetupCaseBase):
         self.assertIn("Details: ", stderr.getvalue())
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("harness-project", stderr.getvalue())
+
+    def test_closed_terminal_at_a_prompt_stops_cleanly_without_a_traceback(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
+            mock.patch.object(sys.stdin, "isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=EOFError),
+            mock.patch.object(setup_builder_pulse, "setup") as setup_call,
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(setup_builder_pulse.main(), 1)
+        setup_call.assert_not_called()
+        self.assertIn("terminal closed before the answer was given", stderr.getvalue())
+        self.assertIn("Details: ", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_failure_exit_1_ends_with_a_details_line_and_a_private_log(self) -> None:
         data_dir = Path(os.environ["BUILDER_PULSE_DATA_DIR"])
