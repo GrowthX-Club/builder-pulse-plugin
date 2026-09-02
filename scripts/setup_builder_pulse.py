@@ -42,6 +42,9 @@ RELEASE_RESPONSE_MAX_BYTES = 1024 * 1024
 SETUP_LOG_KEEP = 10
 SETUP_LOG_MAX_OUTPUT = 600
 HOOK_REVIEW_EXIT_CODE = 3
+# Entries the installer itself may create in the shared data directory before
+# the legacy identity has been migrated. They never hold secrets.
+INSTALLER_OWNED_SHARED_ENTRIES = frozenset({"logs"})
 # Files an official tool or the OS may leave inside an installed package
 # without changing any tracked file. Anything else in the checkout is a reason
 # to refuse provenance.
@@ -544,10 +547,31 @@ def migrate_existing_data_to_shared(
             (target / "identity.json").is_file()
             or (target / "setup-paused-identity.json").is_file()
         )
-        if source_has_identity and not target_has_identity:
+        if target_has_identity or not source_has_identity:
+            return target
+        # The installer creates only the secret-free logs directory before this
+        # step. A shared directory holding nothing else is still "absent" for
+        # migration purposes; anything more is a partial earlier migration and
+        # must fail closed.
+        try:
+            entries = {entry.name for entry in target.iterdir()}
+        except OSError as exc:
+            raise SetupError(
+                "The shared Builder Pulse data directory exists without the prior identity"
+            ) from exc
+        if not entries <= INSTALLER_OWNED_SHARED_ENTRIES:
             raise SetupError(
                 "The shared Builder Pulse data directory exists without the prior identity"
             )
+        for candidate in source.rglob("*"):
+            if candidate.is_symlink():
+                raise SetupError("The existing Builder Pulse data contains a symbolic link")
+        try:
+            shutil.copytree(source, target, symlinks=False, dirs_exist_ok=True)
+        except OSError as exc:
+            raise SetupError(
+                "The existing Builder Pulse data could not be migrated safely"
+            ) from exc
         return target
     if not source_has_identity:
         return target
@@ -570,6 +594,38 @@ def migrate_existing_data_to_shared(
 def existing_plugin_data_dir(installation: dict[str, Any] | None) -> Path:
     del installation
     return canonical_plugin_data_dir()
+
+
+def directory_holds_identity(directory: Path) -> bool:
+    return bool(
+        (directory / "identity.json").is_file()
+        or (directory / "setup-paused-identity.json").is_file()
+    )
+
+
+def repair_identity_dir(installation: dict[str, Any] | None) -> Path:
+    """Locate the identity a repair must preserve.
+
+    The shared directory wins whenever it holds an identity. A member whose
+    earlier v0.5.x attempt stopped before the migration step still has the
+    claimed identity only in the legacy Codex-owned directory, so fall back to
+    it there; the migration step copies it into the shared directory exactly as
+    for any other upgrade, and the pause step still refuses two directories
+    whose installation IDs differ.
+    """
+    shared = existing_plugin_data_dir(installation)
+    if directory_holds_identity(shared):
+        return shared
+    legacy_cli: Path | None = None
+    if installation is not None:
+        try:
+            legacy_cli = installed_cli(installation)
+        except SetupError:
+            legacy_cli = None
+    legacy = legacy_codex_plugin_data_dir(legacy_cli)
+    if directory_holds_identity(legacy):
+        return legacy
+    return shared
 
 
 def authoritative_identity(data_dir: Path) -> dict[str, Any]:
@@ -1911,6 +1967,7 @@ def setup(
     if not reuse_existing_claim and (len(invite_code) < 16 or len(invite_code) > 256):
         raise SetupError("The Builder Pulse invite code is invalid")
     SETUP_LOG.mask(invite_code)
+    SETUP_LOG.open(canonical_plugin_data_dir())
     SETUP_LOG.write(
         "setup started",
         release=TARGET_RELEASE,
@@ -1969,12 +2026,16 @@ def setup(
     rollback_source = verified_rollback_source(previous, previous_marketplace)
     preserved_identity: dict[str, str] | None = None
     if reuse_existing_claim:
+        identity_dir = repair_identity_dir(previous)
         preserved_identity = local_claimed_identity_fields(
-            authoritative_identity(existing_plugin_data_dir(previous))
+            authoritative_identity(identity_dir)
         )
         SETUP_LOG.write(
             "existing identity verified",
             installationId=preserved_identity.get("installationId"),
+            source="legacy"
+            if identity_dir != existing_plugin_data_dir(previous)
+            else "shared",
         )
 
     previous_claude = installed_claude_builders() if claude_available else []
@@ -2008,8 +2069,7 @@ def setup(
         # Move the old Codex-owned identity to the agent-neutral data directory
         # only after every target agent has proved it can install. The old
         # directory remains available for an exact rollback.
-        shared_data_dir = migrate_existing_data_to_shared(previous)
-        SETUP_LOG.open(shared_data_dir)
+        migrate_existing_data_to_shared(previous)
 
         # Claude executes this immutable shared runtime directly.
         shared_cli = install_shared_runtime(target_commit)
@@ -2219,19 +2279,14 @@ def setup(
 
 
 def open_setup_log_for_report() -> Path | None:
-    """Open the log at the shared data directory only if it already exists.
+    """Open the log at its stable location under the shared data directory.
 
-    Creating `~/.builder-pulse` before the legacy identity migration would make
-    the next run believe the shared directory lost the identity, so a failure
-    that happens earlier is logged under the system temporary directory instead.
+    Only the secret-free `logs` directory is created here; the migration step
+    treats a shared directory holding nothing else as absent.
     """
     if SETUP_LOG.path is not None:
         return SETUP_LOG.path
-    shared = canonical_plugin_data_dir()
-    if shared.is_dir():
-        return SETUP_LOG.open(shared)
-    fallback = Path(tempfile.gettempdir()) / "builder-pulse"
-    return SETUP_LOG.open(fallback)
+    return SETUP_LOG.open(canonical_plugin_data_dir())
 
 
 def prompt_for_project(current_folder: Path) -> tuple[str, str]:

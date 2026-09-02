@@ -3674,7 +3674,7 @@ class MainEntrypointTests(SetupCaseBase):
 
     def test_failure_exit_1_ends_with_a_details_line_and_a_private_log(self) -> None:
         data_dir = Path(os.environ["BUILDER_PULSE_DATA_DIR"])
-        data_dir.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(data_dir.exists())
         stderr = io.StringIO()
         with (
             mock.patch.object(sys, "argv", ["setup", "--reuse-existing-claim"]),
@@ -3691,6 +3691,11 @@ class MainEntrypointTests(SetupCaseBase):
         self.assertTrue(lines[-1].startswith("Details: "), lines[-1])
         log_path = Path(lines[-1].removeprefix("Details: "))
         self.assertTrue(log_path.is_file())
+        # The log always lives at the stable shared location, even when the
+        # failure happened before the shared directory existed; only the
+        # secret-free logs directory is created for it.
+        self.assertEqual(log_path.parent, data_dir.resolve() / "logs")
+        self.assertEqual({entry.name for entry in data_dir.iterdir()}, {"logs"})
         self.assertIn("hookStatus=not_loaded", log_path.read_text(encoding="utf-8"))
         self.assertIn("Builder Pulse setup stopped: Builder Pulse activation failed", stderr.getvalue())
 
@@ -3755,6 +3760,129 @@ class MainEntrypointTests(SetupCaseBase):
         self.assertIn("installer clone, not your project", stderr.getvalue())
         self.assertNotIn(f"- Current folder: {ROOT}", stderr.getvalue())
         self.assertEqual(captured, {"root": str(self.project_root), "label": "My Project"})
+
+
+class LegacyIdentityRepairTests(SetupCaseBase):
+    def claimed_identity(self) -> dict:
+        return {
+            "installationId": "11111111-2222-4333-8444-555555555555",
+            "builderId": "builder-legacy",
+            "memberId": "member-legacy",
+            "builderName": "Legacy Member",
+            "installationToken": "f" * 64,
+            "claimedEndpoint": "https://pulse.example",
+            "promptCapture": "on",
+        }
+
+    def repair_with_real_directories(self):
+        cli = ROOT / "scripts" / "builder_pulse.py"
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(setup_builder_pulse.shutil, "which", side_effect=codex_only_which))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "verify_release_exists", return_value=TARGET_COMMIT))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "installed_builder", return_value={"version": "0.4.6"}))
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "marketplace_state",
+                    return_value={"marketplaceSource": {"source": setup_builder_pulse.REPOSITORY}},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "verified_rollback_source",
+                    return_value=setup_builder_pulse.RollbackSource("0.4.6", "a" * 40, setup_builder_pulse.REPOSITORY),
+                )
+            )
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "pause_server_capture", return_value=True))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "resume_server_capture"))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "remove_current"))
+            stack.enter_context(mock.patch.object(setup_builder_pulse, "install_release", return_value=cli))
+            stack.enter_context(
+                mock.patch.object(
+                    setup_builder_pulse,
+                    "activate",
+                    return_value={"activationReady": True, "hooksTrusted": True, "serverVerified": True},
+                )
+            )
+            return setup_builder_pulse.setup(
+                "",
+                setup_builder_pulse.DEFAULT_ENDPOINT,
+                "",
+                "",
+                reuse_existing_claim=True,
+            )
+
+    def test_repair_recovers_an_identity_that_exists_only_in_the_legacy_directory(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        self.assertFalse(shared.exists())
+
+        outcome = self.repair_with_real_directories()
+
+        self.assertEqual(outcome.review_required, ())
+        restored = json.loads((shared / "identity.json").read_text(encoding="utf-8"))
+        self.assertEqual(restored["installationId"], identity["installationId"])
+        self.assertEqual(restored["builderId"], identity["builderId"])
+        self.assertEqual(restored["installationToken"], identity["installationToken"])
+        self.assertFalse((shared / "setup-paused-identity.json").exists())
+        self.assertTrue((legacy / "identity.json").is_file())
+        self.assertEqual(
+            json.loads((legacy / "setup-paused-identity.json").read_text(encoding="utf-8"))["installationId"],
+            identity["installationId"],
+        )
+        log_text = (setup_builder_pulse.SETUP_LOG.path or Path("/nonexistent")).read_text(encoding="utf-8")
+        self.assertIn('"source": "legacy"', log_text)
+        self.assertNotIn("f" * 64, log_text)
+
+    def test_repair_still_fails_closed_when_no_directory_holds_an_identity(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "config.json").write_text("{}", encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        shared.mkdir(parents=True)
+        (shared / "logs").mkdir()
+        with self.assertRaisesRegex(setup_builder_pulse.SetupError, "not fully claimed"):
+            self.repair_with_real_directories()
+
+    def test_repair_identity_dir_prefers_shared_over_legacy(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        (legacy / "identity.json").write_text("{}", encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        shared.mkdir(parents=True)
+        (shared / "logs").mkdir()
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), legacy)
+        (shared / "setup-paused-identity.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(setup_builder_pulse.repair_identity_dir(None), shared)
+
+    def test_migration_merges_into_a_logs_only_shared_directory_and_refuses_more(self) -> None:
+        legacy = setup_builder_pulse.legacy_codex_plugin_data_dir()
+        legacy.mkdir(parents=True)
+        identity = self.claimed_identity()
+        (legacy / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+        (legacy / "contexts.json").write_text("{}", encoding="utf-8")
+        shared = setup_builder_pulse.canonical_plugin_data_dir()
+        (shared / "logs").mkdir(parents=True)
+        (shared / "logs" / "setup-20260101-000000.log").write_text("earlier failure\n")
+
+        self.assertEqual(setup_builder_pulse.migrate_existing_data_to_shared(None), shared)
+        self.assertEqual(
+            json.loads((shared / "identity.json").read_text(encoding="utf-8")), identity
+        )
+        self.assertTrue((shared / "contexts.json").is_file())
+        self.assertTrue((shared / "logs" / "setup-20260101-000000.log").is_file())
+
+        partial = shared.parent / "partial-shared"
+        (partial / "logs").mkdir(parents=True)
+        (partial / "contexts.json").write_text("{}", encoding="utf-8")
+        with mock.patch.dict(setup_builder_pulse.os.environ, {"BUILDER_PULSE_DATA_DIR": str(partial)}):
+            with self.assertRaisesRegex(setup_builder_pulse.SetupError, "exists without the prior identity"):
+                setup_builder_pulse.migrate_existing_data_to_shared(None)
 
 
 if __name__ == "__main__":

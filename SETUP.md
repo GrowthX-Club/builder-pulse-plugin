@@ -35,7 +35,10 @@ Every installer run ends in exactly one of these states:
 
 The log lives under the shared data directory at `~/.builder-pulse/logs/`
 (`setup-<UTC timestamp>.log`, newest ten kept; `activate.log` for later
-`activate` runs). Invite codes, installation tokens, bearer values, prompts,
+`activate` runs). The installer creates that `logs` directory at start, so the
+`Details:` path is the same stable location however early a run stops; a shared
+directory holding nothing but `logs` is still treated as absent when the legacy
+identity is migrated. Invite codes, installation tokens, bearer values, prompts,
 transcripts, the working directory, and enrolled folder paths are never written
 to it; only a folder's last path component appears.
 
@@ -93,8 +96,10 @@ existing Codex or Claude Code registration, or left the claim quarantined
 Codex Builder Pulse data directory. After independently verifying the immutable
 v0.5.2 release as described above, run its installer with
 `--reuse-existing-claim` from inside the member's project folder. The repair
-restores the quarantined claimed identity; it does not require or consume a new
-invite code. Do not delete or hand-edit the preserved data directories.
+restores the quarantined claimed identity, whether it sits in `~/.builder-pulse`
+or only in the legacy Codex data directory (an attempt that stopped before its
+migration step leaves it there); it does not require or consume a new invite
+code. Do not delete or hand-edit the preserved data directories.
 
 The installer securely asks for the personalized handbook code without echoing
 it. An agent that already received the code in its setup prompt may instead
