@@ -167,6 +167,11 @@ class SetupCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.commands = FakeCommands(self)
         self.server_calls: list[tuple[str, str]] = []
+        for guard in (mock.patch.object(S, "run_command", self.commands),
+                      mock.patch.object(S.subprocess, "run", side_effect=AssertionError("test reached a real subprocess")),
+                      mock.patch.object(S.urlrequest, "urlopen", side_effect=AssertionError("test reached the network"))):
+            guard.start()
+            self.addCleanup(guard.stop)
 
     def fake_server_call(self, identity, route, version, confirm):
         self.server_calls.append((route, version))
@@ -456,7 +461,8 @@ class PackageTests(SetupCase):
         self.assertNotIn("plugin remove " + S.PLUGIN, joined)
         self.assertNotIn("plugin marketplace remove", joined)
         self.assertNotIn("plugin add " + S.PLUGIN, joined, "already at the target version: no churn")
-        self.assertEqual(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION), cli_path)
+        with mock.patch.object(S, "run_command", self.commands):
+            self.assertEqual(S.install_codex(S.TARGET_RELEASE, S.TARGET_VERSION), cli_path)
 
     def test_codex_install_rejects_foreign_marketplace_source(self) -> None:
         self.commands.codex_marketplace = {"name": S.MARKETPLACE, "marketplaceSource": {"sourceType": "git", "source": "https://github.com/evil/x.git", "ref": "v1"}}
@@ -699,6 +705,7 @@ class MainTests(SetupCase):
     def run_main(self, argv, *, tty=False, outcome=None, error=None, answers=(), invite="harness-invite-code-0001-abcdef"):
         stdout, stderr = io.StringIO(), io.StringIO()
         with (mock.patch.object(sys, "argv", ["setup", *argv]), mock.patch.object(sys.stdin, "isatty", return_value=tty),
+              mock.patch.object(S.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")),  # git rev-parse in the folder prompt
               mock.patch("builtins.input", side_effect=list(answers) or EOFError),
               mock.patch.object(S.getpass, "getpass", side_effect=EOFError if invite is None else None, return_value=invite),
               mock.patch.object(S, "setup", side_effect=error, return_value=outcome) as setup_call,
