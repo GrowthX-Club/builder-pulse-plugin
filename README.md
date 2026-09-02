@@ -118,7 +118,7 @@ Claim request:
   "inviteCode": "one-time-code",
   "installationId": "stable-uuid",
   "installationToken": "64-lowercase-hex-characters",
-  "pluginVersion": "0.5.3"
+  "pluginVersion": "0.6.0"
 }
 ```
 
@@ -212,7 +212,7 @@ prompt event below in `prompt-outbox.jsonl` and attempts a best-effort
   "featureLabel": "Member search filters",
   "promptText": "Help me improve the member search experience.",
   "occurredAt": 1787721000000,
-  "pluginVersion": "0.5.3",
+  "pluginVersion": "0.6.0",
   "agentPlatform": "claude_code",
   "redacted": false,
   "truncated": false
@@ -256,7 +256,7 @@ When a cumulative token snapshot is available, the wire payload is schema v2:
     "reasoningOutputTokens": 80,
     "totalTokens": 1440
   },
-  "pluginVersion": "0.5.3",
+  "pluginVersion": "0.6.0",
   "agentPlatform": "codex"
 }
 ```
@@ -289,7 +289,7 @@ claimed installation. That proves activation readiness, not event delivery.
 `telemetryReceived: true` means the server has received something at
 some point; it can be historical. Current repair proof requires
 `telemetryReceivedSincePreviousActivation: true`, a non-null `lastSignalAt`, and
-`lastSignalPluginVersion: "0.5.3"` with a matching `lastSignalAgentPlatform`.
+`lastSignalPluginVersion: "0.6.0"` with a matching `lastSignalAgentPlatform`.
 Every `activate` result that is not ready includes a bounded `detail` string
 naming the exact local condition (which stage of the Codex app-server
 handshake failed, which plugins Codex listed instead, which manifest path it
@@ -314,29 +314,34 @@ Builder Pulse ships from the GrowthX Builder Tools marketplace manifest in this
 repository. Python 3.11 or newer is the only host prerequisite; verify it with
 `python3 --version` on macOS/Linux or `py -3 --version` on Windows before
 installation. The runtime uses only Python's standard library. For manual
-recovery, install the current immutable v0.5.3 release. The prepared installer
+recovery, install the current immutable v0.6.0 release. The prepared installer
 installs every supported agent found on the computer. Codex's manual package
 commands are:
 
 ```bash
-codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.5.3
+codex plugin marketplace add GrowthX-Club/builder-pulse-plugin --ref v0.6.0
 codex plugin add builder-pulse@growthx-builder-tools
 ```
 
 Before installing, verify both the exact Git tag and the corresponding
 published GitHub Release. The release API response must report
-`tag_name: "v0.5.3"`, `draft: false`, and `immutable: true`; a tag existing by
+`tag_name: "v0.6.0"`, `draft: false`, and `immutable: true`; a tag existing by
 itself is not proof of immutability. The prepared installer performs both
 checks and fails closed if either one cannot be verified.
 
 The prepared installer defaults to `https://precious-ant-429.convex.site`. It
-records the existing package's exact full commit, proves that commit exists on
-the approved repository with a shallow `git fetch` of that single object (no
-GitHub API response size cap, no per-address rate limit), then uses that
-commit—not a movable version tag—as the only rollback source. Files Codex or
-the OS may leave inside an installed package (`.codex-marketplace-install.json`,
-`.DS_Store`, bytecode caches) do not count as tampering; any tracked-file
-change or other untracked file still does. Exit every running Claude Code and Codex session before
+verifies the release (tag, published immutable release, and its own checkout
+must agree on one commit), pauses capture locally and on the service, re-pins
+the Codex marketplace to the release tag, installs the package for every agent
+found, restores the identity, resumes capture, and activates each agent. If
+anything fails after the pause, capture stays paused and the previous Codex
+release tag is reinstalled; no exact-commit provenance of the plugin cache is
+required because Codex materializes it from the pinned tag. Files Codex, Claude
+Code, or the OS may leave inside a package (`.codex-marketplace-install.json`,
+`.in_use/<pid>`, `.orphaned_at`, `.links_materialized`, `.DS_Store`, bytecode
+caches) are never treated as tampering. The real-Codex scenarios under
+`tests/integration/` must pass before any installer change merges.
+Exit every running Claude Code and Codex session before
 starting fresh sessions so no process keeps the previous hook manifest or
 version path in memory.
 To pause without removing local identity or the project allowlist, run
