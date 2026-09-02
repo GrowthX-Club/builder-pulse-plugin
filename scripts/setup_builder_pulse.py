@@ -534,14 +534,18 @@ def install_codex(ref: str, version: str) -> Path:
     source = (configured or {}).get("marketplaceSource") or {}
     if configured is not None and approved_slug(source.get("source")) is None:
         raise SetupError("The GrowthX marketplace name points to a different source")
-    root = Path()
+    root: Path | None = None
     if installed is not None and installed.get("version") == version and configured is not None:
         # Same package already registered from an approved source: a rerun must
         # not churn the registration (Codex keeps hook trust by content anyway).
         # `codex plugin list` does not report the cache path, so derive it.
-        codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-        root = Path(str(installed.get("installedPath") or codex_home / "plugins" / "cache" / MARKETPLACE / "builder-pulse" / version)).expanduser().resolve(strict=False)
-    if not (root / "scripts" / "builder_pulse.py").is_file():
+        codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+        candidate = Path(str(installed.get("installedPath") or codex_home / "plugins" / "cache" / MARKETPLACE / "builder-pulse" / version))
+        candidate = candidate.expanduser().resolve(strict=False)
+        if candidate.is_absolute() and (candidate / "scripts" / "builder_pulse.py").is_file() \
+                and read_object(candidate / ".codex-plugin" / "plugin.json").get("version") == version:
+            root = candidate
+    if root is None:
         if installed is not None:
             run_command(["codex", "plugin", "remove", PLUGIN, "--json"])
         if configured is not None:
