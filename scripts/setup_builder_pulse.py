@@ -30,7 +30,7 @@ APPROVED_EXISTING_REPOSITORIES = {
 }
 MARKETPLACE = "growthx-builder-tools"
 PLUGIN = f"builder-pulse@{MARKETPLACE}"
-TARGET_RELEASE = "v0.5.2"
+TARGET_RELEASE = "v0.5.3"
 CLAUDE_MARKETPLACE = f"growthx-builder-tools-{TARGET_RELEASE.replace('.', '-')}"
 CLAUDE_POSIX_PLUGIN = f"builder-pulse-claude-posix@{CLAUDE_MARKETPLACE}"
 CLAUDE_WINDOWS_PLUGIN = f"builder-pulse-claude-windows@{CLAUDE_MARKETPLACE}"
@@ -47,7 +47,10 @@ CLAIM_KEYS = ("installationToken", "pendingInstallationToken", "builderId")
 # without changing any tracked file. Anything else in the checkout is a reason
 # to refuse provenance.
 CHECKOUT_NOISE_FILES = frozenset({".codex-marketplace-install.json", ".DS_Store"})
-CHECKOUT_NOISE_PARTS = frozenset({"__pycache__"})
+CHECKOUT_NOISE_PARTS = frozenset({"__pycache__", ".in_use"})
+# Claude Code records the sessions currently using an installed plugin under
+# <plugin>/.in_use/<pid>. Those markers are runtime state, never package content.
+CLAUDE_RUNTIME_MARKER_PARTS = frozenset({".in_use"})
 CHECKOUT_NOISE_SUFFIXES = (".pyc",)
 DIAGNOSTIC_HEX_TOKEN_PATTERN = re.compile(r"\b[0-9a-fA-F]{64}\b")
 DIAGNOSTIC_BEARER_PATTERN = re.compile(r"(?i)\bbearer[ \t]+[^\s\"',;]+")
@@ -1553,12 +1556,15 @@ def verify_claude_marketplace(
                 if path.is_file():
                     expected_files[path.relative_to(source_root)] = path.read_bytes()
             for path in installed_paths:
+                relative = path.relative_to(root)
+                if is_claude_runtime_marker(relative):
+                    continue
                 if path.is_symlink():
                     raise SetupError(
                         "The installed Claude Code GrowthX marketplace contains a symlink"
                     )
                 if path.is_file():
-                    installed_files[path.relative_to(root)] = path.read_bytes()
+                    installed_files[relative] = path.read_bytes()
     except OSError as exc:
         raise SetupError("The Claude Code GrowthX marketplace is unreadable") from exc
     if not expected_files or installed_files != expected_files:
@@ -1637,6 +1643,11 @@ def preflight_agent_installation_support(
         )
 
 
+def is_claude_runtime_marker(relative: Path) -> bool:
+    """True for files Claude Code itself writes into an installed package."""
+    return any(part in CLAUDE_RUNTIME_MARKER_PARTS for part in relative.parts)
+
+
 def verify_claude_install_tree(root: Path) -> None:
     """Prove Claude installed the exact package from this immutable checkout."""
     source_root = expected_claude_package_root().resolve(strict=True)
@@ -1649,10 +1660,13 @@ def verify_claude_install_tree(root: Path) -> None:
             if source.is_file():
                 expected_files[source.relative_to(source_root)] = source.read_bytes()
         for installed in root.rglob("*"):
+            relative = installed.relative_to(root)
+            if is_claude_runtime_marker(relative):
+                continue
             if installed.is_symlink():
                 raise SetupError("The installed Claude Code Builder Pulse package contains a symlink")
             if installed.is_file():
-                installed_files[installed.relative_to(root)] = installed.read_bytes()
+                installed_files[relative] = installed.read_bytes()
     except OSError as exc:
         raise SetupError("The installed Claude Code Builder Pulse package is unreadable") from exc
     if not expected_files or installed_files != expected_files:
@@ -2323,6 +2337,17 @@ def open_setup_log_for_report() -> Path | None:
     return SETUP_LOG.open(canonical_plugin_data_dir())
 
 
+def ask(prompt: str) -> str:
+    """Read one terminal answer; a closed input stops setup cleanly."""
+    try:
+        return input(prompt).strip()
+    except EOFError as exc:
+        raise SetupError(
+            "The terminal closed before the answer was given; run the installer "
+            "again in an interactive terminal"
+        ) from exc
+
+
 def prompt_for_project(current_folder: Path) -> tuple[str, str]:
     repository_root: Path | None = None
     try:
@@ -2367,11 +2392,11 @@ def prompt_for_project(current_folder: Path) -> tuple[str, str]:
     prompt += f"[{default_root}]: " if default_root is not None else "(type the full path): "
     project_root = ""
     while not project_root:
-        entered_root = input(prompt).strip()
+        entered_root = ask(prompt)
         project_root = entered_root or (str(default_root) if default_root is not None else "")
         if not project_root:
             print("A project folder path is required.", file=sys.stderr)
-    project_label = input("Project name GrowthX should display: ").strip()
+    project_label = ask("Project name GrowthX should display: ")
     return project_root, project_label
 
 
@@ -2396,20 +2421,20 @@ def main() -> int:
     project_root = args.project_root or ""
     project_label = args.project_label or ""
     interactive = sys.stdin.isatty()
-    if interactive and not project_root:
-        current_folder = Path.cwd().resolve(strict=False)
-        if args.reuse_existing_claim:
-            answer = input(
-                "Existing enrollments are kept. Enroll an additional project folder "
-                "now? [y/N]: "
-            ).strip().lower()
-            if answer in {"y", "yes"}:
-                project_root, project_label = prompt_for_project(current_folder)
-        else:
-            project_root, project_label = prompt_for_project(current_folder)
-    elif interactive and not project_label:
-        project_label = input("Project name GrowthX should display: ").strip()
     try:
+        if interactive and not project_root:
+            current_folder = Path.cwd().resolve(strict=False)
+            if args.reuse_existing_claim:
+                answer = ask(
+                    "Existing enrollments are kept. Enroll an additional project folder "
+                    "now? [y/N]: "
+                ).lower()
+                if answer in {"y", "yes"}:
+                    project_root, project_label = prompt_for_project(current_folder)
+            else:
+                project_root, project_label = prompt_for_project(current_folder)
+        elif interactive and not project_label:
+            project_label = ask("Project name GrowthX should display: ")
         outcome = setup(
             invite_code,
             args.endpoint,
