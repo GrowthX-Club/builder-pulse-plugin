@@ -98,6 +98,10 @@ class FakeCommands:
             return list(self.claude_plugins)
         if argv[1:4] == ["plugin", "marketplace", "list"]:
             return list(self.claude_marketplaces)
+        if argv[1:4] == ["plugin", "marketplace", "remove"]:
+            self.claude_marketplaces = [m for m in self.claude_marketplaces if m["name"] != argv[4]]
+            self.claude_plugins = [p for p in self.claude_plugins if not p["id"].endswith("@" + argv[4])]
+            return ""
         if argv[1:4] == ["plugin", "marketplace", "add"]:
             self.claude_marketplaces.append({"name": S.CLAUDE_MARKETPLACE, "source": "github", "repo": S.REPOSITORY_SLUG, "ref": S.TARGET_RELEASE})
             return ""
@@ -485,6 +489,13 @@ class PackageTests(SetupCase):
         self.commands.claude_marketplaces = [{"name": S.CLAUDE_MARKETPLACE, "source": "github", "repo": "evil/x", "ref": S.TARGET_RELEASE}]
         with mock.patch.object(S, "run_command", self.commands), self.assertRaisesRegex(S.SetupError, "different source"):
             S.install_claude([])
+        # right repository, wrong pin: re-pinned, and the package installed afresh
+        self.commands.claude_marketplaces = [{"name": S.CLAUDE_MARKETPLACE, "source": "github", "repo": S.REPOSITORY_SLUG, "ref": "feat/branch"}]
+        self.commands.calls.clear()
+        with mock.patch.object(S, "run_command", self.commands):
+            S.install_claude(self.commands.claude_plugins)
+        verbs = [c[2] if c[2] != "marketplace" else f"marketplace {c[3]}" for c in self.commands.calls if c[0] == "claude" and c[1] == "plugin"]
+        self.assertEqual(verbs[:4], ["marketplace list", "marketplace remove", "marketplace add", "install"])
 
     def test_claude_version_mismatch_is_rejected(self) -> None:
         original = self.commands.claude

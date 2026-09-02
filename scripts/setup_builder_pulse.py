@@ -591,12 +591,17 @@ def install_claude(previous: list[dict[str, Any]]) -> None:
     """Add the release-scoped marketplace and install or update the plugin."""
     markets = run_command(["claude", "plugin", "marketplace", "list", "--json"], expect_json=True)
     match = [m for m in (markets if isinstance(markets, list) else []) if isinstance(m, dict) and m.get("name") == CLAUDE_MARKETPLACE]
-    if not match:
-        run_command(["claude", "plugin", "marketplace", "add", f"{REPOSITORY_SLUG}@{TARGET_RELEASE}", "--scope", "user"])
-    elif match[0].get("source") != "github" or match[0].get("repo") != REPOSITORY_SLUG or str(match[0].get("ref") or TARGET_RELEASE) != TARGET_RELEASE:
-        raise SetupError("The Claude Code GrowthX marketplace name points to a different source")
     plugin_id = claude_plugin_id()
     verb = "update" if any(e.get("id") == plugin_id for e in previous) else "install"
+    if match and (match[0].get("source") != "github" or match[0].get("repo") != REPOSITORY_SLUG):
+        raise SetupError("The Claude Code GrowthX marketplace name points to a different source")
+    if match and str(match[0].get("ref") or TARGET_RELEASE) != TARGET_RELEASE:
+        # Right repository, wrong pin: re-pin. Claude drops the plugins that
+        # came from a removed marketplace, so the package is installed afresh.
+        run_command(["claude", "plugin", "marketplace", "remove", CLAUDE_MARKETPLACE, "--scope", "user"])
+        match, verb = [], "install"
+    if not match:
+        run_command(["claude", "plugin", "marketplace", "add", f"{REPOSITORY_SLUG}@{TARGET_RELEASE}", "--scope", "user"])
     run_command(["claude", "plugin", verb, plugin_id, "--scope", "user", "--yes"])
     entries = [e for e in claude_builders() if e.get("id") == plugin_id]
     root = Path(str(entries[0].get("installPath", ""))).expanduser() if len(entries) == 1 else Path()
