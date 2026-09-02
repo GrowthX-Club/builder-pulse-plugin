@@ -1,6 +1,6 @@
 {
   "$schema": "https://code.claude.com/schemas/marketplace.json",
-  "name": "growthx-builder-tools-v0-5-3",
+  "name": "growthx-builder-tools-v0-6-0",
   "description": "GrowthX Builder Pulse telemetry plugins for Claude Code",
   "owner": {
     "name": "GrowthX"

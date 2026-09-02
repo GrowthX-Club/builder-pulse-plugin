@@ -1,6 +1,6 @@
 {
   "name": "builder-pulse-claude-windows",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Builder Pulse for Claude Code. Sends only from explicitly enrolled project folders.",
   "author": {
     "name": "GrowthX"
