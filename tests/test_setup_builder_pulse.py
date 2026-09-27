@@ -292,6 +292,27 @@ class HelperTests(SetupCase):
 
 
 class ReleaseTests(SetupCase):
+    def test_every_packaged_version_label_matches_the_target_release(self) -> None:
+        # The installer adds the Claude marketplace from the tag and then installs
+        # from S.CLAUDE_MARKETPLACE; a stale marketplace name fails every Claude install.
+        def read(path: str) -> dict:
+            return json.loads((ROOT / path).read_text())
+
+        self.assertEqual(read(".claude-plugin/marketplace.json")["name"], S.CLAUDE_MARKETPLACE)
+        for manifest in (
+            ".codex-plugin/plugin.json",
+            "claude-plugins/posix/.claude-plugin/plugin.json",
+            "claude-plugins/windows/.claude-plugin/plugin.json",
+        ):
+            with self.subTest(manifest=manifest):
+                self.assertEqual(read(manifest)["version"], S.TARGET_VERSION)
+        for launcher in (
+            "claude-plugins/posix/scripts/builder_pulse_claude.sh",
+            "claude-plugins/windows/scripts/builder_pulse_claude.cmd",
+        ):
+            with self.subTest(launcher=launcher):
+                self.assertIn(f"BUILDER_PULSE_PLUGIN_VERSION={S.TARGET_VERSION}", (ROOT / launcher).read_text())
+
     def release_response(self, body, status=200):
         raw = json.dumps(body).encode()
         response = mock.MagicMock()
