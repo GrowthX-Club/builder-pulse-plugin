@@ -88,6 +88,6 @@ true` with `lastSignalPluginVersion: "0.6.1"` and the matching
 ## Uninstall
 
 `codex plugin remove builder-pulse@growthx-builder-tools` and
-`claude plugin uninstall builder-pulse-claude-posix@growthx-builder-tools-v0-6-0 --scope user`
+`claude plugin uninstall builder-pulse-claude-posix@growthx-builder-tools-v0-6-1 --scope user`
 remove the packages. Identity and enrollments stay in `~/.builder-pulse`, so a
 later repair reuses the same installation with no new invite.
