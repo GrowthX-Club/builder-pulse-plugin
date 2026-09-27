@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path, PureWindowsPath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -3936,13 +3937,65 @@ class HookManifestTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "{}\n")
         self.assertEqual(completed.stderr, "")
 
-    def test_codex_hook_manifest_is_byte_identical_to_the_v045_release(self) -> None:
-        # Codex hashes the normalized hook definition to decide trust, so any
-        # byte-level drift here forces every v0.4.2-v0.4.5 member through a
-        # new /hooks review. The fixture is `git show v0.4.5:hooks/hooks.json`.
+    def test_codex_hook_manifest_matches_the_v045_release_off_windows(self) -> None:
+        # Codex hashes the normalized hook definition to decide trust. Off
+        # Windows that is `command` with commandWindows dropped, so any other
+        # drift forces every v0.4.2-v0.4.5 member through a new /hooks review.
+        # Only commandWindows may change (v0.6.1: %VAR% never expanded under
+        # PowerShell). The fixture is `git show v0.4.5:hooks/hooks.json`.
+        def without_windows_commands(path: Path) -> dict:
+            manifest = json.loads(path.read_text())
+            for registrations in manifest["hooks"].values():
+                for registration in registrations:
+                    for hook in registration["hooks"]:
+                        hook.pop("commandWindows")
+            return manifest
+
         manifest_path = builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json"
         fixture_path = builder_pulse.PLUGIN_ROOT / "tests" / "fixtures" / "hooks-v0.4.5.json"
-        self.assertEqual(manifest_path.read_bytes(), fixture_path.read_bytes())
+        self.assertEqual(
+            without_windows_commands(manifest_path), without_windows_commands(fixture_path)
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Codex runs Windows hooks through PowerShell")
+    def test_windows_hook_command_runs_under_codex_powershell_runner(self) -> None:
+        # Reproduces codex-rs/hooks: textual ${CLAUDE_PLUGIN_ROOT} substitution,
+        # then `<pwsh|powershell> -NoProfile -Command <command>` with the payload
+        # on stdin. v0.6.0's %CLAUDE_PLUGIN_ROOT% form failed here with exit 1.
+        manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
+        registered = manifest["hooks"]["UserPromptSubmit"][0]["hooks"][0]["commandWindows"]
+        shells = [shell for shell in (shutil.which("pwsh"), shutil.which("powershell")) if shell]
+        self.assertTrue(shells)
+        payload = '{"hook_event_name":"UserPromptSubmit"}'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "plugin root"
+            (root / "scripts").mkdir(parents=True)
+            received = Path(directory) / "received.json"
+            (root / "scripts" / "builder_pulse.py").write_text(
+                "import json, sys\n"
+                f"open({str(received)!r}, 'w').write(json.dumps([sys.argv[1:], sys.stdin.read()]))\n"
+                "print('{}')\n"
+            )
+
+            def run(shell: str, command: str) -> subprocess.CompletedProcess[str]:
+                env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(root))
+                command = command.replace("${CLAUDE_PLUGIN_ROOT}", str(root))
+                return subprocess.run(
+                    [shell, "-NoProfile", "-Command", command],
+                    input=payload, capture_output=True, text=True, env=env, timeout=60,
+                )
+
+            for shell in shells:
+                with self.subTest(shell=shell):
+                    received.unlink(missing_ok=True)
+                    old = run(shell, 'py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook')
+                    self.assertNotEqual(old.returncode, 0)
+                    self.assertFalse(received.exists())
+
+                    new = run(shell, registered)
+                    self.assertEqual(new.returncode, 0, new.stderr)
+                    self.assertEqual(new.stdout.strip(), "{}")
+                    self.assertEqual(json.loads(received.read_text()), [["hook"], payload])
 
     def test_codex_hook_commands_run_the_python_runtime_directly(self) -> None:
         manifest = json.loads((builder_pulse.PLUGIN_ROOT / "hooks" / "hooks.json").read_text())
@@ -3964,8 +4017,9 @@ class HookManifestTests(unittest.TestCase):
             )
             self.assertEqual(
                 hook["commandWindows"],
-                'py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook',
+                'py -3 "${CLAUDE_PLUGIN_ROOT}\\scripts\\builder_pulse.py" hook',
             )
+            self.assertEqual(hook["commandWindows"], builder_pulse.CODEX_WINDOWS_HOOK_COMMAND)
         self.assertFalse((builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.sh").exists())
         self.assertFalse((builder_pulse.PLUGIN_ROOT / "scripts" / "builder_pulse.cmd").exists())
 
@@ -3993,6 +4047,8 @@ class HookManifestTests(unittest.TestCase):
             with mock.patch.object(
                 builder_pulse.os, "name", "nt"
             ), mock.patch.object(
+                builder_pulse.shutil, "which", return_value="powershell.exe"
+            ), mock.patch.object(
                 builder_pulse.subprocess, "run", return_value=completed
             ) as run:
                 result = builder_pulse.verify_hook_launcher(data_dir)
@@ -4002,7 +4058,12 @@ class HookManifestTests(unittest.TestCase):
         options = run.call_args.kwargs
         self.assertEqual(
             command,
-            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f'py -3 "{builder_pulse.PLUGIN_ROOT}\\scripts\\builder_pulse.py" hook',
+            ],
         )
         self.assertEqual(options["env"]["CLAUDE_PLUGIN_ROOT"], str(builder_pulse.PLUGIN_ROOT))
         self.assertNotIn("cwd", options)
@@ -4053,6 +4114,8 @@ class HookManifestTests(unittest.TestCase):
             with mock.patch.object(
                 builder_pulse.os, "name", "nt"
             ), mock.patch.object(
+                builder_pulse.shutil, "which", return_value="powershell.exe"
+            ), mock.patch.object(
                 builder_pulse, "PLUGIN_ROOT", unc_root
             ), mock.patch.object(
                 builder_pulse.subprocess, "run", return_value=completed
@@ -4061,13 +4124,13 @@ class HookManifestTests(unittest.TestCase):
 
         self.assertEqual(result, {"ready": True, "hookStatus": "launcher_verified"})
         self.assertEqual(
-            run.call_args.args[0],
-            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
+            run.call_args.args[0][-1],
+            f'py -3 "{unc_root}\\scripts\\builder_pulse.py" hook',
         )
         self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_PLUGIN_ROOT"], str(unc_root))
         self.assertNotIn("cwd", run.call_args.kwargs)
 
-    def test_windows_launcher_expands_percent_bearing_roots_only_once(self) -> None:
+    def test_windows_launcher_passes_percent_bearing_roots_through_literally(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "{}\n", "")
         roots = (
             Path(r"C:\\plugins\\%TEAM%\\builder pulse"),
@@ -4079,6 +4142,8 @@ class HookManifestTests(unittest.TestCase):
                 with mock.patch.object(
                     builder_pulse.os, "name", "nt"
                 ), mock.patch.object(
+                    builder_pulse.shutil, "which", return_value="powershell.exe"
+                ), mock.patch.object(
                     builder_pulse, "PLUGIN_ROOT", root
                 ), mock.patch.object(
                     builder_pulse.subprocess, "run", return_value=completed
@@ -4089,13 +4154,12 @@ class HookManifestTests(unittest.TestCase):
                     result, {"ready": True, "hookStatus": "launcher_verified"}
                 )
                 self.assertEqual(
-                    run.call_args.args[0],
-                    'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"',
+                    run.call_args.args[0][-1],
+                    f'py -3 "{root}\\scripts\\builder_pulse.py" hook',
                 )
                 self.assertEqual(
                     run.call_args.kwargs["env"]["CLAUDE_PLUGIN_ROOT"], str(root)
                 )
-                self.assertNotIn("call ", run.call_args.args[0].lower())
 
     def test_activation_stops_before_the_server_when_launcher_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

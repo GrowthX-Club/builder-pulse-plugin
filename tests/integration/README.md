@@ -53,7 +53,7 @@ HARNESS_BRANCH=feat/my-branch $I/scenarios.sh /path/to/checkout <sha> repair-ind
 HARNESS_BRANCH=feat/my-branch $I/scenarios.sh /path/to/checkout <sha> upgrade-v045 claude
 
 # 3. scenarios against a published tag (the exact installer members run)
-$I/scenarios.sh real v0.6.0 upgrade-v045
+$I/scenarios.sh real v0.6.1 upgrade-v045
 ```
 
 ## Scenarios

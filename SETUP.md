@@ -1,6 +1,6 @@
-# Builder Pulse v0.6.0 setup
+# Builder Pulse v0.6.1 setup
 
-This guide belongs to the immutable `v0.6.0` release. Use it only from the
+This guide belongs to the immutable `v0.6.1` release. Use it only from the
 release-pinned URL; never run an installer from a default branch.
 
 Builder Pulse installs hooks for Codex and Claude Code when those agents are available on this computer, but it sends data only from project folders you explicitly enroll. One shared identity and project allowlist apply to both agents. GrowthX stores the claimed member ID, name, email address, and any optional roster or program label supplied by GrowthX so telemetry can be linked to the right person. A roster or program label is never used as a telemetry project. For each enrolled project, it receives a stable installation ID, a one-way hashed session ID, the display name you confirm and a sanitized project ID, any feature name and ID you explicitly set, coarse work state and event/activity timestamps, agent name, plugin version, optional cumulative Codex token counts, and each primary prompt you submit after secret redaction and a 64 KiB limit. GrowthX's authenticated Builder Pulse admins can view these identity and telemetry fields for learning feedback. Raw lifecycle events and activity buckets are retained for 30 days; submitted prompts and their feedback are retained for 60 days; the member identity fields, installation/member link, latest status, and compacted session, daily, and all-time token aggregates remain until GrowthX removes them. It does not send folder paths, files, patches, commands, tool input or output, assistant replies, transcripts, or environment variables. Secret redaction is a safety layer, not a guarantee, so do not put secrets in prompts.
@@ -12,13 +12,13 @@ git, and Codex and/or Claude Code. On macOS the installer also finds the Codex
 bundled with the desktop app when `codex` is not on the PATH.
 
 1. Verify the release before executing anything from it:
-   `git ls-remote --exit-code --refs https://github.com/GrowthX-Club/builder-pulse-plugin.git refs/tags/v0.6.0`
+   `git ls-remote --exit-code --refs https://github.com/GrowthX-Club/builder-pulse-plugin.git refs/tags/v0.6.1`
    must return one ref, and an unauthenticated `GET` to
-   `https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/v0.6.0`
-   must report `tag_name: "v0.6.0"`, `draft: false`, `immutable: true`.
+   `https://api.github.com/repos/GrowthX-Club/builder-pulse-plugin/releases/tags/v0.6.1`
+   must report `tag_name: "v0.6.1"`, `draft: false`, `immutable: true`.
 2. Clone only that tag into a fresh temporary directory:
-   `git clone --depth 1 --branch v0.6.0 --single-branch …` and require
-   `git describe --tags --exact-match HEAD` to print `v0.6.0`.
+   `git clone --depth 1 --branch v0.6.1 --single-branch …` and require
+   `git describe --tags --exact-match HEAD` to print `v0.6.1`.
 3. Run the installer **by its absolute path while your working directory is
    your project folder**. Never `cd` into the clone: the installer offers the
    current folder as the default project and the clone must never be enrolled.
@@ -82,7 +82,7 @@ Exit every running Codex and Claude Code session, start a fresh one inside an
 enrolled folder, send one normal prompt, then run
 `<python> <installed plugin>/scripts/builder_pulse.py activate --agent codex`
 (or `--agent claude_code`). Only `telemetryReceivedSincePreviousActivation:
-true` with `lastSignalPluginVersion: "0.6.0"` and the matching
+true` with `lastSignalPluginVersion: "0.6.1"` and the matching
 `lastSignalAgentPlatform` proves end-to-end delivery for that agent.
 
 ## Uninstall

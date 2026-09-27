@@ -3688,6 +3688,11 @@ def interpreter_version_text(executable: str) -> str | None:
     return version if completed.returncode == 0 and version else None
 
 
+# Must equal every commandWindows in hooks/hooks.json. Codex fills in ${...}
+# before any shell sees it; PowerShell never expands %CLAUDE_PLUGIN_ROOT%.
+CODEX_WINDOWS_HOOK_COMMAND = 'py -3 "${CLAUDE_PLUGIN_ROOT}\\scripts\\builder_pulse.py" hook'
+
+
 def verify_hook_launcher(
     data_dir: Path,
     agent_platform: str = DEFAULT_AGENT_PLATFORM,
@@ -3696,7 +3701,9 @@ def verify_hook_launcher(
     """Execute the exact command the selected agent's hooks will invoke.
 
     Codex hooks run ``python3 "${CLAUDE_PLUGIN_ROOT}/scripts/builder_pulse.py" hook``
-    (``py -3`` on Windows). Claude Code hooks run the packaged launcher script.
+    (``py -3`` on Windows). Codex substitutes ``${CLAUDE_PLUGIN_ROOT}`` itself and
+    runs the result in the session shell, which is always PowerShell on Windows.
+    Claude Code hooks run the packaged launcher script.
     """
     launcher_root = plugin_root or PLUGIN_ROOT
     environment = dict(os.environ)
@@ -3705,20 +3712,21 @@ def verify_hook_launcher(
     environment["BUILDER_PULSE_PLUGIN_VERSION"] = PLUGIN_VERSION
     environment["CLAUDE_PLUGIN_ROOT"] = str(launcher_root)
     environment["PLUGIN_ROOT"] = str(launcher_root)
-    command: list[str] | str
+    command: list[str]
+    if os.name == "nt":
+        powershell = (
+            shutil.which("pwsh")
+            or shutil.which("powershell")
+            or shutil.which("powershell.exe")
+        )
+        if not powershell:
+            return {
+                "ready": False,
+                "hookStatus": "launcher_unavailable",
+                "detail": "neither pwsh nor powershell is available to run the hook",
+            }
     if agent_platform == "claude_code":
         if os.name == "nt":
-            powershell = (
-                shutil.which("pwsh")
-                or shutil.which("powershell")
-                or shutil.which("powershell.exe")
-            )
-            if not powershell:
-                return {
-                    "ready": False,
-                    "hookStatus": "launcher_unavailable",
-                    "detail": "neither pwsh nor powershell is available to run the Claude Code hook",
-                }
             command = [
                 powershell,
                 "-NoProfile",
@@ -3729,12 +3737,14 @@ def verify_hook_launcher(
         else:
             command = ["sh", str(launcher_root / "scripts" / "builder_pulse_claude.sh")]
     elif os.name == "nt":
-        # Expand CLAUDE_PLUGIN_ROOT exactly once, the way Codex's commandWindows
-        # runs it. CALL would reparse the expanded path and corrupt legal roots
-        # containing paired percent tokens such as %TEAM%.
-        command = (
-            'cmd /d /s /c "py -3 "%CLAUDE_PLUGIN_ROOT%\\scripts\\builder_pulse.py" hook"'
-        )
+        # Mirror Codex's hook runner: textual ${CLAUDE_PLUGIN_ROOT} substitution,
+        # then `<pwsh|powershell> -NoProfile -Command <command>`.
+        command = [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            CODEX_WINDOWS_HOOK_COMMAND.replace("${CLAUDE_PLUGIN_ROOT}", str(launcher_root)),
+        ]
     else:
         interpreter = shutil.which("python3")
         if not interpreter:
